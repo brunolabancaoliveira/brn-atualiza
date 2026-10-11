@@ -1,6 +1,11 @@
 """
-main.py — Entrypoint unificado do nó BRN (v13)
+main.py — Entrypoint unificado do nó BRN (v13.1)
 ================================================================
+v13.1:
+  [FIX] Defaults ajustados para rede Tailscale privada:
+        - BRN_BOOTSTRAP_PEERS: "192.168.0.19:6001" → "100.111.253.8:6001"
+        - BRN_ALL_MINERS:      "1" → "0"  (evita forks com 2-3 nós)
+        - BRN_TRACKER:         URL pública → ""  (só LAN/Tailscale)
 v13:
   [NEW] HTTP via Waitress (produção, cross-platform) com fallback
         para Flask dev server. Aguenta ~10x mais requisições.
@@ -8,9 +13,6 @@ v13:
   [NEW] DIFFICULTY=6 via BRN_MIN_DIFFICULTY (em blockchain.py)
 v12.6:
   [NEW] Modo "todos mineram" via BRN_ALL_MINERS=1
-        - _is_origin() retorna True para todos os nós
-        - Callback chain.on_block_mined → p2p.broadcast_block
-        - BRN_MIN_DIFFICULTY default 5 (evita colisão)
 v12.5:
   [FIX] auto_genesis=is_origin (era "not is_origin")
 v12.4:
@@ -82,7 +84,9 @@ _HARDCODED_DEFAULTS = {
     # --- Identidade do nó ---
     "BRN_NODE_PASSWORD":       "senha-no-temp-123",
     "BRN_NETWORK_SECRET":      "9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9",
-    "BRN_BOOTSTRAP_PEERS":     "192.168.0.19:6001",
+
+    # [v13.1] Bootstrap Tailscale da Ubuntu (era 192.168.0.19)
+    "BRN_BOOTSTRAP_PEERS":     "100.111.253.8:6001",
 
     # --- Carteira ---
     "BRN_WEB_PASS":            "senha-temp-123",
@@ -91,12 +95,14 @@ _HARDCODED_DEFAULTS = {
     # --- Modo ---
     "BRN_IS_ORIGIN":           "0",
 
+    # [v13.1] Modo "todos mineram" DESLIGADO por padrão (evita forks)
+    "BRN_ALL_MINERS":          "0",
+
     # --- Mineração distribuída ---
-    "BRN_ALL_MINERS":          "1",
-    "BRN_MIN_DIFFICULTY":      "6",     # [v13] subiu de 5 para 6
+    "BRN_MIN_DIFFICULTY":      "6",
 
     # --- HTTP ---
-    "BRN_HTTP_THREADS":        "16",    # [v13] pool do Waitress
+    "BRN_HTTP_THREADS":        "16",
 
     # --- HTTPS / Audit ---
     "BRN_HTTPS":               "0",
@@ -112,8 +118,8 @@ _HARDCODED_DEFAULTS = {
     "BRN_SKIP_VERIFY":         "0",
     "BRN_VERIFY_STRICT":       "0",
 
-    # --- Tracker ---
-    "BRN_TRACKER":             "https://brn-tracker.onrender.com",
+    # [v13.1] Sem tracker público — só LAN/Tailscale
+    "BRN_TRACKER":             "",
 
     # --- MongoDB ---
     "MONGO_USER":              "brunolabncaolivira_db_user",
@@ -507,7 +513,6 @@ def do_status(cfg):
     print(" HTTP threads: " + os.environ.get("BRN_HTTP_THREADS", "?"))
     print()
 
-    # Verifica se Waitress está instalado
     try:
         import waitress  # type: ignore
         waitress_ver = getattr(waitress, "__version__", "?")
@@ -634,9 +639,6 @@ def _init_http_server(chain, log):
     return http_app
 
 
-# ============================================================
-# [v13] run_http com Waitress + fallback Flask
-# ============================================================
 def run_http(app_instance, force_flask_dev: bool = False):
     """
     Roda o servidor HTTP.
@@ -649,7 +651,6 @@ def run_http(app_instance, force_flask_dev: bool = False):
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
 
-    # HTTPS → Flask dev (Waitress não tem SSL nativo)
     if os.environ.get("BRN_HTTPS", "0") == "1":
         log.warning("BRN_HTTPS=1 — Flask dev server (Waitress não faz SSL nativo)")
         ssl_ctx = None
@@ -667,7 +668,6 @@ def run_http(app_instance, force_flask_dev: bool = False):
         )
         return
 
-    # Força Flask dev server via --flask-dev
     if force_flask_dev:
         log.info("HTTP (dev) http://" + WEB_HOST + ":" + str(port)
                  + " [--flask-dev]")
@@ -677,7 +677,6 @@ def run_http(app_instance, force_flask_dev: bool = False):
         )
         return
 
-    # Tenta Waitress
     try:
         from waitress import serve  # type: ignore
         threads = int(os.environ.get("BRN_HTTP_THREADS", "16"))
@@ -700,7 +699,6 @@ def run_http(app_instance, force_flask_dev: bool = False):
     except Exception as e:
         log.error("Waitress falhou (" + str(e) + ") — usando Flask dev server")
 
-    # Fallback: Flask dev server
     log.info("HTTP (dev) http://" + WEB_HOST + ":" + str(port))
     app_instance.run(
         host=WEB_HOST, port=port, threaded=True,
@@ -720,7 +718,6 @@ def run_explorer():
         except Exception:
             ssl_ctx = None
 
-    # [v13] Explorer também usa Waitress
     if ssl_ctx is None and os.environ.get("BRN_HTTPS", "0") != "1":
         try:
             from waitress import serve  # type: ignore
@@ -1210,7 +1207,6 @@ def main():
             _register_service("p2p", p2p)
             log.info("P2P iniciado")
 
-            # Callback: quando a chain local minerar um bloco, propaga
             def _on_block_mined(block):
                 try:
                     if p2p is None:
