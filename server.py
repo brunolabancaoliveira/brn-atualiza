@@ -1,23 +1,23 @@
 """
-server.py — Backend HTTP do nó BRN (v9.3)
+server.py — Backend HTTP do nó BRN (v9.4)
 ================================================================
+v9.4 (Modo 2 — mineração aberta na rede):
+  [CHANGE] /api/mine         — sem @_admin_required (público)
+  [CHANGE] /api/miner/start  — sem @_admin_required (público)
+  [CHANGE] /api/miner/stop   — sem @_admin_required (público)
+  [KEEP]   /api/faucet       — MANTÉM @_admin_required
+  [NEW]    audit_log inclui ip do minerador em todos os eventos
+  [NEW]    rate limit específico para mineração (30/min por IP)
 v9.3:
-  [FIX] CHAIN injetável via set_chain() — evita duas instâncias do DB
-  [FIX] auto_registrar_carteira_atual() pública (chamada pelo main.py)
-  [FIX] fallback para secure_store.load_current_wallet
-  [FIX] paths absolutos (BASE_DIR) para wallets / current_wallet / db
+  CHAIN injetável, auto_registrar_carteira_atual, secure_store fallback
 v9.2:
-  [NEW] Auto-registro da pubkey da carteira ativa no boot
+  Auto-registro da pubkey da carteira ativa no boot
 v9.1:
-  [NEW] Rate limit via security.require_rate_limit
-  [NEW] audit_log em rotas sensíveis
-  [NEW] get_client_ip respeita X-Forwarded-For
+  Rate limit via security.require_rate_limit
+  audit_log em rotas sensíveis
+  get_client_ip respeita X-Forwarded-For
 v9.0:
-  [FIX] bind default 127.0.0.1
-  [FIX] admin token
-  [FIX] caches com cleanup thread
-  [FIX] salvar_wallets atômico + lock
-  [FIX] CORS restrito
+  bind default 127.0.0.1, admin token, caches com cleanup thread
 ================================================================
 """
 from __future__ import annotations
@@ -38,7 +38,6 @@ from flask_cors import CORS
 from wallet import Wallet, WalletManager, HDWalletManager
 from blockchain import Blockchain, make_coinbase, txid as calc_txid, signing_hash
 
-# [v9.1] camada de segurança centralizada
 try:
     from security import (
         require_rate_limit, audit_log, close_audit,
@@ -67,14 +66,8 @@ except ImportError:
 
 log = logging.getLogger("server")
 
-# ============================================================
-# BASE_DIR (para paths absolutos)
-# ============================================================
 BASE_DIR = Path(__file__).resolve().parent
 
-# ============================================================
-# CONFIG
-# ============================================================
 WEB_HOST         = os.environ.get("BRN_WEB_HOST", "127.0.0.1")
 BEHIND_PROXY     = os.environ.get("BRN_BEHIND_PROXY", "0") == "1"
 CORS_ORIGINS     = [o.strip() for o in
@@ -88,18 +81,17 @@ CURRENT_WALLET_FILE  = str(BASE_DIR / "current_wallet.json")
 FAUCET_AMOUNT_BRN      = 10
 FAUCET_MAX_PER_ADDRESS = 3
 FAUCET_COOLDOWN_S      = 60 * 60
+CACHE_TTL_S            = 5
 
-CACHE_TTL_S      = 5
 
 # ============================================================
-# CHAIN INJETÁVEL (lazy fallback)
+# CHAIN INJETÁVEL
 # ============================================================
 _CHAIN = None
 CHAIN_LOCK = threading.RLock()
 
 
 def set_chain(chain) -> None:
-    """Injeta a chain criada pelo main.py (evita duas instâncias do DB)."""
     global _CHAIN
     with CHAIN_LOCK:
         _CHAIN = chain
@@ -119,7 +111,6 @@ def _get_chain():
 
 
 class _LazyChain:
-    """Proxy que resolve CHAIN.db.xxx via _get_chain() na primeira chamada."""
     def __getattr__(self, name):
         return getattr(_get_chain(), name)
 
@@ -129,7 +120,6 @@ class _LazyChain:
 
 CHAIN = _LazyChain()
 
-# ---- L2 (opcional) ----
 try:
     from l2_manager import L2Manager, L2Error
     import btc_config
@@ -176,7 +166,7 @@ if CORS_ORIGINS:
 
 
 # ============================================================
-# Admin guard
+# Admin guard — usado SÓ em /api/faucet agora
 # ============================================================
 def _require_admin() -> bool:
     if not ADMIN_TOKEN:
@@ -201,11 +191,10 @@ def _admin_required(f):
 
 
 # ============================================================
-# Caches locais
+# Caches
 # ============================================================
 _cache_saldos: dict = {}
 _cache_lock = threading.Lock()
-
 _faucet_history: dict = {}
 
 
@@ -229,7 +218,7 @@ def _saldo_cache_invalidate(addr):
 
 
 # ============================================================
-# Wallets JSON (atômico + lock)
+# Wallets JSON
 # ============================================================
 _wallets_lock = threading.Lock()
 
@@ -267,13 +256,9 @@ def _registrar_pubkey(addr, pk):
 
 
 # ============================================================
-# AUTO-REGISTRO DA PUBKEY DO NÓ ATUAL [público — chamado pelo main.py]
+# AUTO-REGISTRO DA PUBKEY
 # ============================================================
 def auto_registrar_carteira_atual() -> dict:
-    """
-    Tenta carregar current_wallet.enc e registra a pubkey em user_wallets.json.
-    Nunca levanta exceção. Retorna {"ok": bool, "msg": str}.
-    """
     senha = (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
              or os.environ.get("BRN_NODE_PASSWORD", "").strip())
     if not senha:
@@ -281,7 +266,6 @@ def auto_registrar_carteira_atual() -> dict:
 
     result = None
 
-    # 1) tenta WalletManager.load_current (se existir)
     try:
         _WM = WalletManager
         if hasattr(_WM, "load_current"):
@@ -289,7 +273,6 @@ def auto_registrar_carteira_atual() -> dict:
     except Exception:
         result = None
 
-    # 2) fallback: secure_store.load_current_wallet
     if result is None:
         try:
             from secure_store import load_current_wallet
@@ -320,10 +303,6 @@ def auto_registrar_carteira_atual() -> dict:
                 "msg": f"registrado: {addr[:16]}... pub={pk[:16]}..."}
     except Exception as e:
         return {"ok": False, "msg": f"falha gravando user_wallets.json: {e}"}
-
-
-# compat com versão antiga
-_auto_registrar_carteira_atual = auto_registrar_carteira_atual
 
 
 # ============================================================
@@ -376,9 +355,6 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
     return ""
 
 
-# ============================================================
-# Tx lookup
-# ============================================================
 def _find_tx_in_mempool(txid_str: str):
     try:
         return _get_chain().db.get_mempool_tx(txid_str)
@@ -502,94 +478,6 @@ def tx_status(txid_str):
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-# ============================================================
-# Histórico por endereço
-# ============================================================
-@app.route("/api/minhas-txs/<address>", methods=["GET"])
-@app.route("/api/transacoes/<address>", methods=["GET"])
-@require_rate_limit("minhas_txs")
-def minhas_txs(address):
-    try:
-        if not WalletManager.validate_address(address):
-            return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
-
-        chain = _get_chain()
-        try:
-            current_height = chain.db.height()
-        except Exception:
-            current_height = 0
-
-        raw_list = chain.db.get_txs_for_address(address, limit=200)
-
-        transactions = []
-        for item in raw_list:
-            tx = item["tx"]
-            block_height = item["block_height"]
-            is_mempool = item["is_mempool"]
-
-            # Valor recebido (outputs para o endereço)
-            outputs_to_addr = 0
-            for o in tx.get("outputs", []):
-                if o.get("address") == address:
-                    outputs_to_addr += int(o.get("amount", 0) or 0)
-
-            # Valor gasto (inputs que vieram de UTXOs do endereço)
-            inputs_from_addr = 0
-            for inp in tx.get("inputs", []):
-                if inp.get("txid") == "0" * 64:
-                    continue
-                try:
-                    row = chain.db.conn.execute(
-                        "SELECT address, amount FROM utxos "
-                        "WHERE txid = ? AND vout = ?",
-                        (inp.get("txid"), inp.get("vout"))
-                    ).fetchone()
-                    if row and row["address"] == address:
-                        inputs_from_addr += int(row["amount"] or 0)
-                except Exception:
-                    pass
-
-            # Direção
-            if inputs_from_addr > 0 and outputs_to_addr > 0:
-                direction = "self"
-                amount = 0
-            elif outputs_to_addr > 0:
-                direction = "received"
-                amount = outputs_to_addr
-            else:
-                direction = "sent"
-                amount = max(0, inputs_from_addr - outputs_to_addr)
-
-            # Status
-            if is_mempool or block_height is None:
-                status = "pending"
-                confirmations = 0
-            else:
-                status = "confirmed"
-                confirmations = max(0, current_height - block_height)
-
-            transactions.append({
-                "txid":         tx.get("txid", ""),
-                "direction":    direction,
-                "amount":       amount,
-                "status":       status,
-                "block_height": block_height,
-                "confirmations": confirmations,
-                "timestamp":    int(tx.get("timestamp", 0) or 0),
-                "num_inputs":   len(tx.get("inputs", [])),
-                "num_outputs":  len(tx.get("outputs", [])),
-            })
-
-        return jsonify({
-            "ok":           True,
-            "address":      address,
-            "count":        len(transactions),
-            "transactions": transactions,
-        })
-    except Exception as e:
-        log.exception("minhas_txs falhou")
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
 
 @app.route("/api/verificar-recebimento/<address>/<txid_str>", methods=["GET"])
 def verificar_recebimento(address, txid_str):
@@ -636,6 +524,100 @@ def verificar_recebimento(address, txid_str):
             "msg": msg,
         })
     except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# Histórico por endereço
+# ============================================================
+@app.route("/api/minhas-txs/<address>", methods=["GET"])
+@app.route("/api/transacoes/<address>", methods=["GET"])
+@require_rate_limit("minhas_txs")
+def minhas_txs(address):
+    try:
+        if not WalletManager.validate_address(address):
+            return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
+
+        chain = _get_chain()
+        try:
+            current_height = chain.db.height()
+        except Exception:
+            current_height = 0
+
+        if not hasattr(chain.db, "get_txs_for_address"):
+            return jsonify({
+                "ok": True,
+                "address": address,
+                "count": 0,
+                "transactions": [],
+                "msg": "Endpoint de histórico precisa do db.py v6.4+",
+            })
+
+        raw_list = chain.db.get_txs_for_address(address, limit=200)
+
+        transactions = []
+        for item in raw_list:
+            tx = item["tx"]
+            block_height = item["block_height"]
+            is_mempool = item["is_mempool"]
+
+            outputs_to_addr = 0
+            for o in tx.get("outputs", []):
+                if o.get("address") == address:
+                    outputs_to_addr += int(o.get("amount", 0) or 0)
+
+            inputs_from_addr = 0
+            for inp in tx.get("inputs", []):
+                if inp.get("txid") == "0" * 64:
+                    continue
+                try:
+                    row = chain.db.conn.execute(
+                        "SELECT address, amount FROM utxos "
+                        "WHERE txid = ? AND vout = ?",
+                        (inp.get("txid"), inp.get("vout"))
+                    ).fetchone()
+                    if row and row["address"] == address:
+                        inputs_from_addr += int(row["amount"] or 0)
+                except Exception:
+                    pass
+
+            if inputs_from_addr > 0 and outputs_to_addr > 0:
+                direction = "self"
+                amount = 0
+            elif outputs_to_addr > 0:
+                direction = "received"
+                amount = outputs_to_addr
+            else:
+                direction = "sent"
+                amount = max(0, inputs_from_addr - outputs_to_addr)
+
+            if is_mempool or block_height is None:
+                status = "pending"
+                confirmations = 0
+            else:
+                status = "confirmed"
+                confirmations = max(0, current_height - block_height)
+
+            transactions.append({
+                "txid":         tx.get("txid", ""),
+                "direction":    direction,
+                "amount":       amount,
+                "status":       status,
+                "block_height": block_height,
+                "confirmations": confirmations,
+                "timestamp":    int(tx.get("timestamp", 0) or 0),
+                "num_inputs":   len(tx.get("inputs", [])),
+                "num_outputs":  len(tx.get("outputs", [])),
+            })
+
+        return jsonify({
+            "ok":           True,
+            "address":      address,
+            "count":        len(transactions),
+            "transactions": transactions,
+        })
+    except Exception as e:
+        log.exception("minhas_txs falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
@@ -738,12 +720,12 @@ def transfer():
 
 
 # ============================================================
-# Miner endpoints (admin)
+# MINERAÇÃO (Modo 2 — SEM admin token)
 # ============================================================
 @app.route("/api/mine", methods=["POST"])
 @require_rate_limit("mine")
-@_admin_required
 def mine():
+    """Mineração aberta — sem @_admin_required (Modo 2)."""
     try:
         data = request.get_json(force=True) or {}
         miner = (data.get("validator_address")
@@ -764,11 +746,15 @@ def mine():
         with CHAIN_LOCK:
             block = chain.mine_block(miner, miner_pubkey)
         if not block:
-            audit_log("mine_failed", {"miner": hash_short(miner, 16)})
+            audit_log("mine_failed", {
+                "miner": hash_short(miner, 16),
+                "ip":    get_client_ip(),
+            })
             return jsonify({"ok": False, "msg": "Falha ao minerar."}), 500
         _saldo_cache_invalidate(miner)
         audit_log("mine_ok", {
             "miner":  hash_short(miner, 16),
+            "ip":     get_client_ip(),
             "height": block["height"],
             "hash":   block["hash"][:16],
         })
@@ -785,8 +771,8 @@ def mine():
 
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
-@_admin_required
 def miner_start():
+    """Inicia miner contínuo — SEM admin token (Modo 2)."""
     try:
         data = request.get_json(force=True) or {}
         addr = (data.get("validator_address")
@@ -811,6 +797,7 @@ def miner_start():
         ok, msg = m.start(addr, pubkey)
         audit_log("miner_start_ok" if ok else "miner_start_failed", {
             "addr": hash_short(addr, 16),
+            "ip":   get_client_ip(),
             "msg":  msg,
         })
         if not ok:
@@ -822,13 +809,16 @@ def miner_start():
 
 @app.route("/api/miner/stop", methods=["POST"])
 @require_rate_limit("miner_stop")
-@_admin_required
 def miner_stop():
+    """Para miner contínuo — SEM admin token (Modo 2)."""
     try:
         from miner_loop import get_miner
         m = get_miner(_get_chain())
         ok, msg = m.stop()
-        audit_log("miner_stop_ok" if ok else "miner_stop_failed", {"msg": msg})
+        audit_log("miner_stop_ok" if ok else "miner_stop_failed", {
+            "ip":  get_client_ip(),
+            "msg": msg,
+        })
         return jsonify({"ok": ok, "msg": msg, **m.status()})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -873,7 +863,7 @@ def miner_status():
 
 
 # ============================================================
-# Faucet (admin)
+# Faucet (MANTÉM admin token)
 # ============================================================
 @app.route("/api/faucet", methods=["POST"])
 @require_rate_limit("faucet")
@@ -1392,6 +1382,7 @@ def health():
             "height": _get_chain().db.height(),
             "l2_enabled": L2_ENABLED,
             "chain_injected": _CHAIN is not None,
+            "mode": "modo2_aberto",
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1401,7 +1392,8 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.3",
+        "version": "9.4",
+        "mode": "modo2_aberto",
         "l2_enabled": L2_ENABLED,
         "admin_protected": bool(ADMIN_TOKEN),
     })
@@ -1424,9 +1416,12 @@ def _shutdown():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.3 — http://{WEB_HOST}:{port}")
+    print(f"BRN Server v9.4 (Modo 2 — mineração aberta)")
+    print(f"  → http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
+    print(f"  /api/mine:    PÚBLICO (sem token)")
+    print(f"  /api/faucet:  {'PROTEGIDO' if ADMIN_TOKEN else 'PÚBLICO'}")
     print(f"  CORS: {CORS_ORIGINS or '(desabilitado)'}")
     print(f"  ProxyFix: {'ON' if BEHIND_PROXY else 'off'}")
 
