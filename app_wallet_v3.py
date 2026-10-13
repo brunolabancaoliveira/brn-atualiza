@@ -1,38 +1,25 @@
 """
-app_wallet_v3.py — Carteira desktop BRN (PyWebView) | v3.6
+app_wallet_v3.py — Carteira desktop BRN (PyWebView) | v3.7
 ============================================================
 API exposta ao JavaScript via ponte pywebview.
 
+v3.7:
+  [FIX] minhas_txs() agora chama /api/minhas-txs (endpoint real)
+  [FIX] list_transactions() também usa o endpoint real
+  [NEW] cache local das últimas txs (evita spam de requisições)
+  [NEW] timeout configurável via env
 v3.6:
-  [FIX] removido sys.exit(1) no import — WalletApi pode ser importada
-        por main.py sem matar o processo
-  [FIX] import webview / requests agora é lazy (headless funciona)
-  [FIX] autenticação via Bearer (BRN_ADMIN_TOKEN), não Basic Auth
-        (server.py v9.3 usa @_admin_required com Bearer)
+  [FIX] removido sys.exit(1) no import
+  [FIX] import webview / requests lazy
+  [FIX] autenticação via Bearer (BRN_ADMIN_TOKEN)
   [FIX] _senha_carteira() NÃO cai para BRN_WEB_PASS
-        (usa BRN_WALLET_SESSION_PASS → BRN_NODE_PASSWORD)
-  [FIX] save_current_wallet NÃO grava mais current_wallet.json em plaintext
-  [FIX] user_wallets.json escrito atomicamente + lock de arquivo
-  [FIX] get_active_wallet() registra pubkey em user_wallets.json
-        (antes o miner falhava com "Pubkey desconhecida")
-  [FIX] minhas_txs() e list_transactions() detectam endpoint inexistente
-        e devolvem resposta amigável (não 404 cru)
+  [FIX] user_wallets.json escrito atomicamente
   [NEW] WalletApi.info() / close() / __enter__ / __exit__
-  [NEW] Detecta versão do server no /health (faz 1 probe no __init__)
-  [NEW] X-BRN-Sk header nas transferências (server v9.3 aceita)
-
+  [NEW] Probe de versão do server no /health
 v3.5.1:
-  [FIX] start_mining() usa timeout curto (30s) e trata timeout como
-        "iniciado em background" em vez de reportar erro.
+  start_mining() usa timeout curto (30s)
 v3.5:
-  [FIX] generate_wallet() salva current_wallet.enc automaticamente
-  [FIX] start_mining() envia 'miner_pubkey' (chave que o server espera)
-  [FIX] mine_block() envia 'miner_pubkey'
-  [FIX] get_active_wallet() tenta .enc primeiro, depois .json (legado)
-  [NEW] _senha_carteira() le BRN_WALLET_SESSION_PASS ou BRN_NODE_PASSWORD
-  [NEW] registro automatico em user_wallets.json quando a carteira e gerada
-v3.4.1:
-  timeouts maiores (leitura=30, tx=20, mina=120).
+  generate_wallet() salva current_wallet.enc automaticamente
 ============================================================
 """
 from __future__ import annotations
@@ -46,7 +33,7 @@ import time
 from pathlib import Path
 
 # ============================================================
-# CONSTANTES / CONFIG
+# CONFIG
 # ============================================================
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -58,11 +45,11 @@ EXPLORER_URL   = os.environ.get("BRN_EXPLORER_URL",
 
 ADMIN_TOKEN    = os.environ.get("BRN_ADMIN_TOKEN", "").strip()
 
-TIMEOUT_LEITURA     = 30
-TIMEOUT_TX          = 120
-TIMEOUT_MINERACAO   = 300
-TIMEOUT_MINER_START = 30
-TIMEOUT_HEALTH      = 5
+TIMEOUT_LEITURA     = int(os.environ.get("BRN_WALLET_TIMEOUT_LEITURA", "30"))
+TIMEOUT_TX          = int(os.environ.get("BRN_WALLET_TIMEOUT_TX", "120"))
+TIMEOUT_MINERACAO   = int(os.environ.get("BRN_WALLET_TIMEOUT_MINERACAO", "300"))
+TIMEOUT_MINER_START = int(os.environ.get("BRN_WALLET_TIMEOUT_MINER_START", "30"))
+TIMEOUT_HEALTH      = int(os.environ.get("BRN_WALLET_TIMEOUT_HEALTH", "5"))
 
 CACHE_TTL          = 5
 WALLET_HTML        = "index_wallet.html"
@@ -77,20 +64,16 @@ log = logging.getLogger("brn.wallet")
 
 
 # ============================================================
-# HELPERS DE SENHA / CARREGAMENTO LAZY
+# HELPERS
 # ============================================================
 def _senha_carteira() -> str:
-    """
-    Senha para cifrar/decifrar current_wallet.enc.
-    NÃO usa BRN_WEB_PASS — esse é para o app HTTP, não para o cofre.
-    Ordem: BRN_WALLET_SESSION_PASS → BRN_NODE_PASSWORD.
-    """
+    """Senha para cifrar/decifrar current_wallet.enc.
+    NÃO usa BRN_WEB_PASS — esse é para o app HTTP, não para o cofre."""
     return (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
             or os.environ.get("BRN_NODE_PASSWORD", "").strip())
 
 
 def _load_requests():
-    """Import lazy — evita ImportError no boot se a dep faltar."""
     try:
         import requests  # type: ignore
         return requests
@@ -102,7 +85,6 @@ def _load_requests():
 
 
 def _load_webview():
-    """Import lazy — permite importar WalletApi sem pywebview (headless)."""
     try:
         import webview  # type: ignore
         return webview
@@ -110,22 +92,14 @@ def _load_webview():
         return None
 
 
-# ============================================================
-# AUTENTICAÇÃO HTTP
-# ============================================================
 def _auth_kwargs() -> dict:
-    """
-    server.py v9.3 usa Bearer token para endpoints admin
-    (@_admin_required). Não usa Basic Auth.
-    Retorna kwargs para requests: {"headers": {...}} ou {}.
-    """
+    """Retorna headers com Bearer token se BRN_ADMIN_TOKEN definido."""
     if ADMIN_TOKEN:
         return {"headers": {"Authorization": f"Bearer {ADMIN_TOKEN}"}}
     return {}
 
 
 def _tratar_erro_http(r):
-    """Converte resposta HTTP de erro em dict uniforme para o JS."""
     if r.status_code == 400:
         try:
             data = r.json()
@@ -151,7 +125,7 @@ def _tratar_erro_http(r):
 
 
 # ============================================================
-# USER_WALLETS.JSON (atômico + lock)
+# USER_WALLETS.JSON
 # ============================================================
 _wallets_lock = threading.Lock()
 
@@ -183,7 +157,6 @@ def _salvar_wallets_atomico(w: dict) -> bool:
 
 
 def _registrar_pubkey(addr: str, pk: str) -> bool:
-    """Registra/atualiza pubkey de um endereço em user_wallets.json."""
     if not addr or not pk:
         return False
     try:
@@ -198,20 +171,20 @@ def _registrar_pubkey(addr: str, pk: str) -> bool:
 
 
 # ============================================================
-# WALLET API (exposta ao JS via pywebview)
+# WALLET API
 # ============================================================
 class WalletApi:
-    """API exposta ao JavaScript via pywebview."""
-
     def __init__(self):
         self._cache_saldos: dict = {}
-        self._session = None  # requests.Session (lazy)
+        self._cache_txs: dict = {}
+        self._cache_txs_lock = threading.Lock()
+        self._session = None
         self._server_version = ""
         self._server_has_admin_token = False
         self._probe_server()
 
     # --------------------------------------------------------
-    # SESSÃO / PROBE
+    # SESSÃO
     # --------------------------------------------------------
     def _get_session(self):
         if self._session is None:
@@ -220,10 +193,6 @@ class WalletApi:
         return self._session
 
     def _probe_server(self):
-        """
-        Faz 1 chamada rápida ao /health para saber se o server está
-        de pé e qual a versão. Nunca levanta — falha silenciosa.
-        """
         try:
             requests = _load_requests()
             r = requests.get(f"{API_URL}/health", timeout=TIMEOUT_HEALTH)
@@ -233,11 +202,13 @@ class WalletApi:
                 self._server_has_admin_token = bool(
                     data.get("admin_protected", False)
                 )
+                mode = data.get("mode", "")
+                if mode:
+                    self._server_version += f" ({mode})"
         except Exception:
             pass
 
     def info(self) -> dict:
-        """Diagnóstico — útil para JS mostrar no rodapé."""
         senha_ok = bool(_senha_carteira())
         return {
             "api_url":       API_URL,
@@ -266,7 +237,7 @@ class WalletApi:
         return False
 
     # --------------------------------------------------------
-    # CACHE
+    # CACHE SALDOS
     # --------------------------------------------------------
     def _cache_get(self, key):
         if key in self._cache_saldos:
@@ -283,15 +254,12 @@ class WalletApi:
             if k.startswith(prefix):
                 del self._cache_saldos[k]
 
-    # ========================================================
-    # CARTEIRA LOCAL
-    # ========================================================
+    # --------------------------------------------------------
+    # CARTEIRA
+    # --------------------------------------------------------
     def generate_wallet(self):
-        """
-        Gera carteira, salva em current_wallet.enc (cifrada) e
-        registra pubkey em user_wallets.json.
-        """
         try:
+            from wallet import WalletManager
             info = WalletManager.generate_keypair()
             addr = info.get("address", "")
             sk = info.get("private_key", "")
@@ -300,7 +268,7 @@ class WalletApi:
             if not addr or not sk or not pk:
                 return {"erro": "Falha ao gerar chaves (resposta incompleta)"}
 
-            # 1) Salva current_wallet.enc (cifrado) via secure_store
+            # Salva current_wallet.enc
             senha = _senha_carteira()
             if senha:
                 try:
@@ -317,11 +285,8 @@ class WalletApi:
                         log.warning(f"save_current_wallet: {r.get('msg')}")
                 except Exception as e:
                     log.warning(f"save_current_wallet falhou: {e}")
-            else:
-                log.warning("BRN_WALLET_SESSION_PASS/BRN_NODE_PASSWORD nao definidas "
-                            "— carteira nao sera salva em .enc")
 
-            # 2) Registra pubkey (atômico + lock)
+            # Registra pubkey
             _registrar_pubkey(addr, pk)
 
             return {
@@ -335,16 +300,12 @@ class WalletApi:
 
     def validate_address(self, addr):
         try:
+            from wallet import WalletManager
             return WalletManager.validate_address(addr)
         except Exception:
             return False
 
     def get_active_wallet(self):
-        """
-        Carrega current_wallet.enc (novo) ou current_wallet.json (legado).
-        Registra pubkey em user_wallets.json automaticamente (evita o
-        erro "Pubkey desconhecida" ao minerar).
-        """
         senha = _senha_carteira()
 
         # 1) .enc
@@ -367,7 +328,7 @@ class WalletApi:
             except Exception as e:
                 log.debug(f"load_current_wallet falhou: {e}")
 
-        # 2) .json (legado, plaintext)
+        # 2) .json (legado)
         try:
             p = Path(CURRENT_WALLET_JSON)
             if not p.exists():
@@ -386,9 +347,9 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # ========================================================
-    # LEITURA (nó)
-    # ========================================================
+    # --------------------------------------------------------
+    # LEITURA
+    # --------------------------------------------------------
     def portfolio(self, addr):
         if not self.validate_address(addr):
             return {"erro": "Endereco invalido."}
@@ -440,9 +401,9 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # ========================================================
-    # EXPLORADOR
-    # ========================================================
+    # --------------------------------------------------------
+    # EXPLORER
+    # --------------------------------------------------------
     def list_blocks(self, start=0, limit=15):
         try:
             s = self._get_session()
@@ -468,38 +429,61 @@ class WalletApi:
         except Exception as e:
             return {"erro": str(e)}
 
-    def list_transactions(self, addr):
+    # --------------------------------------------------------
+    # MINHAS TRANSAÇÕES (v3.7 — chama endpoint real)
+    # --------------------------------------------------------
+    def minhas_txs(self, addr, force: bool = False):
         """
-        Endpoint /api/transacoes/{addr} NÃO existe no server v9.3.
-        Retorna lista vazia com aviso amigável em vez de 404.
-        """
-        if not self.validate_address(addr):
-            return {"erro": "Endereco invalido."}
-        return {
-            "ok": True,
-            "count": 0,
-            "transactions": [],
-            "msg": "Listagem de txs por endereço ainda não implementada no nó.",
-        }
-
-    def minhas_txs(self, addr):
-        """
-        Endpoint /api/minhas-txs/{addr} NÃO existe no server v9.3.
-        Devolve estrutura vazia para o JS não quebrar.
+        Retorna histórico completo de transações do endereço.
+        v3.7: chama /api/minhas-txs (endpoint real do server v9.4).
         """
         if not self.validate_address(addr):
             return {"ok": False, "msg": "Endereco invalido."}
-        return {
-            "ok": True,
-            "address": addr,
-            "count": 0,
-            "transactions": [],
-            "msg": "Endpoint de histórico ainda não disponível no nó.",
-        }
 
-    # ========================================================
-    # TRANSACOES
-    # ========================================================
+        cache_key = f"txs:{addr}"
+        if not force:
+            with self._cache_txs_lock:
+                if cache_key in self._cache_txs:
+                    ts, val = self._cache_txs[cache_key]
+                    if time.time() - ts < CACHE_TTL:
+                        return val
+
+        try:
+            s = self._get_session()
+            r = s.get(f"{API_URL}/api/minhas-txs/{addr}",
+                      timeout=TIMEOUT_LEITURA, **_auth_kwargs())
+            if r.status_code == 200:
+                data = r.json()
+                with self._cache_txs_lock:
+                    self._cache_txs[cache_key] = (time.time(), data)
+                return data
+            return _tratar_erro_http(r)
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
+    def list_transactions(self, addr):
+        """
+        Compat com chamadas antigas. Delega para minhas_txs.
+        """
+        r = self.minhas_txs(addr)
+        if r.get("ok"):
+            return {"ok": True,
+                    "count": r.get("count", 0),
+                    "transactions": r.get("transactions", [])}
+        return r
+
+    def _invalidate_txs_cache(self, addr: str = "") -> None:
+        with self._cache_txs_lock:
+            if not addr:
+                self._cache_txs.clear()
+            else:
+                for k in list(self._cache_txs.keys()):
+                    if k == f"txs:{addr}":
+                        del self._cache_txs[k]
+
+    # --------------------------------------------------------
+    # TRANSFER
+    # --------------------------------------------------------
     def transfer(self, sender, to, asset_id, amount, sk, pk):
         if not self.validate_address(sender):
             return {"ok": False, "msg": "Remetente invalido."}
@@ -525,7 +509,6 @@ class WalletApi:
             "nonce": int(time.time() * 1000),
         }
 
-        # [v3.6] X-BRN-Sk também no header (server v9.3 lê ambos)
         headers = dict(_auth_kwargs().get("headers", {}))
         if sk:
             headers["X-BRN-Sk"] = sk
@@ -535,12 +518,17 @@ class WalletApi:
             r = s.post(f"{API_URL}/api/transfer", json=payload,
                        timeout=TIMEOUT_TX, headers=headers)
             self._cache_invalidate("portfolio:")
+            self._invalidate_txs_cache(sender)
+            self._invalidate_txs_cache(to)
             if r.status_code != 200:
                 return _tratar_erro_http(r)
             return r.json()
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
+    # --------------------------------------------------------
+    # MINERAÇÃO
+    # --------------------------------------------------------
     def mine_block(self, addr, pk=""):
         if not self.validate_address(addr):
             return {"ok": False, "msg": "Endereco invalido."}
@@ -557,40 +545,13 @@ class WalletApi:
                 resp = r.json()
                 if resp.get("ok"):
                     self._cache_invalidate(f"portfolio:{addr}")
+                    self._invalidate_txs_cache(addr)
                 return resp
             return _tratar_erro_http(r)
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    def call_faucet(self, addr, sk, pk):
-        if not self.validate_address(addr):
-            return {"ok": False, "msg": "Endereco invalido."}
-        try:
-            payload = {
-                "address": addr,
-                "public_key": pk,
-                "miner_pubkey": pk,
-                "private_key": sk,
-            }
-            s = self._get_session()
-            r = s.post(f"{API_URL}/api/faucet", json=payload,
-                       timeout=TIMEOUT_TX, **_auth_kwargs())
-            if r.status_code != 200:
-                return _tratar_erro_http(r)
-            self._cache_invalidate(f"portfolio:{addr}")
-            return r.json()
-        except Exception as e:
-            return {"ok": False, "msg": str(e)}
-
-    # ========================================================
-    # MINER LOOP
-    # ========================================================
     def start_mining(self, address, pubkey=""):
-        """
-        Inicia mineração contínua.
-        Timeout curto; se der timeout, assume que o servidor iniciou
-        em background (evita falso negativo).
-        """
         try:
             payload = {
                 "validator_address": address,
@@ -605,7 +566,6 @@ class WalletApi:
                 return _tratar_erro_http(r)
             return r.json()
         except Exception as e:
-            # Timeout pode ser processamento lento do lado do servidor
             msg = str(e)
             if "timed out" in msg.lower() or "timeout" in msg.lower():
                 log.warning("start_mining: timeout; assumindo background")
@@ -640,9 +600,9 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "running": False, "msg": str(e)}
 
-    # ========================================================
-    # VERIFICACAO DE TX
-    # ========================================================
+    # --------------------------------------------------------
+    # TX STATUS / VERIFICAR
+    # --------------------------------------------------------
     def tx_status(self, txid_str):
         try:
             s = self._get_session()
@@ -668,17 +628,36 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # ========================================================
-    # BRIDGE (stub)
-    # ========================================================
-    def bridge_claim(self, txid, addr):
-        return {"ok": False, "msg": "Bridge nao disponivel nesta versao"}
+    # --------------------------------------------------------
+    # FAUCET
+    # --------------------------------------------------------
+    def call_faucet(self, addr, sk, pk):
+        if not self.validate_address(addr):
+            return {"ok": False, "msg": "Endereco invalido."}
+        try:
+            payload = {
+                "address": addr,
+                "public_key": pk,
+                "miner_pubkey": pk,
+                "private_key": sk,
+            }
+            s = self._get_session()
+            r = s.post(f"{API_URL}/api/faucet", json=payload,
+                       timeout=TIMEOUT_TX, **_auth_kwargs())
+            if r.status_code != 200:
+                return _tratar_erro_http(r)
+            self._cache_invalidate(f"portfolio:{addr}")
+            self._invalidate_txs_cache(addr)
+            return r.json()
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
 
-    # ========================================================
-    # PERSISTENCIA LOCAL
-    # ========================================================
+    # --------------------------------------------------------
+    # SALVAR / CARREGAR
+    # --------------------------------------------------------
     def save_wallet(self, filename, password, address, sk, pk):
         try:
+            from wallet import WalletManager
             return WalletManager.save_encrypted_wallet(
                 filename, password, address, sk, pk)
         except Exception as e:
@@ -686,37 +665,37 @@ class WalletApi:
 
     def load_wallet(self, filename, password):
         try:
-            return WalletManager.load_encrypted_wallet(filename, password)
+            from wallet import WalletManager
+            r = WalletManager.load_encrypted_wallet(filename, password)
+            if r.get("ok"):
+                _registrar_pubkey(r.get("address", ""),
+                                  r.get("public_key", ""))
+                senha = _senha_carteira()
+                if senha:
+                    try:
+                        from secure_store import save_current_wallet
+                        save_current_wallet(senha, {
+                            "address": r.get("address", ""),
+                            "private_key": r.get("private_key", ""),
+                            "public_key": r.get("public_key", ""),
+                            "pub_hex": r.get("public_key", ""),
+                        })
+                    except Exception as e:
+                        log.warning(f"save_current_wallet falhou: {e}")
+            return r
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
     def list_wallets(self):
         try:
+            from wallet import WalletManager
             return WalletManager.list_wallets()
         except Exception:
             return []
 
 
 # ============================================================
-# IMPORTA WalletManager (lazy, mas com erro claro)
-# ============================================================
-try:
-    from wallet import WalletManager
-except ImportError:
-    class _MissingWalletManager:
-        def __getattr__(self, name):
-            def _fail(*args, **kwargs):
-                raise ImportError(
-                    "wallet.py indisponível — não consigo usar WalletManager"
-                )
-            return _fail
-
-    WalletManager = _MissingWalletManager()  # type: ignore
-    log.warning("wallet.py não disponível — WalletManager em modo stub")
-
-
-# ============================================================
-# MAIN (standalone: python app_wallet_v3.py)
+# MAIN
 # ============================================================
 def main():
     webview = _load_webview()
@@ -727,7 +706,6 @@ def main():
 
     if not os.environ.get("BRN_WEB_PASS"):
         print("ERRO: defina BRN_WEB_PASS antes de rodar.", file=sys.stderr)
-        print("      Ex: set BRN_WEB_PASS=carteira123", file=sys.stderr)
         sys.exit(1)
 
     index_path = BASE_DIR / WALLET_HTML
@@ -739,7 +717,7 @@ def main():
     info = api.info()
 
     log.info("=" * 60)
-    log.info("  BRN Wallet v3.6")
+    log.info("  BRN Wallet v3.7")
     log.info(f"  API_URL      : {info['api_url']}")
     log.info(f"  EXPLORER_URL : {info['explorer_url']}")
     log.info(f"  HTML         : {index_path.name}")
