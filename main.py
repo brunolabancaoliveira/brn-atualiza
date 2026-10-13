@@ -1,16 +1,19 @@
 """
-main.py — Entrypoint unificado do nó BRN (v13.1)
+main.py — Entrypoint unificado do nó BRN (v13.2)
 ================================================================
+v13.2:
+  [FIX] run_status_loop não chama mais p2p.get_status() (que tocava
+        o SQLite em paralelo e gerava "bad parameter or other API misuse").
+        Agora usa só p2p.discovery.listar_peers() — memória, sem DB.
 v13.1:
   [FIX] Defaults ajustados para rede Tailscale privada:
         - BRN_BOOTSTRAP_PEERS: "192.168.0.19:6001" → "100.111.253.8:6001"
-        - BRN_ALL_MINERS:      "1" → "0"  (evita forks com 2-3 nós)
-        - BRN_TRACKER:         URL pública → ""  (só LAN/Tailscale)
+        - BRN_ALL_MINERS:      "1" → "0"
+        - BRN_TRACKER:         URL pública → ""
 v13:
   [NEW] HTTP via Waitress (produção, cross-platform) com fallback
-        para Flask dev server. Aguenta ~10x mais requisições.
-  [NEW] BRN_HTTP_THREADS (default 16) — pool de threads do Waitress
-  [NEW] DIFFICULTY=6 via BRN_MIN_DIFFICULTY (em blockchain.py)
+  [NEW] BRN_HTTP_THREADS (default 16)
+  [NEW] DIFFICULTY=6 via BRN_MIN_DIFFICULTY
 v12.6:
   [NEW] Modo "todos mineram" via BRN_ALL_MINERS=1
 v12.5:
@@ -73,61 +76,30 @@ def _bootstrap_env() -> None:
 
 # ============================================================
 # DEFAULTS HARDCODED
-# ------------------------------------------------------------
-# Aplica só se a variável NÃO estiver no ambiente.
-# Prioridade final:
-#   1) Shell / .bat          (maior)
-#   2) brn_network.env
-#   3) _HARDCODED_DEFAULTS   (menor)
 # ============================================================
 _HARDCODED_DEFAULTS = {
-    # --- Identidade do nó ---
     "BRN_NODE_PASSWORD":       "senha-no-temp-123",
     "BRN_NETWORK_SECRET":      "9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9",
-
-    # [v13.1] Bootstrap Tailscale da Ubuntu (era 192.168.0.19)
     "BRN_BOOTSTRAP_PEERS":     "100.111.253.8:6001",
-
-    # --- Carteira ---
     "BRN_WEB_PASS":            "senha-temp-123",
     "BRN_WALLET_SESSION_PASS": "senha-forte-da-carteira-2026",
-
-    # --- Modo ---
     "BRN_IS_ORIGIN":           "0",
-
-    # [v13.1] Modo "todos mineram" DESLIGADO por padrão (evita forks)
     "BRN_ALL_MINERS":          "0",
-
-    # --- Mineração distribuída ---
     "BRN_MIN_DIFFICULTY":      "6",
-
-    # --- HTTP ---
     "BRN_HTTP_THREADS":        "16",
-
-    # --- HTTPS / Audit ---
     "BRN_HTTPS":               "0",
     "BRN_AUDIT_ENABLED":       "1",
     "BRN_AUDIT_LOG":           "audit.log",
-
-    # --- P2P ---
     "BRN_P2P_AUTH":            "optional",
     "BRN_P2P_AUTH_WINDOW":     "30",
     "BRN_P2P_NONCE_CACHE":     "10000",
-
-    # --- Verify ---
     "BRN_SKIP_VERIFY":         "0",
     "BRN_VERIFY_STRICT":       "0",
-
-    # [v13.1] Sem tracker público — só LAN/Tailscale
     "BRN_TRACKER":             "",
-
-    # --- MongoDB ---
     "MONGO_USER":              "brunolabncaolivira_db_user",
     "MONGO_PASS":              "SUA_SENHA_DO_ATLAS_AQUI",
     "MONGO_HOST":              "cluster0.vbxjymy.mongodb.net",
     "MONGO_DB":                "brn_analytics",
-
-    # --- Tailscale ---
     "TS_AUTH_KEY":             "",
     "TS_API_KEY":              "",
     "TS_TAILNET":              "",
@@ -225,7 +197,7 @@ def _check_required_modules() -> list:
 
 
 # ============================================================
-# L2 — fallback que NUNCA quebra o nó
+# L2 — fallback
 # ============================================================
 L2_ENABLED = False
 btc_config = None
@@ -320,8 +292,7 @@ def parse_args():
     p.add_argument("--config", default="config.json")
     p.add_argument("--log-level", default=None)
     p.add_argument("--log-file", default=None)
-    p.add_argument("--password-file", default=None,
-                   help="arquivo com a senha do nó (uma linha)")
+    p.add_argument("--password-file", default=None)
     p.add_argument("--rotate-node-id", action="store_true")
     p.add_argument("--client-mode", action="store_true")
     p.add_argument("--discover", action="store_true")
@@ -329,18 +300,13 @@ def parse_args():
     p.add_argument("--l2-stats", action="store_true")
     p.add_argument("--mine", action="store_true")
     p.add_argument("--no-p2p", action="store_true")
-    p.add_argument("--relay", dest="relay", action="store_true", default=None,
-                   help="Força relay ligado")
-    p.add_argument("--no-relay", dest="relay", action="store_false",
-                   help="Força relay desligado")
+    p.add_argument("--relay", dest="relay", action="store_true", default=None)
+    p.add_argument("--no-relay", dest="relay", action="store_false")
     p.add_argument("--verify-only", action="store_true")
     p.add_argument("--skip-verify", action="store_true")
-    p.add_argument("--no-tailscale", action="store_true",
-                   help="Desabilita setup automático do Tailscale neste boot")
-    p.add_argument("--no-sync", action="store_true",
-                   help="Não sincronizar cadeia com peers (debug)")
-    p.add_argument("--flask-dev", action="store_true",
-                   help="Força Flask dev server (não usa Waitress)")
+    p.add_argument("--no-tailscale", action="store_true")
+    p.add_argument("--no-sync", action="store_true")
+    p.add_argument("--flask-dev", action="store_true")
     return p.parse_args()
 
 
@@ -404,11 +370,6 @@ def _read_role() -> str:
 
 
 def _is_origin(client_mode: bool) -> bool:
-    """
-    Determina se o nó é ORIGEM (pode criar genesis + minerar).
-
-    Se BRN_ALL_MINERS=1, TODOS os nós retornam True.
-    """
     if os.environ.get("BRN_ALL_MINERS", "0") == "1":
         return True
     if client_mode:
@@ -419,7 +380,7 @@ def _is_origin(client_mode: bool) -> bool:
 
 
 # ============================================================
-# VERIFY — tri-state
+# VERIFY
 # ============================================================
 VERIFY_OK      = "ok"
 VERIFY_INVALID = "invalid"
@@ -640,14 +601,6 @@ def _init_http_server(chain, log):
 
 
 def run_http(app_instance, force_flask_dev: bool = False):
-    """
-    Roda o servidor HTTP.
-
-    Prioridade:
-      1) Se BRN_HTTPS=1 ou --flask-dev → Flask dev server (com SSL se HTTPS)
-      2) Se Waitress instalado → Waitress (produção)
-      3) Senão → Flask dev server (fallback)
-    """
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
 
@@ -747,7 +700,17 @@ def run_explorer():
     )
 
 
+# ============================================================
+# [v13.2 FIX] run_status_loop sem p2p.get_status()
+# ============================================================
 def run_status_loop(chain, p2p, l2_manager=None, sync=None):
+    """
+    Loop de status a cada 30s.
+
+    v13.2: usa p2p.discovery.listar_peers() em vez de p2p.get_status().
+    O get_status() tocava o SQLite em paralelo com a thread principal,
+    gerando "bad parameter or other API misuse" no log.
+    """
     log = get_logger("status")
     if p2p is None:
         log.warning("P2P desabilitado — status loop sem peers")
@@ -764,16 +727,25 @@ def run_status_loop(chain, p2p, l2_manager=None, sync=None):
         try:
             peer_count = 0
             relay_routes = 0
+
             if p2p is not None:
+                # ---- Conta peers SEM tocar no DB ----
                 try:
-                    st = p2p.get_status()
-                    peer_count = st.get("peer_count", 0)
+                    disc = getattr(p2p, "discovery", None)
+                    if disc is not None and hasattr(disc, "listar_peers"):
+                        peer_count = len(disc.listar_peers())
+                except Exception:
+                    peer_count = 0
+
+                # ---- Relay routes (memória, sem DB) ----
+                try:
                     relay = getattr(p2p, "relay", None)
                     if relay:
                         relay_routes = len(relay.routes)
-                except Exception as e:
-                    log.warning("p2p.get_status: " + str(e))
+                except Exception:
+                    relay_routes = 0
 
+            # ---- Estatísticas do DB ----
             mempool_n = len(chain.db.all_mempool(limit=1000))
             utxos_n = chain.db.count_utxos()
 
@@ -1108,7 +1080,6 @@ def main():
              + " | Min difficulty: " + os.environ.get("BRN_MIN_DIFFICULTY", "?"))
     log.info("=" * 60)
 
-    # ---- comandos que saem sozinhos ----
     if args.version:
         print(VERSION)
         return 0
@@ -1133,19 +1104,16 @@ def main():
             print("Erro: " + str(e))
         return 0
 
-    # ---- módulos obrigatórios ----
     missing = _check_required_modules()
     if missing:
         log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
         return 1
 
-    # ---- Tailscale automático (antes de P2P) ----
     if not args.no_tailscale:
         _setup_tailscale_auto(log)
     else:
         log.info("Tailscale: pulado por --no-tailscale")
 
-    # ---- identidade ----
     node_password = _resolve_password(args)
     try:
         node_id_priv, node_id_pub = load_or_create_node_identity(
@@ -1154,12 +1122,10 @@ def main():
         raise
     log.info("Nó ID: " + node_id_pub)
 
-    # ---- blockchain ----
     from blockchain import Blockchain
     chain = Blockchain(cfg["db_path"], auto_genesis=is_origin)
     log.info("Altura atual: " + str(chain.db.height()))
 
-    # ---- checkpoints ----
     try:
         from checkpoints import load_checkpoints
         from blockchain import set_checkpoints, set_checkpoint_priv
@@ -1173,7 +1139,6 @@ def main():
     except Exception as e:
         log.warning("Checkpoints desativados: " + str(e))
 
-    # ---- verify ----
     if args.verify_only:
         st = _verify_chain(chain)
         try:
@@ -1245,22 +1210,54 @@ def main():
 
     # ---- Rendezvous ----
     rdv = None
-    rdv_url = os.environ.get("BRN_RENDEZVOUS_URL", "").strip()
-    if rdv_url and p2p is not None:
+    if p2p is not None:
+        rdv_backend = os.environ.get("BRN_RDV_BACKEND", "auto").strip().lower()
+        mongo_ok = False
         try:
-            from rendezvous_discovery import RendezvousDiscovery
-            rdv = RendezvousDiscovery(
-                tcp_port=cfg["p2p_port"],
-                node_uuid=node_id_pub,
-                on_peer=p2p.add_peer,
-                running_flag=lambda: not _shutdown.is_set(),
-                sign_fn=node_id_priv.sign,
-            )
-            rdv.start()
-            _register_service("rendezvous", rdv)
-            log.info("Rendezvous -> " + rdv_url)
-        except Exception as e:
-            log.warning("Rendezvous falhou: " + str(e))
+            from mongo_client import mongo
+            mongo_ok = mongo.is_configured()
+        except Exception:
+            pass
+
+        use_mongo = (
+            (rdv_backend == "mongo")
+            or (rdv_backend == "auto" and mongo_ok)
+        )
+
+        if use_mongo:
+            try:
+                from rendezvous_mongo import RendezvousMongo
+                rdv = RendezvousMongo(
+                    tcp_port=cfg["p2p_port"],
+                    node_uuid=node_id_pub,
+                    on_peer=p2p.add_peer,
+                    running_flag=lambda: not _shutdown.is_set(),
+                    blockchain=chain,
+                )
+                rdv.start()
+                _register_service("rendezvous", rdv)
+                log.info("RendezvousMongo ativo (backend=mongo)")
+            except Exception as e:
+                log.warning("RendezvousMongo falhou: " + str(e))
+                rdv = None
+
+        if rdv is None:
+            rdv_url = os.environ.get("BRN_RENDEZVOUS_URL", "").strip()
+            if rdv_url:
+                try:
+                    from rendezvous_discovery import RendezvousDiscovery
+                    rdv = RendezvousDiscovery(
+                        tcp_port=cfg["p2p_port"],
+                        node_uuid=node_id_pub,
+                        on_peer=p2p.add_peer,
+                        running_flag=lambda: not _shutdown.is_set(),
+                        sign_fn=node_id_priv.sign,
+                    )
+                    rdv.start()
+                    _register_service("rendezvous", rdv)
+                    log.info("Rendezvous HTTP -> " + rdv_url)
+                except Exception as e:
+                    log.warning("Rendezvous HTTP falhou: " + str(e))
 
     # ---- L2 ----
     l2_manager = None
@@ -1369,7 +1366,6 @@ def main():
                 break
             time.sleep(1)
 
-    # ---- AUDIT ----
     _audit("node_start", {
         "mode":       "origin" if is_origin else "client",
         "all_miners": os.environ.get("BRN_ALL_MINERS") == "1",
@@ -1386,7 +1382,6 @@ def main():
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
 
-    # ---- UI / loop principal ----
     try:
         if not cfg["headless"]:
             run_wallet_main_thread()
@@ -1396,7 +1391,6 @@ def main():
     except KeyboardInterrupt:
         pass
 
-    # ---- shutdown ----
     log.info("Encerrando...")
     _shutdown.set()
     _graceful_shutdown(log)
