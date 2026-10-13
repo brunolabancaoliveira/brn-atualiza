@@ -1,3 +1,37 @@
+
+# ⛓️ BRN — BrunoCoin | Blockchain Layer 1 + L2 BTC↔BRN
+ > Blockchain completa desenvolvida do zero em Python.
+ > Inclui rede P2P autenticada, carteira HD BIP39/BIP44, mineração PoW,
+ > explorador de blocos, API REST e ponte Layer 2 com Bitcoin.
+ ---
+ ## 🚀 Recursos Principais
+ | Camada | Funcionalidade |
+ |---|---|
+ | 🔗 **L1 Blockchain** | Blocos, PoW, fork choice por trabalho acumulado, checkpoints |
+ | 🌐 **Rede P2P** | Descoberta automática, autenticação Ed25519, sincronização incremental |
+ | 💰 **Carteira HD** | BIP39/BIP44 — mnemônico de 12 palavras, endereços bech32 |
+ | ⛏️ **Mineração** | PoW com dificuldade ajustável, recompensa por bloco |
+ | 🌉 **L2 BTC ↔ BRN** | Watcher RPC, escrow, conversão Bitcoin → BRN na mineração |
+ | 📊 **Explorer + API** | Interface web e endpoints REST completos |
+ ---
+ ## 📋 Instalação Rápida
+ ### Pré-requisitos
+ - Python 3.11+
+ - Git
+ ### Passo a Passo
+ ```bash
+ # 1. Clone o repositório
+ git clone https://github.com/brunoldo2312/brn-atualiza.git
+ cd brn-atualiza
+ # 2. (OPCIONAL) Se for rodar como nó completo na rede oficial
+ # Peça o arquivo brn_network.env ao administrador
+ # e coloque na pasta raiz — NÃO está incluído no repositório
+ # 3. Rode o inicializador
+ # Windows:
+ iniciar.bat
+ # Linux/Ubuntu:
+ chmod +x iniciar.sh
+ ./iniciar.sh
 # 1. Salvar os 3 arquivos nas duas máquinas:
 #    - brn_tailscale_setup.py
 #    - iniciar.bat (Windows)
