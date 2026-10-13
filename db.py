@@ -1,9 +1,14 @@
-"""db.py — Banco SQLite do BRN (v6.3)
+"""db.py — Banco SQLite do BRN (v6.4)
+================================================================
+v6.4:
+  [NEW] get_txs_for_address() — histórico completo por endereço
+        (recebidas + enviadas + mempool) para a aba "Minhas transações"
+v6.3:
+  [FIX] contract_spend — corrigida corrupção de sintaxe
+  [NEW] get_tx_block_height(txid) — usado por Blockchain.count_confirmations
 v6.2:
   + backfill automático de transactions.raw no __init__ (idempotente)
-v6.3:
-  [FIX] contract_spend — corrigida corrupção de sintaxe (ois/dissoco)
-  [NEW] get_tx_block_height(txid) — usado por Blockchain.count_confirmations
+================================================================
 """
 import os
 import time
@@ -131,7 +136,6 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_l2tx_escrow ON l2_txs(escrow_id);
             """)
 
-            # migrações incrementais
             try:
                 cols = self.conn.execute("PRAGMA table_info(peers)").fetchall()
                 names = {c["name"] for c in cols}
@@ -297,7 +301,6 @@ class ChainDB:
         except Exception:
             return None, None
 
-    # [v6.3] NOVO — usado por Blockchain.count_confirmations
     def get_tx_block_height(self, txid: str) -> int:
         """Retorna o height do bloco onde a tx está, ou -1 se não encontrada."""
         try:
@@ -308,6 +311,125 @@ class ChainDB:
             return int(row["block_height"]) if row else -1
         except Exception:
             return -1
+
+    # ==================== [v6.4] HISTÓRICO POR ENDEREÇO ====================
+    def get_txs_for_address(self, address: str, limit: int = 200) -> list:
+        """
+        Retorna todas as txs relacionadas a um endereço:
+        - recebidas (address aparece nos outputs)
+        - enviadas (address gastou algum input)
+        - mempool (pendentes)
+
+        Cada item: {
+            "tx": dict (tx completa),
+            "block_height": int | None,
+            "is_mempool": bool,
+        }
+        """
+        result = []
+        seen_txids = set()
+
+        with self.lock:
+            # 1) Txids onde o endereço recebeu (aparece em utxos)
+            try:
+                rows = self.conn.execute(
+                    "SELECT DISTINCT txid FROM utxos WHERE address = ? LIMIT ?",
+                    (address, limit)
+                ).fetchall()
+                received_txids = {r["txid"] for r in rows}
+            except Exception:
+                received_txids = set()
+
+            # 2) Txids onde o endereço gastou (spent_by)
+            try:
+                rows = self.conn.execute(
+                    "SELECT DISTINCT spent_by FROM utxos "
+                    "WHERE address = ? AND spent_by IS NOT NULL LIMIT ?",
+                    (address, limit)
+                ).fetchall()
+                sent_txids = {r["spent_by"] for r in rows if r["spent_by"]}
+            except Exception:
+                sent_txids = set()
+
+            # 3) Carrega cada tx confirmada
+            for txid_str in (received_txids | sent_txids):
+                try:
+                    row = self.conn.execute(
+                        "SELECT raw, block_height FROM transactions "
+                        "WHERE txid = ?",
+                        (txid_str,)
+                    ).fetchone()
+                except Exception:
+                    continue
+                if not row or row["raw"] is None:
+                    continue
+                try:
+                    tx = orjson.loads(zlib.decompress(row["raw"]))
+                except Exception:
+                    continue
+                result.append({
+                    "tx": tx,
+                    "block_height": int(row["block_height"]),
+                    "is_mempool": False,
+                })
+                seen_txids.add(txid_str)
+
+            # 4) Mempool — checa se o endereço aparece
+            try:
+                mp_rows = self.conn.execute(
+                    "SELECT txid, raw FROM mempool"
+                ).fetchall()
+            except Exception:
+                mp_rows = []
+
+            for r in mp_rows:
+                txid_str = r["txid"]
+                if txid_str in seen_txids:
+                    continue
+                try:
+                    tx = orjson.loads(zlib.decompress(r["raw"]))
+                except Exception:
+                    continue
+
+                touches = False
+
+                # 4a) Outputs
+                for o in tx.get("outputs", []):
+                    if o.get("address") == address:
+                        touches = True
+                        break
+
+                # 4b) Inputs — consulta utxos para descobrir de quem é
+                if not touches:
+                    for inp in tx.get("inputs", []):
+                        if inp.get("txid") == "0" * 64:
+                            continue
+                        try:
+                            row_u = self.conn.execute(
+                                "SELECT address FROM utxos "
+                                "WHERE txid = ? AND vout = ?",
+                                (inp.get("txid"), inp.get("vout"))
+                            ).fetchone()
+                        except Exception:
+                            continue
+                        if row_u and row_u["address"] == address:
+                            touches = True
+                            break
+
+                if touches:
+                    result.append({
+                        "tx": tx,
+                        "block_height": None,
+                        "is_mempool": True,
+                    })
+
+        # Ordena: pendentes primeiro, depois por altura decrescente
+        result.sort(key=lambda x: (
+            0 if x["is_mempool"] else 1,
+            -(x["block_height"] or 0),
+        ))
+
+        return result[:limit]
 
     # ==================== UTXO ====================
     def balance(self, address):
@@ -792,126 +914,8 @@ class ChainDB:
             "SELECT * FROM contract_events ORDER BY id DESC LIMIT ?",
             (limit,)).fetchall()
         return [dict(r) for r in rows]
-    # ==================== HISTÓRICO POR ENDEREÇO ====================
-    def get_txs_for_address(self, address: str, limit: int = 200) -> list:
-        """
-        Retorna todas as txs relacionadas a um endereço:
-        - recebidas (address aparece nos outputs)
-        - enviadas (address gastou algum input)
-        - mempool (pendentes)
 
-        Cada item: {
-            "tx": dict (tx completa),
-            "block_height": int | None,
-            "is_mempool": bool,
-        }
-        """
-        result = []
-        seen_txids = set()
-
-        with self.lock:
-            # 1) Txids onde o endereço recebeu (aprecendo em utxos como output)
-            try:
-                rows = self.conn.execute(
-                    "SELECT DISTINCT txid FROM utxos WHERE address = ? LIMIT ?",
-                    (address, limit)
-                ).fetchall()
-                received_txids = {r["txid"] for r in rows}
-            except Exception:
-                received_txids = set()
-
-            # 2) Txids onde o endereço gastou (spent_by)
-            try:
-                rows = self.conn.execute(
-                    "SELECT DISTINCT spent_by FROM utxos "
-                    "WHERE address = ? AND spent_by IS NOT NULL LIMIT ?",
-                    (address, limit)
-                ).fetchall()
-                sent_txids = {r["spent_by"] for r in rows if r["spent_by"]}
-            except Exception:
-                sent_txids = set()
-
-            # 3) Carrega cada tx confirmada
-            for txid_str in (received_txids | sent_txids):
-                try:
-                    row = self.conn.execute(
-                        "SELECT raw, block_height FROM transactions "
-                        "WHERE txid = ?",
-                        (txid_str,)
-                    ).fetchone()
-                except Exception:
-                    continue
-                if not row or row["raw"] is None:
-                    continue
-                try:
-                    tx = orjson.loads(zlib.decompress(row["raw"]))
-                except Exception:
-                    continue
-                result.append({
-                    "tx": tx,
-                    "block_height": int(row["block_height"]),
-                    "is_mempool": False,
-                })
-                seen_txids.add(txid_str)
-
-            # 4) Mempool — checa se o endereço aparece
-            try:
-                mp_rows = self.conn.execute(
-                    "SELECT txid, raw FROM mempool"
-                ).fetchall()
-            except Exception:
-                mp_rows = []
-
-            for r in mp_rows:
-                txid_str = r["txid"]
-                if txid_str in seen_txids:
-                    continue
-                try:
-                    tx = orjson.loads(zlib.decompress(r["raw"]))
-                except Exception:
-                    continue
-
-                touches = False
-
-                # 4a) Outputs
-                for o in tx.get("outputs", []):
-                    if o.get("address") == address:
-                        touches = True
-                        break
-
-                # 4b) Inputs — consulta utxos para descobrir de quem é
-                if not touches:
-                    for inp in tx.get("inputs", []):
-                        if inp.get("txid") == "0" * 64:
-                            continue
-                        try:
-                            row_u = self.conn.execute(
-                                "SELECT address FROM utxos "
-                                "WHERE txid = ? AND vout = ?",
-                                (inp.get("txid"), inp.get("vout"))
-                            ).fetchone()
-                        except Exception:
-                            continue
-                        if row_u and row_u["address"] == address:
-                            touches = True
-                            break
-
-                if touches:
-                    result.append({
-                        "tx": tx,
-                        "block_height": None,
-                        "is_mempool": True,
-                    })
-
-        # Ordena: pendentes primeiro, depois por altura decrescente
-        result.sort(key=lambda x: (
-            0 if x["is_mempool"] else 1,
-            -(x["block_height"] or 0),
-        ))
-
-        return result[:limit]
-
-    # ==================== [FIX v6.3] contract_spend ====================
+    # ==================== CONTRACT_SPEND ====================
     def contract_spend(self, from_addr: str, to_addr: str, amount: int):
         """Move fundos de from_addr para to_addr. Chamado por contracts.py."""
         import hashlib
