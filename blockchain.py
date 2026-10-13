@@ -1,12 +1,22 @@
 """
 blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.1.6 | Data: 11/10/2026
+Versão: 9.1.7 | Data: 13/10/2026
 ================================================================
+v9.1.7:
+  [FIX] CRÍTICO: evita "difficulty death spiral".
+        Quando a chain minerou muito rápido, o retarget antigo
+        (intervalo=2016, block_time=120s) jogava a dificuldade para
+        o máximo (10) e a chain congelava — Python puro não consegue
+        minerar difficulty 10.
+        Fix:
+          - BLOCK_TIME configurável (default 30s, era 120s)
+          - DIFFICULTY_INTERVAL configurável (default 50, era 2016)
+          - MAX_DIFFICULTY configurável (default 7, era 10)
+          - BRN_FORCE_DIFFICULTY=<n> força difficulty fixa (útil para
+            destravar uma chain congelada sem precisar apagar o DB)
 v9.1.6:
-  [NEW] Callback `on_block_mined` chamado após aceitar bloco minerado.
-        Usado pelo main.py para propagar via P2P (modo "todos mineram").
+  [NEW] Callback on_block_mined.
   [NEW] INITIAL_DIFFICULTY lê de BRN_MIN_DIFFICULTY (default 5).
-        Dificuldade maior reduz colisão em rede multi-minerador.
 v9.1.5:
   [FIX] validate_block não exige pubkey em coinbase do genesis (#0).
 v9.1.4:
@@ -28,10 +38,14 @@ UNIT = 10 ** DECIMALS
 MAX_SUPPLY = 21_000_000 * UNIT
 INITIAL_REWARD = 50 * UNIT
 HALVING_INTERVAL = 210_000
-BLOCK_TIME = 120
-DIFFICULTY_INTERVAL = 2016
+
+# [v9.1.7] Todos configuráveis via env para evitar death spiral
+BLOCK_TIME = int(os.environ.get("BRN_BLOCK_TIME", "30"))
+DIFFICULTY_INTERVAL = int(os.environ.get("BRN_DIFF_INTERVAL", "50"))
+MAX_DIFFICULTY = int(os.environ.get("BRN_MAX_DIFFICULTY", "7"))
 INITIAL_DIFFICULTY = int(os.environ.get("BRN_MIN_DIFFICULTY", "5"))
-MAX_DIFFICULTY = 10
+FORCE_DIFFICULTY = os.environ.get("BRN_FORCE_DIFFICULTY", "").strip()
+
 MAX_TX_PER_BLOCK = 500
 MIN_RELAY_FEE = 1000
 MAX_REORG_DEPTH = 100
@@ -307,7 +321,6 @@ class Blockchain:
         else:
             self.require_auth_tag = bool(require_auth_tag)
 
-        # [v9.1.6] Callback: chamado após aceitar bloco minerado localmente
         self.on_block_mined = None
 
         if not auto_genesis:
@@ -363,20 +376,45 @@ class Blockchain:
             return 0
         return INITIAL_REWARD >> halvings
 
+    # ============================================================
+    # [v9.1.7] current_difficulty com BRN_FORCE_DIFFICULTY
+    # ============================================================
     def current_difficulty(self):
+        """
+        Retorna a dificuldade para o próximo bloco.
+
+        v9.1.7:
+          1. Se BRN_FORCE_DIFFICULTY estiver setado → usa esse valor
+             (evita death spiral em chains congeladas).
+          2. Caso contrário, retarget a cada DIFFICULTY_INTERVAL
+             blocos, com clamp de BLOCK_TIME segundos.
+        """
+        # [FIX] Override explícito — destrava chain congelada
+        if FORCE_DIFFICULTY:
+            try:
+                v = int(FORCE_DIFFICULTY)
+                return max(1, min(20, v))
+            except ValueError:
+                print(f"[difficulty] BRN_FORCE_DIFFICULTY inválido: "
+                      f"{FORCE_DIFFICULTY!r} — ignorando")
+
         h = self.db.height()
         if h < DIFFICULTY_INTERVAL:
             return INITIAL_DIFFICULTY
+
         start = self.db.get_block(h - DIFFICULTY_INTERVAL + 1)
         end = self.db.get_block(h)
         if not start or not end:
             return INITIAL_DIFFICULTY
+
         if end["difficulty"] > MAX_DIFFICULTY:
             return MAX_DIFFICULTY
+
         actual = max(1, end["timestamp"] - start["timestamp"])
         expected = BLOCK_TIME * DIFFICULTY_INTERVAL
         prev = end["difficulty"]
         new = int(prev * expected / actual)
+        # Limita variação por ciclo (4x pra cima, 4x pra baixo)
         new = max(prev // 4, min(prev * 4, new))
         new = max(1, min(MAX_DIFFICULTY, new))
         return new
@@ -726,7 +764,6 @@ class Blockchain:
         return block
 
     def _fire_block_mined(self, block):
-        """[v9.1.6] Notifica o callback (usado pelo main.py → p2p.broadcast_block)."""
         cb = self.on_block_mined
         if cb is None:
             return
