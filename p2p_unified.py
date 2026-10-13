@@ -1,11 +1,13 @@
 """
-p2p_unified.py — BRN P2P Network v6.6.2
+p2p_unified.py — BRN P2P Network v6.6.3
 ================================================================
+v6.6.3:
+  [FIX] _refresh_heights_loop agora atualiza last_seen no DB
+        a cada ciclo. Antes, o peer só era registrado na primeira
+        descoberta — passados 5min, contar_peers(apenas_ativos=True)
+        retornava 0 e a GUI mostrava "Peers: 0" mesmo com peers reais.
 v6.6.2:
-  [NEW] Gossip em _on_new_block — quando aceita bloco de um peer,
-        retransmite para os outros peers (menos o que enviou).
-        Isso é o que faz "todos minerarem" funcionar: sem gossip,
-        o bloco minerado por um nó só chega no outro se for vizinho direto.
+  [NEW] Gossip em _on_new_block — retransmite bloco para outros peers.
 v6.6.1:
   [FIX] CRÍTICO: _chain e _uuid assinados ANTES do build_auth
 v6.6:
@@ -13,7 +15,8 @@ v6.6:
 v6.5:
   [FIX] DoS em listar_peers_com_altura, P2PManager.add_peer() público,
         TOKEN HMAC 256 bits, CHAIN_ID no handshake, etc.
-v6.4: binding criptográfico ao payload
+v6.4:
+  binding criptográfico ao payload (anti payload-swap)
 ================================================================
 """
 from __future__ import annotations
@@ -191,6 +194,10 @@ def _carregar_bootstrap() -> set[str]:
 
 def _registrar_peer_no_db(blockchain, ip: str, port: int,
                            peer_id: Optional[str] = None) -> None:
+    """
+    Registra/atualiza peer no DB. Atualiza last_seen — usado tanto na
+    descoberta inicial quanto no _refresh_heights_loop (a cada 60s).
+    """
     if blockchain is None:
         return
     try:
@@ -538,7 +545,6 @@ class P2PServer(threading.Thread):
         self.on_peer_good = on_peer_good
         self.get_peers_callback = get_peers_callback
 
-        # ---- hooks de relay ----
         self.on_relay_caps:     Optional[callable] = None
         self.on_relay_request:  Optional[callable] = None
         self.on_relay_incoming: Optional[callable] = None
@@ -749,7 +755,6 @@ class P2PServer(threading.Thread):
                 return {"type": "peers",
                         "peers": peers[:MAX_PEERS_PER_PEX]}
 
-            # ---------------- relay ----------------
             if mtype == "relay_capabilities":
                 if self.on_relay_caps and peer_id:
                     try:
@@ -1131,6 +1136,9 @@ class PeerDiscovery:
                             novo = self._add_peer(peer)
                             if resp.get("_uuid"):
                                 self.register_uuid(resp["_uuid"], ip, port)
+                            # [v6.6.3] Atualiza last_seen no DB
+                            _registrar_peer_no_db(self.bc, ip, port,
+                                                  resp.get("_uuid"))
                             if novo:
                                 log.info(f"Bootstrap conectado: {peer}")
                                 self._salvar_peers()
@@ -1229,7 +1237,16 @@ class PeerDiscovery:
             except Exception:
                 pass
 
+    # ============================================================
+    # [v6.6.3] Refresh heights — AGORA ATUALIZA last_seen NO DB
+    # ============================================================
     def _refresh_heights_loop(self) -> None:
+        """
+        A cada 60s, faz get_chain_height() para cada peer e:
+          1. Atualiza o cache de alturas (usado pelo sync_manager)
+          2. [v6.6.3] Atualiza last_seen no DB (para a GUI mostrar Peers)
+          3. Registra uuid no directory (para o relay)
+        """
         while self.running:
             try:
                 peers = self.listar_peers()
@@ -1239,16 +1256,29 @@ class PeerDiscovery:
                     try:
                         ip, port = p.split(":")
                         resp, lat = P2PClient.get_chain_height(ip, int(port))
-                        if resp:
-                            with self._height_cache_lock:
-                                self._height_cache[p] = (
-                                    time.time(),
-                                    resp.get("height", 0),
-                                    resp.get("work", 0),
-                                    lat,
-                                )
-                            if resp.get("_uuid"):
-                                self.register_uuid(resp["_uuid"], ip, int(port))
+                        if not resp:
+                            continue
+
+                        # [v6.6.3] FIX PRINCIPAL: atualiza last_seen no DB.
+                        # Sem isso, contar_peers(apenas_ativos=True) retornava 0
+                        # depois de 5min, e a GUI mostrava "Peers: 0".
+                        try:
+                            _registrar_peer_no_db(
+                                self.bc, ip, int(port),
+                                resp.get("_uuid"),
+                            )
+                        except Exception as e:
+                            log.debug(f"registrar_peer_no_db falhou: {e}")
+
+                        with self._height_cache_lock:
+                            self._height_cache[p] = (
+                                time.time(),
+                                resp.get("height", 0),
+                                resp.get("work", 0),
+                                lat,
+                            )
+                        if resp.get("_uuid"):
+                            self.register_uuid(resp["_uuid"], ip, int(port))
                     except Exception:
                         continue
             except Exception:
@@ -1625,17 +1655,9 @@ class P2PManager:
                 pass
 
     # ============================================================
-    # [v6.6.2] _on_new_block com GOSSIP
+    # _on_new_block com GOSSIP (v6.6.2)
     # ============================================================
     def _on_new_block(self, block_dict: dict) -> bool:
-        """
-        Aceita um bloco vindo de um peer.
-
-        v6.6.2: adicionado gossip — retransmite o bloco para os outros
-        peers assim que ele é aceito. Sem isso, em rede com mais de 2 nós,
-        o bloco minerado por A só chega em B se A e B forem vizinhos diretos.
-        Com gossip, propaga em N saltos.
-        """
         try:
             h = block_dict.get("height", -1)
             if h == self.bc.db.height() + 1:
