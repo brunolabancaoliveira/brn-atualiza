@@ -110,6 +110,26 @@ def _get_chain():
         return _CHAIN
 
 
+# ============================================================
+# SYNC MANAGER INJETÁVEL (v7)
+# ============================================================
+_SYNC_MANAGER = None
+_SYNC_LOCK = threading.Lock()
+
+
+def set_sync_manager(sync) -> None:
+    """Injeta o ChainSyncManager no server (chamado pelo main.py)."""
+    global _SYNC_MANAGER
+    with _SYNC_LOCK:
+        _SYNC_MANAGER = sync
+    log.info("server: sync_manager injetado")
+
+
+def _get_sync_manager():
+    """Retorna o sync manager injetado, ou None se não disponível."""
+    return _SYNC_MANAGER
+
+
 class _LazyChain:
     def __getattr__(self, name):
         return getattr(_get_chain(), name)
@@ -1128,6 +1148,106 @@ def sync_info():
         log.warning(f"[sync-info] bridge: {e}")
 
     return jsonify(result), 200
+
+
+# ============================================================
+# Sync Status detalhado (v7) — progresso, velocidade, ETA
+# ============================================================
+@app.route("/api/sync/status", methods=["GET"])
+def sync_status_v7():
+    """
+    Retorna status detalhado da sincronização em tempo real.
+
+    Campos:
+      - synced          : bool — está sincronizado?
+      - syncing         : bool — sync em andamento?
+      - progress        : float — porcentagem (0-100)
+      - local_height    : int   — altura local atual
+      - target_height   : int   — altura do melhor peer
+      - blocos_faltando : int   — blocos restantes
+      - blocos_por_segundo : float — velocidade (janela 10 s)
+      - velocidade_media   : float — média desde início do sync
+      - eta_segundos    : float|null — ETA em segundos (null=desconhecido)
+      - eta_legivel     : str   — ETA em formato humano ("2m 34s", "sincronizado", etc.)
+      - active_peer     : str|null — peer ativo no momento
+      - peers_known     : int   — peers conhecidos
+      - checkpoint_violations : int — violações de checkpoint detectadas
+      - checkpoints_conhecidos: int — total de checkpoints carregados
+      - last_error      : str   — último erro (vazio se nenhum)
+      - mode            : str   — "full" ou "spv"
+    """
+    sync = _get_sync_manager()
+
+    if sync is not None:
+        try:
+            data = sync.get_status()
+        except Exception as e:
+            log.warning("[sync/status] get_status falhou: %s", e)
+            data = {}
+    else:
+        # Fallback: monta a resposta básica com dados da chain
+        data = {}
+        try:
+            chain = _get_chain()
+            local_h = chain.db.height()
+            data["local_height"] = local_h
+            data["target_height"] = local_h
+            data["synced"] = True
+            data["syncing"] = False
+            data["progress"] = 100.0
+        except Exception:
+            data["local_height"] = 0
+            data["target_height"] = 0
+            data["synced"] = False
+            data["syncing"] = False
+            data["progress"] = 0.0
+
+    # Campos com defaults seguros
+    local_h  = int(data.get("local_height", 0))
+    target_h = int(data.get("target_height", local_h))
+    progress = float(data.get("progress", 100.0 if local_h >= target_h else 0.0))
+    eta_s    = data.get("eta_segundos")
+
+    # Calcula blocos faltando
+    blocos_faltando = max(0, target_h - local_h)
+
+    # ETA em formato legível por humanos
+    if data.get("synced", True) or blocos_faltando == 0:
+        eta_legivel = "sincronizado"
+    elif eta_s is None:
+        eta_legivel = "calculando..."
+    else:
+        eta_s = float(eta_s)
+        if eta_s < 60:
+            eta_legivel = f"{int(eta_s)}s"
+        elif eta_s < 3600:
+            m, s = divmod(int(eta_s), 60)
+            eta_legivel = f"{m}m {s}s"
+        else:
+            h, rem = divmod(int(eta_s), 3600)
+            m = rem // 60
+            eta_legivel = f"{h}h {m}m"
+
+    return jsonify({
+        "ok": True,
+        "synced": bool(data.get("synced", True)),
+        "syncing": bool(data.get("syncing", False)),
+        "mode": data.get("mode", "full"),
+        "progress": round(progress, 2),
+        "local_height": local_h,
+        "target_height": target_h,
+        "blocos_faltando": blocos_faltando,
+        "blocos_por_segundo": float(data.get("blocos_por_segundo", 0.0)),
+        "velocidade_media": float(data.get("velocidade_media", 0.0)),
+        "eta_segundos": eta_s,
+        "eta_legivel": eta_legivel,
+        "active_peer": data.get("active_peer"),
+        "peers_known": int(data.get("peers_known", 0)),
+        "peers_synced": int(data.get("peers_synced", 0)),
+        "checkpoint_violations": int(data.get("checkpoint_violations", 0)),
+        "checkpoints_conhecidos": int(data.get("checkpoints_conhecidos", 0)),
+        "last_error": data.get("last_error", ""),
+    }), 200
 
 
 # ============================================================

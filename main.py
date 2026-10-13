@@ -600,6 +600,18 @@ def _init_http_server(chain, log):
     return http_app
 
 
+def _inject_sync_manager(sync, log) -> None:
+    """[v7] Injeta o ChainSyncManager no server para o endpoint /api/sync/status."""
+    if sync is None:
+        return
+    try:
+        from server import set_sync_manager
+        set_sync_manager(sync)
+        log.info("sync_manager injetado no server")
+    except Exception as e:
+        log.warning("Falha ao injetar sync_manager no server: " + str(e))
+
+
 def run_http(app_instance, force_flask_dev: bool = False):
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
@@ -1205,6 +1217,7 @@ def main():
         sync = _setup_sync(chain, p2p, log)
         if sync:
             _register_service("sync", sync)
+            _inject_sync_manager(sync, log)   # [v7] expõe para /api/sync/status
     else:
         log.info("Sync: pulado por --no-sync")
 
