@@ -97,7 +97,7 @@ _HARDCODED_DEFAULTS = {
     "BRN_VERIFY_STRICT":       "0",
     "BRN_TRACKER":             "",
     "MONGO_USER":              "brunolabncaolivira_db_user",
-    "MONGO_PASS":              "SUA_SENHA_DO_ATLAS_AQUI",
+    "MONGO_PASS":              "BR8PvWdBGrEoBF1x",
     "MONGO_HOST":              "cluster0.vbxjymy.mongodb.net",
     "MONGO_DB":                "brn_analytics",
     "TS_AUTH_KEY":             "",
@@ -598,18 +598,6 @@ def _init_http_server(chain, log):
         log.warning("auto-registro pubkey falhou: " + str(e))
 
     return http_app
-
-
-def _inject_sync_manager(sync, log) -> None:
-    """[v7] Injeta o ChainSyncManager no server para o endpoint /api/sync/status."""
-    if sync is None:
-        return
-    try:
-        from server import set_sync_manager
-        set_sync_manager(sync)
-        log.info("sync_manager injetado no server")
-    except Exception as e:
-        log.warning("Falha ao injetar sync_manager no server: " + str(e))
 
 
 def run_http(app_instance, force_flask_dev: bool = False):
@@ -1217,7 +1205,6 @@ def main():
         sync = _setup_sync(chain, p2p, log)
         if sync:
             _register_service("sync", sync)
-            _inject_sync_manager(sync, log)   # [v7] expõe para /api/sync/status
     else:
         log.info("Sync: pulado por --no-sync")
 
