@@ -1,38 +1,45 @@
-"""
-main.py — Entrypoint unificado do nó BRN (v13.2)
+"""main.py — Entrypoint unificado do nó BRN (v12.5)
 ================================================================
-v13.2:
-  [FIX] run_status_loop não chama mais p2p.get_status() (que tocava
-        o SQLite em paralelo e gerava "bad parameter or other API misuse").
-        Agora usa só p2p.discovery.listar_peers() — memória, sem DB.
-v13.1:
-  [FIX] Defaults ajustados para rede Tailscale privada:
-        - BRN_BOOTSTRAP_PEERS: "192.168.0.19:6001" → "100.111.253.8:6001"
-        - BRN_ALL_MINERS:      "1" → "0"
-        - BRN_TRACKER:         URL pública → ""
-v13:
-  [NEW] HTTP via Waitress (produção, cross-platform) com fallback
-  [NEW] BRN_HTTP_THREADS (default 16)
-  [NEW] DIFFICULTY=6 via BRN_MIN_DIFFICULTY
-v12.6:
-  [NEW] Modo "todos mineram" via BRN_ALL_MINERS=1
-v12.5:
-  [FIX] auto_genesis=is_origin (era "not is_origin")
-v12.4:
-  [FIX] blockchain usa is_origin (não args.client_mode)
-v12.3:
-  [NEW] ChainSyncManager instanciado no boot
-v12.2:
-  [FIX] _HARDCODED_DEFAULTS com segredos reais
-v12.1:
-  [FIX] server.set_chain + auto-registro
-v12:
-  [NEW] _HARDCODED_DEFAULTS
-  [NEW] Tailscale automático
-v11:
-  [FIX] BASE_DIR antes de _bootstrap_env
-  [FIX] _is_origin fail-safe: na dúvida, CLIENTE
-  [FIX] 2º Ctrl+C força saída
+Amarra tudo:
+  1. Config (brn_config.Config) + env
+  2. Senha do nó
+  3. Identidade Ed25519 (node_identity.enc)
+  4. Blockchain (blockchain.py v9.1.7)
+  5. P2P (p2p_unified.P2PManager)
+  6. Sync (sync_manager.ChainSyncManager)
+  7. Rendezvous (rendezvous_discovery.RendezvousDiscovery)
+  8. Relay (p2p_relay.RelayManager)
+  9. L2 (btc_watcher.BTCWatcher)
+ 10. HTTP server (server.py v9.5)
+ 11. Explorer (explorer.py)
+ 12. Miner (miner_loop.get_miner)
+ 13. Loop principal até Ctrl+C
+
+Argumentos:
+    --status               Mostra diagnóstico
+    --headless             Sem GUI
+    --read-only            Nó não assina blocos
+    --version              Mostra versão
+    --check-update         Consulta GitHub
+    --config PATH          Config.json (default config.json)
+    --log-level LEVEL      INFO/DEBUG/WARNING
+    --log-file PATH
+    --password-file PATH   Arquivo com senha (uma linha)
+    --rotate-node-id       Nova identidade Ed25519
+    --client-mode          Não cria genesis local
+    --discover             Diagnóstico de descoberta
+    --l2                   Habilita BTC watcher
+    --l2-stats             Mostra stats do L2 e sai
+    --mine                 Inicia miner
+    --no-p2p               Desabilita P2P
+    --no-sync              Não sincroniza
+    --no-tailscale         Pula Tailscale
+    --relay / --no-relay   Força relay on/off
+    --verify-only          Só verifica cadeia
+    --skip-verify          Pula verificação no boot
+
+Prioridade de env:
+    Shell / .bat  >  brn_network.env  >  _HARDCODED_DEFAULTS
 ================================================================
 """
 from __future__ import annotations
@@ -50,7 +57,7 @@ from pathlib import Path
 
 
 # ============================================================
-# BASE_DIR — definido ANTES de qualquer import do projeto
+# BASE_DIR — antes de qualquer import do projeto
 # ============================================================
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -75,31 +82,36 @@ def _bootstrap_env() -> None:
 
 
 # ============================================================
-# DEFAULTS HARDCODED
+# DEFAULTS HARDCODED (menor prioridade)
 # ============================================================
 _HARDCODED_DEFAULTS = {
     "BRN_NODE_PASSWORD":       "senha-no-temp-123",
     "BRN_NETWORK_SECRET":      "9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9",
-    "BRN_BOOTSTRAP_PEERS":     "100.111.253.8:6001",
+    "BRN_BOOTSTRAP_PEERS":     "",
+
     "BRN_WEB_PASS":            "senha-temp-123",
     "BRN_WALLET_SESSION_PASS": "senha-forte-da-carteira-2026",
+
     "BRN_IS_ORIGIN":           "0",
-    "BRN_ALL_MINERS":          "0",
-    "BRN_MIN_DIFFICULTY":      "6",
-    "BRN_HTTP_THREADS":        "16",
+
     "BRN_HTTPS":               "0",
     "BRN_AUDIT_ENABLED":       "1",
     "BRN_AUDIT_LOG":           "audit.log",
+
     "BRN_P2P_AUTH":            "optional",
     "BRN_P2P_AUTH_WINDOW":     "30",
     "BRN_P2P_NONCE_CACHE":     "10000",
+
     "BRN_SKIP_VERIFY":         "0",
     "BRN_VERIFY_STRICT":       "0",
+
     "BRN_TRACKER":             "",
-    "MONGO_USER":              "brunolabncaolivira_db_user",
-    "MONGO_PASS":              "BR8PvWdBGrEoBF1x",
-    "MONGO_HOST":              "cluster0.vbxjymy.mongodb.net",
+
+    "MONGO_USER":              "",
+    "MONGO_PASS":              "",
+    "MONGO_HOST":              "",
     "MONGO_DB":                "brn_analytics",
+
     "TS_AUTH_KEY":             "",
     "TS_API_KEY":              "",
     "TS_TAILNET":              "",
@@ -117,9 +129,9 @@ def _apply_hardcoded_defaults() -> int:
 
 
 _bootstrap_env()
-_aplicados = _apply_hardcoded_defaults()
-if _aplicados:
-    print("[boot] defaults aplicados: " + str(_aplicados) + " variáveis")
+_applied = _apply_hardcoded_defaults()
+if _applied:
+    print(f"[boot] defaults aplicados: {_applied} variáveis")
 
 
 # ============================================================
@@ -137,7 +149,7 @@ CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
 WEB_HOST      = os.environ.get("BRN_WEB_HOST",      "127.0.0.1")
 EXPLORER_HOST = os.environ.get("BRN_EXPLORER_HOST", "127.0.0.1")
 
-AUTO_MINE     = os.environ.get("BRN_AUTO_MINE", "0") == "1"
+AUTO_MINE = os.environ.get("BRN_AUTO_MINE", "0") == "1"
 
 _running_services: list = []
 _services_lock = threading.Lock()
@@ -172,7 +184,8 @@ def _thread_wrap(name: str, fn):
             fn()
         except Exception as e:
             try:
-                get_logger(name).exception("thread " + name + " caiu: " + str(e))
+                get_logger(name).exception(
+                    "thread " + name + " caiu: " + str(e))
             except Exception:
                 pass
     return runner
@@ -184,8 +197,10 @@ def _thread_wrap(name: str, fn):
 def _check_required_modules() -> list:
     required = [
         "brn_config", "brn_logger", "version",
-        "blockchain", "db", "crypto", "wallet",
-        "p2p_auth", "p2p_unified", "discovery_v2",
+        "blockchain", "db", "crypto", "wallet", "bech32",
+        "secure_store", "chain_validator", "checkpoints",
+        "p2p_auth", "p2p_cipher", "p2p_secure", "p2p_unified",
+        "discovery_v2", "miner_loop",
     ]
     missing = []
     for m in required:
@@ -197,7 +212,7 @@ def _check_required_modules() -> list:
 
 
 # ============================================================
-# L2 — fallback
+# L2 — fallback que NUNCA quebra o nó
 # ============================================================
 L2_ENABLED = False
 btc_config = None
@@ -216,8 +231,10 @@ except Exception as _e:
 
 
 def _l2_disponivel() -> bool:
-    return (L2_ENABLED and btc_config is not None
-            and BTCWatcher is not None and L2Manager is not None)
+    return (L2_ENABLED
+            and btc_config is not None
+            and BTCWatcher is not None
+            and L2Manager is not None)
 
 
 # ============================================================
@@ -267,9 +284,6 @@ def _setup_tailscale_auto(log) -> bool:
                     log.info("  " + line)
             return True
         log.warning("Tailscale: falhou (código " + str(r.returncode) + ")")
-        for line in (r.stdout or "").splitlines()[-4:]:
-            if line.strip():
-                log.warning("  " + line)
         return False
     except subprocess.TimeoutExpired:
         log.warning("Tailscale: timeout de 180s — continuando sem VPN")
@@ -283,7 +297,7 @@ def _setup_tailscale_auto(log) -> bool:
 # ARGS
 # ============================================================
 def parse_args():
-    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v13")
+    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v12")
     p.add_argument("--status", action="store_true")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--read-only", action="store_true")
@@ -306,7 +320,6 @@ def parse_args():
     p.add_argument("--skip-verify", action="store_true")
     p.add_argument("--no-tailscale", action="store_true")
     p.add_argument("--no-sync", action="store_true")
-    p.add_argument("--flask-dev", action="store_true")
     return p.parse_args()
 
 
@@ -370,8 +383,6 @@ def _read_role() -> str:
 
 
 def _is_origin(client_mode: bool) -> bool:
-    if os.environ.get("BRN_ALL_MINERS", "0") == "1":
-        return True
     if client_mode:
         return False
     if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
@@ -404,16 +415,28 @@ def _verify_chain(chain) -> str:
         return VERIFY_ERROR
 
     dt = time.time() - t0
-    if r.valid:
-        log.info("OK " + r.summary() + " (" + str(round(dt, 2)) + "s, "
-                 + str(r.blocks_checked) + " blocos, "
-                 + str(r.checkpoints_checked) + " checkpoints)")
-        for w in (r.warnings or [])[:5]:
+
+    # Compat: chain_validator pode retornar VerifyResult (novo) ou bool (antigo)
+    valid = getattr(r, "valid", None)
+    if valid is None:
+        valid = bool(r)
+    summary_fn = getattr(r, "summary", None)
+    blocks = getattr(r, "blocks_checked", 0)
+    cps = getattr(r, "checkpoints_checked", 0)
+    warns = getattr(r, "warnings", []) or []
+    errs = getattr(r, "errors", []) or []
+
+    if valid:
+        if callable(summary_fn):
+            log.info(f"OK {summary_fn()} ({dt:.2f}s)")
+        else:
+            log.info(f"OK cadeia íntegra ({dt:.2f}s, {blocks} blocos)")
+        for w in warns[:5]:
             log.warning("  " + str(w))
         return VERIFY_OK
 
-    log.error("CADEIA INVÁLIDA (" + str(len(r.errors)) + " erros)")
-    for e in (r.errors or [])[:10]:
+    log.error(f"CADEIA INVÁLIDA ({len(errs)} erros)")
+    for e in errs[:10]:
         log.error("  - " + str(e))
     return VERIFY_INVALID
 
@@ -469,17 +492,7 @@ def do_status(cfg):
     print(" Rendezvous  : " + (rdv if rdv else "(não configurado)"))
     print(" Tailscale   : " + (ts if ts else "(desabilitado)"))
     print(" Auto-mine   : " + ("SIM" if AUTO_MINE else "não"))
-    print(" All miners  : " + os.environ.get("BRN_ALL_MINERS", "0"))
-    print(" Min diff    : " + os.environ.get("BRN_MIN_DIFFICULTY", "?"))
-    print(" HTTP threads: " + os.environ.get("BRN_HTTP_THREADS", "?"))
     print()
-
-    try:
-        import waitress  # type: ignore
-        waitress_ver = getattr(waitress, "__version__", "?")
-        print(" Waitress    : OK (v" + str(waitress_ver) + ")")
-    except ImportError:
-        print(" Waitress    : NÃO INSTALADO (pip install waitress)")
 
     missing = _check_required_modules()
     if missing:
@@ -555,8 +568,10 @@ def _do_discover_diagnostic(cfg):
         print(" [achou] " + ip + ":" + str(port))
 
     stop = [False]
+
     try:
-        udp = UDPDiscovery(cfg["p2p_port"], "diag", on_peer, lambda: not stop[0])
+        udp = UDPDiscovery(cfg["p2p_port"], "diag", on_peer,
+                           lambda: not stop[0])
         udp.start()
         time.sleep(15)
         stop[0] = True
@@ -600,13 +615,11 @@ def _init_http_server(chain, log):
     return http_app
 
 
-def run_http(app_instance, force_flask_dev: bool = False):
+def run_http(app_instance):
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-
+    ssl_ctx = None
     if os.environ.get("BRN_HTTPS", "0") == "1":
-        log.warning("BRN_HTTPS=1 — Flask dev server (Waitress não faz SSL nativo)")
-        ssl_ctx = None
         try:
             from security import ensure_self_signed_cert
             cert, key = ensure_self_signed_cert()
@@ -615,47 +628,11 @@ def run_http(app_instance, force_flask_dev: bool = False):
         except Exception as e:
             log.warning("Falha ao gerar cert HTTPS: " + str(e) + ". Caindo para HTTP.")
             ssl_ctx = None
-        app_instance.run(
-            host=WEB_HOST, port=port, threaded=True,
-            debug=False, use_reloader=False, ssl_context=ssl_ctx,
-        )
-        return
-
-    if force_flask_dev:
-        log.info("HTTP (dev) http://" + WEB_HOST + ":" + str(port)
-                 + " [--flask-dev]")
-        app_instance.run(
-            host=WEB_HOST, port=port, threaded=True,
-            debug=False, use_reloader=False,
-        )
-        return
-
-    try:
-        from waitress import serve  # type: ignore
-        threads = int(os.environ.get("BRN_HTTP_THREADS", "16"))
-        log.info("HTTP via Waitress http://" + WEB_HOST + ":" + str(port)
-                 + " (threads=" + str(threads) + ", conn_limit=200)")
-        serve(
-            app_instance,
-            host=WEB_HOST,
-            port=port,
-            threads=threads,
-            connection_limit=200,
-            channel_timeout=120,
-            cleanup_interval=30,
-            ident="brn-node",
-        )
-        return
-    except ImportError:
-        log.warning("Waitress não instalado — usando Flask dev server")
-        log.warning("Para produção: pip install waitress")
-    except Exception as e:
-        log.error("Waitress falhou (" + str(e) + ") — usando Flask dev server")
-
-    log.info("HTTP (dev) http://" + WEB_HOST + ":" + str(port))
+    if ssl_ctx is None:
+        log.info("HTTP http://" + WEB_HOST + ":" + str(port))
     app_instance.run(
         host=WEB_HOST, port=port, threaded=True,
-        debug=False, use_reloader=False,
+        debug=False, use_reloader=False, ssl_context=ssl_ctx,
     )
 
 
@@ -670,30 +647,8 @@ def run_explorer():
             ssl_ctx = ensure_self_signed_cert()
         except Exception:
             ssl_ctx = None
-
-    if ssl_ctx is None and os.environ.get("BRN_HTTPS", "0") != "1":
-        try:
-            from waitress import serve  # type: ignore
-            threads = int(os.environ.get("BRN_HTTP_THREADS", "16"))
-            log.info("Explorer via Waitress http://" + EXPLORER_HOST + ":" + str(port))
-            serve(
-                explorer_app,
-                host=EXPLORER_HOST,
-                port=port,
-                threads=threads,
-                connection_limit=200,
-                channel_timeout=120,
-                cleanup_interval=30,
-                ident="brn-explorer",
-            )
-            return
-        except ImportError:
-            pass
-        except Exception as e:
-            log.warning("Waitress falhou no explorer (" + str(e) + ")")
-
     proto = "https" if ssl_ctx else "http"
-    log.info("Explorer (dev) " + proto + "://" + EXPLORER_HOST + ":" + str(port))
+    log.info("Explorer " + proto + "://" + EXPLORER_HOST + ":" + str(port))
     explorer_app.run(
         host=EXPLORER_HOST, port=port, threaded=True,
         debug=False, use_reloader=False, ssl_context=ssl_ctx,
@@ -701,16 +656,9 @@ def run_explorer():
 
 
 # ============================================================
-# [v13.2 FIX] run_status_loop sem p2p.get_status()
+# STATUS LOOP
 # ============================================================
 def run_status_loop(chain, p2p, l2_manager=None, sync=None):
-    """
-    Loop de status a cada 30s.
-
-    v13.2: usa p2p.discovery.listar_peers() em vez de p2p.get_status().
-    O get_status() tocava o SQLite em paralelo com a thread principal,
-    gerando "bad parameter or other API misuse" no log.
-    """
     log = get_logger("status")
     if p2p is None:
         log.warning("P2P desabilitado — status loop sem peers")
@@ -727,25 +675,16 @@ def run_status_loop(chain, p2p, l2_manager=None, sync=None):
         try:
             peer_count = 0
             relay_routes = 0
-
             if p2p is not None:
-                # ---- Conta peers SEM tocar no DB ----
                 try:
-                    disc = getattr(p2p, "discovery", None)
-                    if disc is not None and hasattr(disc, "listar_peers"):
-                        peer_count = len(disc.listar_peers())
-                except Exception:
-                    peer_count = 0
-
-                # ---- Relay routes (memória, sem DB) ----
-                try:
+                    st = p2p.get_status()
+                    peer_count = st.get("peer_count", 0)
                     relay = getattr(p2p, "relay", None)
                     if relay:
                         relay_routes = len(relay.routes)
-                except Exception:
-                    relay_routes = 0
+                except Exception as e:
+                    log.warning("p2p.get_status: " + str(e))
 
-            # ---- Estatísticas do DB ----
             mempool_n = len(chain.db.all_mempool(limit=1000))
             utxos_n = chain.db.count_utxos()
 
@@ -778,7 +717,7 @@ def run_status_loop(chain, p2p, l2_manager=None, sync=None):
                 except Exception:
                     pass
 
-            if mongo is not None and mongo.uri:
+            if mongo is not None and getattr(mongo, "uri", None):
                 ok, err = mongo.ping()
                 msg += " Mongo=" + ("OK" if ok else "off")
 
@@ -877,6 +816,7 @@ def _setup_relay(p2p, node_id_priv, enabled):
 # SYNC SETUP
 # ============================================================
 def _list_p2p_peers(p2p):
+    """Normaliza a lista de peers do p2p_unified para (ip, port, id, h, w)."""
     out = []
 
     def _pick(v, *names):
@@ -1074,12 +1014,12 @@ def main():
              + " | Modo: " + ("ORIGEM" if is_origin else "CLIENTE")
              + " | L2: " + l2_mode)
     log.info(" HTTPS: " + ("ON" if os.environ.get("BRN_HTTPS") == "1" else "off")
-             + " | Rendezvous: " + os.environ.get("BRN_RENDEZVOUS_URL", "—")
+             + " | Rendezvous: " + (os.environ.get("BRN_RENDEZVOUS_URL", "—") or "—")
              + " | Auto-mine: " + ("ON" if AUTO_MINE else "off"))
-    log.info(" All miners: " + os.environ.get("BRN_ALL_MINERS", "0")
-             + " | Min difficulty: " + os.environ.get("BRN_MIN_DIFFICULTY", "?"))
+    log.info(" Tailscale: " + (os.environ.get("TS_TAILNET", "").strip() or "desabilitado"))
     log.info("=" * 60)
 
+    # ---- comandos que saem sozinhos ----
     if args.version:
         print(VERSION)
         return 0
@@ -1104,16 +1044,19 @@ def main():
             print("Erro: " + str(e))
         return 0
 
+    # ---- módulos obrigatórios ----
     missing = _check_required_modules()
     if missing:
         log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
         return 1
 
+    # ---- Tailscale ----
     if not args.no_tailscale:
         _setup_tailscale_auto(log)
     else:
         log.info("Tailscale: pulado por --no-tailscale")
 
+    # ---- identidade ----
     node_password = _resolve_password(args)
     try:
         node_id_priv, node_id_pub = load_or_create_node_identity(
@@ -1122,10 +1065,12 @@ def main():
         raise
     log.info("Nó ID: " + node_id_pub)
 
+    # ---- blockchain ----
     from blockchain import Blockchain
     chain = Blockchain(cfg["db_path"], auto_genesis=is_origin)
     log.info("Altura atual: " + str(chain.db.height()))
 
+    # ---- checkpoints ----
     try:
         from checkpoints import load_checkpoints
         from blockchain import set_checkpoints, set_checkpoint_priv
@@ -1139,6 +1084,7 @@ def main():
     except Exception as e:
         log.warning("Checkpoints desativados: " + str(e))
 
+    # ---- verify ----
     if args.verify_only:
         st = _verify_chain(chain)
         try:
@@ -1171,18 +1117,6 @@ def main():
             p2p.start()
             _register_service("p2p", p2p)
             log.info("P2P iniciado")
-
-            def _on_block_mined(block):
-                try:
-                    if p2p is None:
-                        return
-                    p2p.broadcast_block(block)
-                    log.info("[Miner] bloco #" + str(block.get("height")) + " propagado")
-                except Exception as e:
-                    log.warning("broadcast_block falhou: " + str(e))
-
-            chain.on_block_mined = _on_block_mined
-            log.info("Callback on_block_mined ligado ao P2P")
         except Exception as e:
             log.error("Falha ao iniciar P2P: " + str(e))
             p2p = None
@@ -1199,7 +1133,7 @@ def main():
             _register_service("relay", relay)
             log.info("Relay E2E pronto")
 
-    # ---- SYNC ----
+    # ---- Sync ----
     sync = None
     if not args.no_sync:
         sync = _setup_sync(chain, p2p, log)
@@ -1210,54 +1144,26 @@ def main():
 
     # ---- Rendezvous ----
     rdv = None
+    rdv_url = os.environ.get("BRN_RENDEZVOUS_URL", "").strip()
     if p2p is not None:
-        rdv_backend = os.environ.get("BRN_RDV_BACKEND", "auto").strip().lower()
-        mongo_ok = False
         try:
-            from mongo_client import mongo
-            mongo_ok = mongo.is_configured()
-        except Exception:
-            pass
-
-        use_mongo = (
-            (rdv_backend == "mongo")
-            or (rdv_backend == "auto" and mongo_ok)
-        )
-
-        if use_mongo:
-            try:
-                from rendezvous_mongo import RendezvousMongo
-                rdv = RendezvousMongo(
-                    tcp_port=cfg["p2p_port"],
-                    node_uuid=node_id_pub,
-                    on_peer=p2p.add_peer,
-                    running_flag=lambda: not _shutdown.is_set(),
-                    blockchain=chain,
-                )
-                rdv.start()
+            from rendezvous_discovery import RendezvousDiscovery
+            rdv = RendezvousDiscovery(
+                tcp_port=cfg["p2p_port"],
+                node_uuid=node_id_pub,
+                on_peer=p2p.add_peer,
+                running_flag=lambda: not _shutdown.is_set(),
+                sign_fn=node_id_priv.sign,
+                blockchain=chain,
+            )
+            rdv.start()
+            if rdv.is_active():
                 _register_service("rendezvous", rdv)
-                log.info("RendezvousMongo ativo (backend=mongo)")
-            except Exception as e:
-                log.warning("RendezvousMongo falhou: " + str(e))
-                rdv = None
-
-        if rdv is None:
-            rdv_url = os.environ.get("BRN_RENDEZVOUS_URL", "").strip()
-            if rdv_url:
-                try:
-                    from rendezvous_discovery import RendezvousDiscovery
-                    rdv = RendezvousDiscovery(
-                        tcp_port=cfg["p2p_port"],
-                        node_uuid=node_id_pub,
-                        on_peer=p2p.add_peer,
-                        running_flag=lambda: not _shutdown.is_set(),
-                        sign_fn=node_id_priv.sign,
-                    )
-                    rdv.start()
-                    _register_service("rendezvous", rdv)
-                    log.info("Rendezvous HTTP -> " + rdv_url)
-                except Exception as e:
-                    log.warning("Rendezvous HTTP falhou: " + str(e))
+                log.info("Rendezvous ativo (backend=" + rdv.backend_name() + ")")
+            else:
+                log.info("Rendezvous: nenhum backend disponivel (no-op)")
+        except Exception as e:
+            log.warning("Rendezvous falhou: " + str(e))
 
     # ---- L2 ----
     l2_manager = None
@@ -1290,13 +1196,9 @@ def main():
 
     # ---- HTTP ----
     http_app = _init_http_server(chain, log)
-
     if http_app is not None:
         threading.Thread(
-            target=_thread_wrap(
-                "HTTP",
-                lambda: run_http(http_app, force_flask_dev=args.flask_dev),
-            ),
+            target=_thread_wrap("HTTP", lambda: run_http(http_app)),
             daemon=True, name="HTTP",
         ).start()
     else:
@@ -1331,8 +1233,6 @@ def main():
                         save_wallet(mw.to_dict(), node_password,
                                     str(miner_wallet_path))
                         log.info("Miner wallet criada em " + str(miner_wallet_path))
-                    else:
-                        log.warning("Wallet sem to_dict() — não salvei (inseguro)")
                 except Exception as e:
                     log.warning("Falha ao salvar miner wallet: " + str(e))
 
@@ -1366,15 +1266,15 @@ def main():
                 break
             time.sleep(1)
 
+    # ---- AUDIT ----
     _audit("node_start", {
         "mode":       "origin" if is_origin else "client",
-        "all_miners": os.environ.get("BRN_ALL_MINERS") == "1",
         "l2":         bool(args.l2 and l2_ativo),
         "mine":       bool(args.mine or AUTO_MINE),
         "https":      os.environ.get("BRN_HTTPS") == "1",
         "height":     chain.db.height(),
         "node_id":    node_id_pub[:16],
-        "rendezvous": bool(rdv),
+        "rendezvous": bool(rdv and rdv.is_active()),
         "relay":      bool(relay),
         "sync":       bool(sync),
         "tailscale":  bool(os.environ.get("TS_TAILNET", "").strip()),
@@ -1382,6 +1282,7 @@ def main():
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
 
+    # ---- UI / loop principal ----
     try:
         if not cfg["headless"]:
             run_wallet_main_thread()
@@ -1391,6 +1292,7 @@ def main():
     except KeyboardInterrupt:
         pass
 
+    # ---- shutdown ----
     log.info("Encerrando...")
     _shutdown.set()
     _graceful_shutdown(log)
