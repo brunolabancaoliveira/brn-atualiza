@@ -1,25 +1,26 @@
-"""crypto.py — Primitivas do BRN
+"""crypto.py — Primitivas criptográficas do BRN
 ================================================================
 Exporta:
+  - Ed25519PrivateKey, Ed25519PublicKey  (reexport de cryptography)
   - sha256, double_sha256, hash160
   - generate_private_key, pubkey_from_priv, pubkey_to_address
-  - sign_ecdsa, verify_ecdsa, sign_schnorr (= ecdsa alias)
-  - Ed25519PrivateKey, Ed25519PublicKey (reexport)
+  - sign_ecdsa, verify_ecdsa
+  - sign_schnorr, verify_schnorr  (aliases para ECDSA — compatibilidade)
 ================================================================
 """
 from __future__ import annotations
 
-import os
 import hashlib
 import secrets
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey, Ed25519PublicKey,
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
 )
 
 
 # ============================================================
-# HASH
+# HASHES
 # ============================================================
 def sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
@@ -30,33 +31,29 @@ def double_sha256(data: bytes) -> bytes:
 
 
 def hash160(data: bytes) -> bytes:
+    """RIPEMD160(SHA256(data)) com fallback sha256[:20]."""
+    h = hashlib.sha256(data).digest()
     try:
-        h = hashlib.new("ripemd160")
-        h.update(hashlib.sha256(data).digest())
-        return h.digest()
+        r = hashlib.new("ripemd160")
+        r.update(h)
+        return r.digest()
     except ValueError:
-        # fallback
-        return hashlib.sha256(data).digest()[:20]
+        return h[:20]
 
 
 # ============================================================
-# SECP256K1
+# SECP256K1 — parâmetros
 # ============================================================
-P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
-N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+P  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+N  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
 Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 _HALF_N = N // 2
 
 
-def generate_private_key() -> bytes:
-    while True:
-        k = secrets.token_bytes(32)
-        val = int.from_bytes(k, "big")
-        if 1 <= val < N:
-            return k
-
-
+# ============================================================
+# ARITMÉTICA DE CURVA
+# ============================================================
 def _inv_mod(a: int, m: int) -> int:
     return pow(a, m - 2, m)
 
@@ -90,6 +87,18 @@ def _point_mul(k: int, point):
     return result
 
 
+# ============================================================
+# CHAVE PRIVADA / PUBKEY
+# ============================================================
+def generate_private_key() -> bytes:
+    """Gera 32 bytes de chave privada válida para secp256k1."""
+    while True:
+        k = secrets.token_bytes(32)
+        val = int.from_bytes(k, "big")
+        if 1 <= val < N:
+            return k
+
+
 def pubkey_from_priv(priv_bytes: bytes, compressed: bool = True) -> bytes:
     k = int.from_bytes(priv_bytes, "big")
     if k == 0 or k >= N:
@@ -102,21 +111,26 @@ def pubkey_from_priv(priv_bytes: bytes, compressed: bool = True) -> bytes:
 
 
 def pubkey_to_address(pubkey_hex: str) -> str:
+    """Deriva endereço Bech32 (brn1...) a partir da pubkey em hex."""
     from bech32 import address_from_pubkey
     return address_from_pubkey(bytes.fromhex(pubkey_hex))
 
 
 # ============================================================
-# ECDSA (Schnorr alias)
+# ECDSA secp256k1
 # ============================================================
 def sign_ecdsa(priv_bytes: bytes, msg_hash: bytes) -> bytes:
+    """
+    Assina o hash. Retorna r||s (64 bytes) com low-S.
+    """
     z = int.from_bytes(msg_hash, "big")
     d = int.from_bytes(priv_bytes, "big")
     if d == 0 or d >= N:
         raise ValueError("chave privada fora do range")
+
     while True:
         k = secrets.randbelow(N - 1) + 1
-        x, y = _point_mul(k, (Gx, Gy))
+        x, _y = _point_mul(k, (Gx, Gy))
         r = x % N
         if r == 0:
             continue
@@ -129,6 +143,7 @@ def sign_ecdsa(priv_bytes: bytes, msg_hash: bytes) -> bytes:
 
 
 def verify_ecdsa(pub_bytes: bytes, sig_bytes: bytes, msg_hash: bytes) -> bool:
+    """Verifica assinatura ECDSA (r||s, low-S). Rejeita high-S."""
     try:
         if len(sig_bytes) != 64:
             return False
@@ -167,5 +182,8 @@ def verify_ecdsa(pub_bytes: bytes, sig_bytes: bytes, msg_hash: bytes) -> bool:
         return False
 
 
+# ============================================================
+# ALIASES (compatibilidade — não são BIP340 real)
+# ============================================================
 sign_schnorr = sign_ecdsa
 verify_schnorr = verify_ecdsa
