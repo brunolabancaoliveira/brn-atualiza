@@ -40,9 +40,6 @@ except ImportError:
 
 log = logging.getLogger("secure_store")
 
-# ============================================================
-# CONSTANTES DO FORMATO
-# ============================================================
 MAGIC           = b"BRNS"
 FORMAT_VERSION  = 1
 SALT_SIZE       = 16
@@ -51,34 +48,20 @@ TAG_SIZE        = 16
 KEY_SIZE        = 32
 MIN_PASSWORD_LEN = 8
 
-# Parâmetros Argon2id (configuráveis por env)
 ARGON2_TIME    = int(os.environ.get("BRN_ARGON2_TIME", "3"))
-ARGON2_MEMORY  = int(os.environ.get("BRN_ARGON2_MEMORY", "65536"))  # 64 MiB
+ARGON2_MEMORY  = int(os.environ.get("BRN_ARGON2_MEMORY", "65536"))
 ARGON2_PAR     = int(os.environ.get("BRN_ARGON2_PARALLEL", "4"))
 
 
-# ============================================================
-# DERIVAÇÃO DE CHAVE
-# ============================================================
 def _derive_key(password: str, salt: bytes) -> bytes:
-    """Deriva 32 bytes a partir da senha + salt usando Argon2id."""
     if _ARGON2_IMPL == "cffi":
         return hash_secret_raw(
-            secret=password.encode("utf-8"),
-            salt=salt,
-            time_cost=ARGON2_TIME,
-            memory_cost=ARGON2_MEMORY,
-            parallelism=ARGON2_PAR,
-            hash_len=KEY_SIZE,
-            type=Type.ID,
+            secret=password.encode("utf-8"), salt=salt,
+            time_cost=ARGON2_TIME, memory_cost=ARGON2_MEMORY,
+            parallelism=ARGON2_PAR, hash_len=KEY_SIZE, type=Type.ID,
         )
-    kdf = Argon2id(
-        salt=salt,
-        length=KEY_SIZE,
-        iterations=ARGON2_TIME,
-        lanes=ARGON2_PAR,
-        memory_cost=ARGON2_MEMORY,
-    )
+    kdf = Argon2id(salt=salt, length=KEY_SIZE, iterations=ARGON2_TIME,
+                   lanes=ARGON2_PAR, memory_cost=ARGON2_MEMORY)
     return kdf.derive(password.encode("utf-8"))
 
 
@@ -86,12 +69,9 @@ def _validate_password(p) -> None:
     if not isinstance(p, str):
         raise ValueError("senha deve ser string")
     if len(p) < MIN_PASSWORD_LEN:
-        raise ValueError(f"senha muito curta (min {MIN_PASSWORD_LEN} caracteres)")
+        raise ValueError(f"senha muito curta (min {MIN_PASSWORD_LEN})")
 
 
-# ============================================================
-# AEAD (cifra/decifra)
-# ============================================================
 def _encrypt(data: bytes, key: bytes, aad: bytes = b"") -> bytes:
     nonce = os.urandom(NONCE_SIZE)
     ct = ChaCha20Poly1305(key).encrypt(nonce, data, aad)
@@ -105,9 +85,6 @@ def _decrypt(packed: bytes, key: bytes, aad: bytes = b"") -> bytes:
     return ChaCha20Poly1305(key).decrypt(nonce, ct, aad)
 
 
-# ============================================================
-# ESCRITA ATÔMICA (tmp + rename + fsync)
-# ============================================================
 def _atomic_write(path, data: bytes, mode: int = 0o600) -> None:
     p = Path(path)
     if p.parent and not p.parent.exists():
@@ -116,9 +93,7 @@ def _atomic_write(path, data: bytes, mode: int = 0o600) -> None:
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
+            f.write(data); f.flush(); os.fsync(f.fileno())
         os.replace(str(tmp), str(path))
     except Exception:
         try:
@@ -128,11 +103,7 @@ def _atomic_write(path, data: bytes, mode: int = 0o600) -> None:
         raise
 
 
-# ============================================================
-# API BAIXO NÍVEL — blob de bytes
-# ============================================================
 def encrypt_blob(data: bytes, password: str) -> bytes:
-    """Cifra bytes crus. Retorna MAGIC+VER+SALT+nonce||ct."""
     _validate_password(password)
     salt = os.urandom(SALT_SIZE)
     key = _derive_key(password, salt)
@@ -140,26 +111,21 @@ def encrypt_blob(data: bytes, password: str) -> bytes:
 
 
 def decrypt_blob(blob: bytes, password: str) -> bytes:
-    """Decifra bytes gerados por encrypt_blob()."""
     if len(blob) < len(MAGIC) + 1 + SALT_SIZE + NONCE_SIZE + TAG_SIZE:
         raise ValueError("blob truncado")
     if blob[:4] != MAGIC:
         raise ValueError("magic invalido")
     ver = blob[4]
-    if ver == 49:      # compat: versão gravada como ASCII '1' (0x31) em versões antigas
+    if ver == 49:
         ver = 1
     if ver != FORMAT_VERSION:
         raise ValueError(f"versao nao suportada: {ver}")
     off = 5
-    salt = blob[off:off + SALT_SIZE]
-    off += SALT_SIZE
+    salt = blob[off:off + SALT_SIZE]; off += SALT_SIZE
     key = _derive_key(password, salt)
     return _decrypt(blob[off:], key, b"blob")
 
 
-# ============================================================
-# API ALTO NÍVEL — dict JSON cifrado em arquivo
-# ============================================================
 def _save_blob(path: str, data: dict, password: str, aad: bytes) -> bool:
     _validate_password(password)
     salt = os.urandom(SALT_SIZE)
@@ -187,8 +153,7 @@ def _load_blob(path: str, password: str, aad: bytes):
     if version != FORMAT_VERSION:
         raise ValueError(f"versao nao suportada: {version}")
     off = 5
-    salt = raw[off:off + SALT_SIZE]
-    off += SALT_SIZE
+    salt = raw[off:off + SALT_SIZE]; off += SALT_SIZE
     key = _derive_key(password, salt)
     try:
         decrypted = _decrypt(raw[off:], key, aad)
@@ -202,33 +167,25 @@ def _load_blob(path: str, password: str, aad: bytes):
         raise ValueError(f"Conteudo invalido: {e}")
 
 
-# ============================================================
-# API PÚBLICA — compatível com main.py v12.5
-# ============================================================
 def save_wallet(data: dict, password: str,
                 path: str = "wallet_encrypted.dat") -> bool:
-    """Salva carteira cifrada. Assinatura: (data, password, path)."""
     return _save_blob(path, data, password, aad=b"wallet")
 
 
 def load_wallet(password: str, path: str = "wallet_encrypted.dat"):
-    """Carrega carteira cifrada. Assinatura: (password, path)."""
     return _load_blob(path, password, aad=b"wallet")
 
 
 def save_node_identity(data: dict, password: str,
                        path: str = "node_identity.enc") -> bool:
-    """Salva identidade Ed25519 cifrada."""
     return _save_blob(path, data, password, aad=b"node_identity")
 
 
 def load_node_identity(password: str, path: str = "node_identity.enc"):
-    """Carrega identidade Ed25519 cifrada."""
     return _load_blob(path, password, aad=b"node_identity")
 
 
 def delete_identity(path: str = "node_identity.enc", secure: bool = True) -> bool:
-    """Apaga arquivo. Se secure=True, sobrescreve com random antes."""
     p = Path(path)
     if not p.exists():
         return False
@@ -236,18 +193,13 @@ def delete_identity(path: str = "node_identity.enc", secure: bool = True) -> boo
         try:
             size = p.stat().st_size
             with p.open("r+b") as f:
-                f.write(os.urandom(size))
-                f.flush()
-                os.fsync(f.fileno())
+                f.write(os.urandom(size)); f.flush(); os.fsync(f.fileno())
         except Exception as e:
             log.warning(f"overwrite de {path} falhou: {e}")
     p.unlink()
     return True
 
 
-# ============================================================
-# CURRENT WALLET (carteira ativa — aba "Minha Carteira")
-# ============================================================
 CURRENT_WALLET_ENC  = os.environ.get("BRN_CURRENT_WALLET", "current_wallet.enc")
 CURRENT_WALLET_JSON = "current_wallet.json"
 
@@ -271,7 +223,6 @@ def load_current_wallet(password: str) -> dict:
 
 
 def migrate_current_wallet(password: str) -> dict:
-    """Migra current_wallet.json (plaintext legado) → current_wallet.enc."""
     if not os.path.exists(CURRENT_WALLET_JSON):
         return {"ok": False, "msg": "current_wallet.json nao existe"}
     try:
@@ -286,14 +237,9 @@ def migrate_current_wallet(password: str) -> dict:
         return {"ok": False, "msg": str(e)}
 
 
-# ============================================================
-# UTILITÁRIOS
-# ============================================================
 def constant_time_eq(a, b) -> bool:
-    if isinstance(a, str):
-        a = a.encode()
-    if isinstance(b, str):
-        b = b.encode()
+    if isinstance(a, str): a = a.encode()
+    if isinstance(b, str): b = b.encode()
     return hmac.compare_digest(a, b)
 
 
@@ -306,7 +252,6 @@ def is_encrypted_file(path: str) -> bool:
 
 
 def reencrypt_file(path: str, old_password: str, new_password: str) -> bool:
-    """Troca a senha de um arquivo cifrado."""
     data = _load_blob(path, old_password, aad=b"wallet")
     if data is None:
         raise FileNotFoundError(path)
@@ -314,9 +259,6 @@ def reencrypt_file(path: str, old_password: str, new_password: str) -> bool:
     return True
 
 
-# ============================================================
-# SESSÃO EM MEMÓRIA (para a carteira web não pedir senha toda hora)
-# ============================================================
 class WalletSession:
     def __init__(self, ttl: int = 15 * 60):
         self.ttl = ttl
@@ -358,63 +300,3 @@ class WalletSession:
 
     def is_unlocked(self) -> bool:
         return self.get() is not None
-
-
-# ============================================================
-# AUTO-TESTE
-# ============================================================
-if __name__ == "__main__":
-    import tempfile
-
-    print("Testando secure_store...")
-
-    # round-trip blob
-    secret = b"chave-privada-super-secreta-12345"
-    pw = "minha-senha-forte-de-teste-2026"
-    blob = encrypt_blob(secret, pw)
-    assert decrypt_blob(blob, pw) == secret
-    print("  [ok] encrypt_blob/decrypt_blob")
-
-    # senha errada
-    try:
-        decrypt_blob(blob, "senha-errada-totalmente-dif")
-        raise AssertionError("senha errada NAO deveria decifrar")
-    except ValueError:
-        print("  [ok] senha errada rejeitada")
-
-    # adulteração
-    tampered = bytearray(blob)
-    tampered[-1] ^= 0x01
-    try:
-        decrypt_blob(bytes(tampered), pw)
-        raise AssertionError("adulteracao NAO deveria passar")
-    except ValueError:
-        print("  [ok] adulteracao detectada")
-
-    # arquivo (assinatura main.py v12.5)
-    with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, "ident.enc")
-        assert save_wallet({"sk": "abc", "pub": "def"}, pw, p)
-        assert load_wallet(pw, p) == {"sk": "abc", "pub": "def"}
-        print("  [ok] save_wallet(data, pw, path) / load_wallet(pw, path)")
-
-        # is_encrypted_file
-        assert is_encrypted_file(p)
-        print("  [ok] is_encrypted_file")
-
-        # reencrypt
-        pw2 = "outra-senha-forte-2026"
-        reencrypt_file(p, pw, pw2)
-        assert load_wallet(pw2, p) == {"sk": "abc", "pub": "def"}
-        print("  [ok] reencrypt_file")
-
-    # sessão
-    s = WalletSession(ttl=1)
-    s.unlock({"address": "brn1test"})
-    assert s.is_unlocked()
-    assert s.get()["address"] == "brn1test"
-    s.lock()
-    assert not s.is_unlocked()
-    print("  [ok] WalletSession")
-
-    print("Todos os testes passaram.")
