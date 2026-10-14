@@ -1,339 +1,411 @@
-"""
-p2p_secure.py — Handshake autenticado + canal cifrado para BRN P2P (v2)
-========================================================================
-Híbrido do melhor das duas implementações:
+"""p2p_secure.py — Fachada que une p2p_auth + p2p_cipher
+================================================================
+Fornece handshake autenticado (Ed25519) + opcionalmente cifrado
+(ChaCha20-Poly1305 sobre X25519) numa única API.
 
-  * ChaCha20-Poly1305 (constante em tempo, sem dependência de AES-NI)
-  * Duas chaves por sessão (C2S e S2C) via HKDF com info distintos
-  * Assinatura do servidor inclui o eph do cliente (binds a sessão)
-  * NodeIdentity persistente e criptografada (PBKDF2 + Fernet)
-  * Helpers SecureClient / accept_secure para integração fácil
-  * Anti-replay por contador de nonce separado por direção
+API:
+    handshake_client(sock, my_priv, expected_pub_hex=None)
+        → (SecureConn, peer_hex)
 
-Protocolo:
-  Cliente -> Servidor: PROTO(9) || id_pub_A(32) || eph_A(32) || sig_A(64)
-      sig_A = Ed25519(A, PROTO || id_pub_A || eph_A || ROLE_C)
+    handshake_server(sock, my_priv)
+        → (SecureConn, peer_hex)
 
-  Servidor -> Cliente: PROTO(9) || id_pub_B(32) || eph_B(32) || sig_B(64)
-      sig_B = Ed25519(B, PROTO || id_pub_B || eph_B || eph_A || ROLE_S)
-      ^^^ assina TAMBÉM eph_A: resposta amarrada a esta sessão
+SecureConn é compatível com socket (sendall/recv/close/settimeout).
 
-  shared = X25519(eph_A, eph_B)
-  salt   = SHA256(eph_A || eph_B)
-  k_c2s  = HKDF(shared, salt, "BRN-P2P-C2S-v2")
-  k_s2c  = HKDF(shared, salt, "BRN-P2P-S2C-v2")
+Fluxo cliente:
+    1. (opcional) wrap_client(sock)   → cifra
+    2. build_auth() + send hello
+    3. recebe hello resposta
+    4. verify_auth(resp)              → valida assinatura do servidor
 
-  Frame: [len(4, BE)][ciphertext ChaCha20-Poly1305]
+Fluxo servidor:
+    1. (opcional) wrap_server(sock)   → cifra
+    2. recebe hello
+    3. verify_auth(hello)             → valida assinatura do cliente
+    4. build_auth() + send hello resposta
+
+Env:
+    BRN_P2P_AUTH        (off | optional | required)
+    BRN_P2P_CIPHER      (0 | 1)
+================================================================
 """
 from __future__ import annotations
 
-import os
 import json
-import base64
-import struct
+import logging
 import socket
-import hashlib
-from pathlib import Path
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey, Ed25519PublicKey,
+from p2p_auth import (
+    build_auth,
+    verify_auth,
+    set_node_id_priv,
+    auth_enabled,
 )
-from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey, X25519PublicKey,
+from p2p_cipher import (
+    wrap_client,
+    wrap_server,
+    CipherSocket,
+    cipher_enabled,
 )
-from cryptography.fernet import Fernet
+
+
+log = logging.getLogger("p2p_secure")
+
+HELLO_TIMEOUT = float(__import__("os").environ.get(
+    "BRN_SECURE_HELLO_TIMEOUT", "5.0"))
+MAX_HELLO = 8192
 
 
 # ============================================================
-# CONSTANTES
+# SecureConn — interface compatível com socket
 # ============================================================
-PROTO       = b"BRN-P2P/2"
-ROLE_C      = b"|client"
-ROLE_S      = b"|server"
-MAX_FRAME   = 4 * 1024 * 1024
+class SecureConn:
+    """
+    Envelopa um socket (possivelmente cifrado) com metadados do peer.
+    Todas as operações de socket delegam para o objeto subjacente.
+    """
 
-HKDF_INFO_C2S = b"BRN-P2P-C2S-v2"
-HKDF_INFO_S2C = b"BRN-P2P-S2C-v2"
+    def __init__(self, sock, peer_pub_hex: str = "",
+                 peer_verified: bool = False,
+                 cipher_on: bool = False):
+        self.sock = sock
+        self.peer_pub_hex = peer_pub_hex
+        self.peer_verified = peer_verified
+        self.cipher_on = cipher_on
 
-HANDSHAKE_TIMEOUT = 10.0
-RECV_TIMEOUT      = 30.0
+    # ---- interface socket ----
+    def settimeout(self, t):
+        self.sock.settimeout(t)
 
-DEFAULT_IDENTITY_FILE = "node_identity.enc"
-DEFAULT_PASSWORD_ENV  = "BRN_NODE_PASSWORD"
+    def gettimeout(self):
+        return self.sock.gettimeout()
 
+    def sendall(self, data: bytes) -> None:
+        self.sock.sendall(data)
 
-class SecureChannelError(Exception):
-    pass
+    def send(self, data: bytes):
+        return self.sock.sendall(data)
+
+    def recv(self, n: int) -> bytes:
+        return self.sock.recv(n)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+    def __repr__(self):
+        c = "cipher" if self.cipher_on else "plain"
+        v = "verified" if self.peer_verified else "unverified"
+        return f"<SecureConn {self.peer_pub_hex[:12]}... {c} {v}>"
 
 
 # ============================================================
-# HELPERS
+# Handshake — mensagens
 # ============================================================
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
+def _send_hello(conn) -> None:
+    """Monta o payload de hello com auth e envia com header de tamanho."""
+    auth = build_auth(msg={"t": "hello"})
+    payload_obj = {"t": "hello"}
+    if auth:
+        payload_obj["auth"] = auth
+    raw = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+    if len(raw) > MAX_HELLO:
+        raise ValueError(f"hello grande demais: {len(raw)}B")
+    frame = len(raw).to_bytes(4, "big") + raw
+    conn.sendall(frame)
+
+
+def _recv_hello(conn) -> dict:
+    """Lê um hello do socket, com header de tamanho (4B BE)."""
+    hdr = _recv_n(conn, 4)
+    if not hdr or len(hdr) < 4:
+        raise ConnectionError("sem header hello")
+    ln = int.from_bytes(hdr, "big")
+    if ln == 0 or ln > MAX_HELLO:
+        raise ConnectionError(f"hello com tamanho invalido ({ln})")
+    raw = _recv_n(conn, ln)
+    if not raw or len(raw) < ln:
+        raise ConnectionError("hello truncado")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise ConnectionError(f"hello nao e JSON valido: {e}")
+
+
+def _recv_n(conn, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
+        chunk = conn.recv(n - len(buf))
         if not chunk:
-            raise SecureChannelError("conexao fechada antes do fim do frame")
+            return bytes(buf)
         buf.extend(chunk)
     return bytes(buf)
 
 
-def _derive_keys(shared: bytes, eph_a: bytes, eph_b: bytes):
-    """Deriva 2 chaves (C2S e S2C) a partir do shared secret."""
-    salt = hashlib.sha256(eph_a + eph_b).digest()
-    k_c2s = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
-                 info=HKDF_INFO_C2S).derive(shared)
-    k_s2c = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
-                 info=HKDF_INFO_S2C).derive(shared)
-    return k_c2s, k_s2c
-
-
 # ============================================================
-# IDENTIDADE PERSISTENTE DO NÓ
-# ============================================================
-class NodeIdentity:
-    """
-    Chave Ed25519 do nó. Pode ser persistida cifrada em disco com
-    a senha definida em BRN_NODE_PASSWORD.
-    """
-
-    def __init__(self, priv: Ed25519PrivateKey):
-        self.priv = priv
-        self.pub = priv.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
-
-    @property
-    def pub_hex(self) -> str:
-        return self.pub.hex()
-
-    # -------- Persistência cifrada --------
-    def _to_payload(self) -> bytes:
-        return self.priv.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-
-    def save(self, path: str, password: str) -> bool:
-        try:
-            salt = os.urandom(16)
-            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
-                             salt=salt, iterations=600_000)
-            key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
-            token = Fernet(key).encrypt(self._to_payload())
-            Path(path).write_bytes(base64.b64encode(salt + token))
-            return True
-        except Exception as e:
-            print(f"[NodeIdentity] erro ao salvar: {e}")
-            return False
-
-    @classmethod
-    def load(cls, path: str, password: str) -> "NodeIdentity | None":
-        try:
-            blob = base64.b64decode(Path(path).read_bytes())
-            salt, token = blob[:16], blob[16:]
-            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
-                             salt=salt, iterations=600_000)
-            key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
-            payload = Fernet(key).decrypt(token)
-            return cls(Ed25519PrivateKey.from_private_bytes(payload))
-        except Exception as e:
-            print(f"[NodeIdentity] falha ao carregar: {e}")
-            return None
-
-    @classmethod
-    def load_or_create(cls,
-                       path: str = DEFAULT_IDENTITY_FILE,
-                       password_env: str = DEFAULT_PASSWORD_ENV,
-                       ) -> "NodeIdentity":
-        pw = os.environ.get(password_env, "").strip()
-        if pw and Path(path).exists():
-            id_ = cls.load(path, pw)
-            if id_ is not None:
-                return id_
-
-        id_ = cls(Ed25519PrivateKey.generate())
-        if pw:
-            id_.save(path, pw)
-            print(f"[NodeIdentity] nova identidade salva em {path}")
-        else:
-            print(f"[NodeIdentity] AVISO: {password_env} vazio — identidade efêmera")
-        return id_
-
-    def sign(self, data: bytes) -> bytes:
-        return self.priv.sign(data)
-
-
-# ============================================================
-# CANAL SEGURO
-# ============================================================
-class SecureChannel:
-    def __init__(self, send_key: bytes, recv_key: bytes):
-        self.send_aead = ChaCha20Poly1305(send_key)
-        self.recv_aead = ChaCha20Poly1305(recv_key)
-        self.tx_nonce = 0
-        self.rx_nonce = 0
-
-    def _nonce(self, i: int) -> bytes:
-        return i.to_bytes(12, "big")
-
-    def send(self, sock: socket.socket, data: bytes):
-        n = self._nonce(self.tx_nonce)
-        self.tx_nonce += 1
-        ct = self.send_aead.encrypt(n, data, None)
-        sock.sendall(struct.pack(">I", len(ct)) + ct)
-
-    def recv(self, sock: socket.socket) -> bytes:
-        hdr = _recv_exact(sock, 4)
-        (ln,) = struct.unpack(">I", hdr)
-        if ln > MAX_FRAME + 16:
-            raise SecureChannelError(f"frame grande demais: {ln}")
-        ct = _recv_exact(sock, ln)
-        n = self._nonce(self.rx_nonce)
-        self.rx_nonce += 1
-        try:
-            return self.recv_aead.decrypt(n, ct, None)
-        except Exception:
-            raise SecureChannelError("falha ao decifrar (tag invalida)")
-
-    def close(self, sock: socket.socket | None = None):
-        if sock:
-            try: sock.close()
-            except Exception: pass
-
-
-# ============================================================
-# HANDSHAKE
+# Handshake — CLIENTE
 # ============================================================
 def handshake_client(sock: socket.socket,
-                     my_id: NodeIdentity,
-                     expected_pub_hex: str | None = None,
-                     timeout: float = HANDSHAKE_TIMEOUT,
-                     ) -> tuple[SecureChannel, str]:
-    sock.settimeout(timeout)
+                     my_priv,
+                     expected_pub_hex: str | None = None):
+    """
+    Executa o handshake do lado cliente.
 
-    eph = X25519PrivateKey.generate()
-    eph_pub = eph.public_key().public_bytes_raw()
-    id_pub = my_id.pub
+    Retorna (SecureConn, peer_pub_hex).
 
-    sig = my_id.sign(PROTO + id_pub + eph_pub + ROLE_C)
-    sock.sendall(PROTO + id_pub + eph_pub + sig)
+    Raises:
+        ConnectionError se o servidor não validar ou a pubkey não bater.
+    """
+    set_node_id_priv(my_priv)
+    sock.settimeout(HELLO_TIMEOUT)
 
-    if _recv_exact(sock, len(PROTO)) != PROTO:
-        raise SecureChannelError("proto invalido (server)")
-    peer_id_pub  = _recv_exact(sock, 32)
-    peer_eph_pub = _recv_exact(sock, 32)
-    peer_sig     = _recv_exact(sock, 64)
-
-    # Verifica assinatura do servidor — INCLUI o nosso eph_pub
-    try:
-        Ed25519PublicKey.from_public_bytes(peer_id_pub).verify(
-            peer_sig,
-            PROTO + peer_id_pub + peer_eph_pub + eph_pub + ROLE_S,
-        )
-    except Exception as e:
-        raise SecureChannelError(f"assinatura do servidor invalida: {e}")
-
-    peer_hex = peer_id_pub.hex()
-    if expected_pub_hex is not None and peer_hex != expected_pub_hex:
-        raise SecureChannelError(
-            f"identidade do peer mudou: "
-            f"esperado={expected_pub_hex[:16]}..., recebido={peer_hex[:16]}..."
-        )
-
-    shared = eph.exchange(X25519PublicKey.from_public_bytes(peer_eph_pub))
-    k_c2s, k_s2c = _derive_keys(shared, eph_pub, peer_eph_pub)
-
-    sock.settimeout(RECV_TIMEOUT)
-    # Cliente envia com k_c2s, recebe com k_s2c
-    return SecureChannel(send_key=k_c2s, recv_key=k_s2c), peer_hex
-
-
-def handshake_server(sock: socket.socket,
-                     my_id: NodeIdentity,
-                     timeout: float = HANDSHAKE_TIMEOUT,
-                     ) -> tuple[SecureChannel, str]:
-    sock.settimeout(timeout)
-
-    if _recv_exact(sock, len(PROTO)) != PROTO:
-        raise SecureChannelError("proto invalido (client)")
-    peer_id_pub  = _recv_exact(sock, 32)
-    peer_eph_pub = _recv_exact(sock, 32)
-    peer_sig     = _recv_exact(sock, 64)
-
-    try:
-        Ed25519PublicKey.from_public_bytes(peer_id_pub).verify(
-            peer_sig,
-            PROTO + peer_id_pub + peer_eph_pub + ROLE_C,
-        )
-    except Exception as e:
-        raise SecureChannelError(f"assinatura do cliente invalida: {e}")
-
-    eph = X25519PrivateKey.generate()
-    eph_pub = eph.public_key().public_bytes_raw()
-    id_pub = my_id.pub
-
-    # IMPORTANTE: assina TAMBÉM o eph do cliente — binds a sessão
-    sig = my_id.sign(PROTO + id_pub + eph_pub + peer_eph_pub + ROLE_S)
-    sock.sendall(PROTO + id_pub + eph_pub + sig)
-
-    shared = eph.exchange(X25519PublicKey.from_public_bytes(peer_eph_pub))
-    k_c2s, k_s2c = _derive_keys(shared, peer_eph_pub, eph_pub)
-
-    sock.settimeout(RECV_TIMEOUT)
-    # Servidor recebe com k_c2s, envia com k_s2c
-    return SecureChannel(send_key=k_s2c, recv_key=k_c2s), peer_id_pub.hex()
-
-
-# ============================================================
-# CLIENTE ONE-SHOT
-# ============================================================
-class SecureClient:
-    """Conecta → handshake → 1 request → 1 response → fecha."""
-
-    @staticmethod
-    def request(host: str, port: int, payload: bytes,
-                identity: NodeIdentity,
-                timeout: float = 5.0,
-                expected_pub_hex: str | None = None) -> bytes | None:
+    # ---------- cifra (opcional) ----------
+    cipher_on = False
+    if cipher_enabled():
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            s.connect((host, port))
-            ch, _ = handshake_client(s, identity, expected_pub_hex, timeout)
-            ch.send(s, payload)
-            resp = ch.recv(s)
-            ch.close(s)
-            return resp
-        except Exception:
-            return None
+            wrapped = wrap_client(sock)
+            if isinstance(wrapped, CipherSocket):
+                sock = wrapped
+                cipher_on = wrapped.cipher_on
+        except Exception as e:
+            log.debug(f"cipher handshake cliente falhou: {e}")
 
-
-# ============================================================
-# SERVIDOR — helper para o accept
-# ============================================================
-def accept_secure(conn: socket.socket, identity: NodeIdentity,
-                  expected_pub_hex: str | None = None,
-                  timeout: float = HANDSHAKE_TIMEOUT,
-                  ) -> SecureChannel | None:
-    """
-    Envolve uma conexão já aceita em um SecureChannel autenticado.
-    Retorna None se o handshake falhar.
-    """
+    # ---------- auth hello ----------
     try:
-        ch, peer_hex = handshake_server(conn, identity, timeout)
-        if expected_pub_hex and peer_hex != expected_pub_hex:
-            ch.close(conn)
-            return None
-        return ch
+        _send_hello(sock)
+        resp = _recv_hello(sock)
+    except Exception as e:
+        raise ConnectionError(f"falha no hello: {e}")
+
+    peer_hex = ""
+    verified = False
+
+    if auth_enabled():
+        auth = resp.get("auth") or {}
+        if not auth:
+            raise ConnectionError("servidor nao enviou auth")
+        ok, err = verify_auth(auth, msg={"t": "hello"})
+        if not ok:
+            raise ConnectionError(f"auth do servidor invalida: {err}")
+        peer_hex = auth.get("pub", "")
+        verified = True
+
+        if expected_pub_hex:
+            if peer_hex != expected_pub_hex:
+                raise ConnectionError(
+                    f"identidade do servidor mudou: "
+                    f"esperado={expected_pub_hex[:16]}... "
+                    f"recebido={peer_hex[:16]}..."
+                )
+    else:
+        peer_hex = resp.get("pub", "")
+
+    return SecureConn(sock, peer_hex, verified, cipher_on), peer_hex
+
+
+# ============================================================
+# Handshake — SERVIDOR
+# ============================================================
+def handshake_server(sock: socket.socket, my_priv):
+    """
+    Executa o handshake do lado servidor.
+
+    Retorna (SecureConn, peer_pub_hex).
+
+    Raises:
+        ConnectionError se o cliente não validar.
+    """
+    set_node_id_priv(my_priv)
+    sock.settimeout(HELLO_TIMEOUT)
+
+    # ---------- cifra (opcional) ----------
+    cipher_on = False
+    if cipher_enabled():
+        try:
+            wrapped = wrap_server(sock)
+            if isinstance(wrapped, CipherSocket):
+                sock = wrapped
+                cipher_on = wrapped.cipher_on
+        except Exception as e:
+            log.debug(f"cipher handshake servidor falhou: {e}")
+
+    # ---------- lê hello do cliente ----------
+    try:
+        hello = _recv_hello(sock)
+    except Exception as e:
+        raise ConnectionError(f"falha lendo hello: {e}")
+
+    peer_hex = ""
+    verified = False
+
+    if auth_enabled():
+        auth = hello.get("auth") or {}
+        if not auth:
+            raise ConnectionError("cliente nao enviou auth")
+        ok, err = verify_auth(auth, msg={"t": "hello"})
+        if not ok:
+            raise ConnectionError(f"auth do cliente invalida: {err}")
+        peer_hex = auth.get("pub", "")
+        verified = True
+
+    # ---------- responde com nosso hello ----------
+    try:
+        _send_hello(sock)
+    except Exception as e:
+        raise ConnectionError(f"falha enviando hello resposta: {e}")
+
+    return SecureConn(sock, peer_hex, verified, cipher_on), peer_hex
+
+
+# ============================================================
+# INFO
+# ============================================================
+def info() -> dict:
+    return {
+        "auth_enabled":     auth_enabled(),
+        "cipher_enabled":   cipher_enabled(),
+        "hello_timeout":    HELLO_TIMEOUT,
+        "max_hello_bytes":  MAX_HELLO,
+    }
+
+
+# ============================================================
+# AUTO-TESTE (loopback in-process)
+# ============================================================
+if __name__ == "__main__":
+    import os
+    import threading
+    import time
+
+    # Garante config de teste
+    os.environ.setdefault("BRN_P2P_AUTH", "optional")
+    os.environ.setdefault("BRN_P2P_CIPHER", "1")
+    os.environ.setdefault("BRN_NETWORK_SECRET",
+                          "segredo-de-teste-para-p2p-secure-1234567")
+
+    # Importa Ed25519 para gerar identidades
+    try:
+        from crypto import Ed25519PrivateKey
     except Exception:
-        try: conn.close()
-        except Exception: pass
-        return None
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey,
+        )
+
+    print("Testando p2p_secure...")
+    print(f"  auth={auth_enabled()} cipher={cipher_enabled()}")
+
+    # ---------- 1. Handshake completo ----------
+    srv_priv = Ed25519PrivateKey.generate()
+    cli_priv = Ed25519PrivateKey.generate()
+
+    srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv_sock.bind(("127.0.0.1", 0))
+    srv_sock.listen(1)
+    port = srv_sock.getsockname()[1]
+
+    result = {}
+
+    def run_server():
+        try:
+            conn, _ = srv_sock.accept()
+            sc, peer_hex = handshake_server(conn, srv_priv)
+            result["server_peer_hex"]  = peer_hex
+            result["server_cipher_on"] = sc.cipher_on
+            result["server_verified"]  = sc.peer_verified
+
+            # echo
+            data = sc.recv(1024)
+            result["server_received"] = data
+            sc.sendall(b"echo:" + data)
+            sc.close()
+        except Exception as e:
+            result["server_error"] = repr(e)
+
+    t = threading.Thread(target=run_server, daemon=True)
+    t.start()
+
+    try:
+        cli_sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sc, peer_hex = handshake_client(cli_sock, cli_priv)
+        result["client_peer_hex"]  = peer_hex
+        result["client_cipher_on"] = sc.cipher_on
+        result["client_verified"]  = sc.peer_verified
+
+        # confere que o servidor apresentou a pubkey correta
+        srv_pub_expected = srv_priv.public_key().public_bytes_raw().hex()
+        assert peer_hex == srv_pub_expected, \
+            f"peer_hex esperado {srv_pub_expected[:16]}, recebido {peer_hex[:16]}"
+
+        sc.sendall(b"ping")
+        reply = sc.recv(1024)
+        result["client_received"] = reply
+        sc.close()
+    except Exception as e:
+        result["client_error"] = repr(e)
+
+    t.join(timeout=5)
+
+    print(f"  servidor recebeu: {result.get('server_received')!r}")
+    print(f"  cliente recebeu:  {result.get('client_received')!r}")
+    print(f"  server cipher:    {result.get('server_cipher_on')}")
+    print(f"  client cipher:    {result.get('client_cipher_on')}")
+    print(f"  server verified:  {result.get('server_verified')}")
+    print(f"  client verified:  {result.get('client_verified')}")
+
+    assert "server_error" not in result, result.get("server_error")
+    assert "client_error" not in result, result.get("client_error")
+    assert result.get("server_received") == b"ping"
+    assert result.get("client_received") == b"echo:ping"
+    assert result.get("server_verified") is True
+    assert result.get("client_verified") is True
+    print("  [ok] handshake + echo")
+
+    # ---------- 2. expected_pub_hex errado ----------
+    srv_sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv_sock2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv_sock2.bind(("127.0.0.1", 0))
+    srv_sock2.listen(1)
+    port2 = srv_sock2.getsockname()[1]
+
+    def run_server2():
+        try:
+            conn, _ = srv_sock2.accept()
+            try:
+                handshake_server(conn, srv_priv)
+            except Exception:
+                pass
+            conn.close()
+        except Exception:
+            pass
+
+    t2 = threading.Thread(target=run_server2, daemon=True)
+    t2.start()
+
+    try:
+        s2 = socket.create_connection(("127.0.0.1", port2), timeout=5)
+        try:
+            handshake_client(s2, cli_priv, expected_pub_hex="ff" * 32)
+            print("  [X] identidade errada foi aceita")
+            raise SystemExit(1)
+        except ConnectionError:
+            print("  [ok] identidade errada rejeitada")
+        s2.close()
+    except Exception as e:
+        print(f"  [X] teste falhou: {e!r}")
+        raise SystemExit(1)
+
+    t2.join(timeout=3)
+
+    # ---------- 3. Info ----------
+    print(f"  [info] {info()}")
+
+    print("p2p_secure OK.")
