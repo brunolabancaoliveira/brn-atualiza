@@ -1,5 +1,4 @@
-"""
-rendezvous_mongo.py — Descoberta de peers via MongoDB (v1)
+"""rendezvous_mongo.py — Descoberta de peers via MongoDB (v1)
 ================================================================
 Substitui o rendezvous HTTP e o tracker.py. Cada nó:
   1. Anuncia seu peer na coleção `rendezvous` a cada N segundos
@@ -8,7 +7,7 @@ Substitui o rendezvous HTTP e o tracker.py. Cada nó:
 
 Esquema da coleção:
     {
-        _id: "<uuid>",             # unicidade por nó
+        _id: "<uuid>",
         uuid: "<pubkey hex>",
         ip:   "100.111.253.8",
         port: 6001,
@@ -35,6 +34,16 @@ Uso:
     rdv.start()
     ...
     rdv.stop()
+
+Env:
+    BRN_RDV_INTERVAL        (default 120s)
+    BRN_RDV_TTL             (default 600s)
+    BRN_RDV_INITIAL_DELAY   (default 5s)
+    BRN_RDV_MAX_RETURN      (default 500)
+    BRN_PUBLIC_IP           (override do IP anunciado)
+
+Requer:
+    mongo_client.py com is_configured(), db()
 ================================================================
 """
 from __future__ import annotations
@@ -49,6 +58,9 @@ from typing import Callable, Optional
 log = logging.getLogger("rendezvous_mongo")
 
 
+# ============================================================
+# CONFIG
+# ============================================================
 DEFAULT_INTERVAL  = int(os.environ.get("BRN_RDV_INTERVAL", "120"))
 DEFAULT_TTL_S     = int(os.environ.get("BRN_RDV_TTL", "600"))
 INITIAL_DELAY     = int(os.environ.get("BRN_RDV_INITIAL_DELAY", "5"))
@@ -56,8 +68,11 @@ MAX_PEERS_RETURN  = int(os.environ.get("BRN_RDV_MAX_RETURN", "500"))
 UA                = "brn-node-rdv/1"
 
 
+# ============================================================
+# HELPERS
+# ============================================================
 def _get_local_ip() -> str:
-    """IP local (fallback se BRN_PUBLIC_IP não setado)."""
+    """Descobre o IP local da interface principal (fallback do anunciado)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -68,11 +83,13 @@ def _get_local_ip() -> str:
         s.close()
 
 
+# ============================================================
+# RendezvousMongo
+# ============================================================
 class RendezvousMongo(threading.Thread):
     """
-    Anúncio + descoberta via MongoDB.
-
-    Não requer servidor HTTP. Só precisa do mongo_client configurado.
+    Anúncio + descoberta de peers via MongoDB.
+    Não requer servidor HTTP — só precisa do mongo_client configurado.
     """
 
     def __init__(self,
@@ -85,15 +102,17 @@ class RendezvousMongo(threading.Thread):
                  ttl_s: int = DEFAULT_TTL_S,
                  blockchain=None) -> None:
         super().__init__(daemon=True, name="RendezvousMongo")
-        self.tcp_port = tcp_port
-        self.node_uuid = node_uuid
+
+        self.tcp_port = int(tcp_port)
+        self.node_uuid = str(node_uuid or "")
         self.on_peer = on_peer
         self.running_flag = running_flag
         self.blockchain = blockchain
-        self.interval = interval
-        self.ttl_s = ttl_s
+        self.interval = int(interval)
+        self.ttl_s = int(ttl_s)
 
-        self.ip_hint = (ip_hint or os.environ.get("BRN_PUBLIC_IP", "")
+        self.ip_hint = (ip_hint
+                        or os.environ.get("BRN_PUBLIC_IP", "")
                         or _get_local_ip())
 
         self._stop_evt = threading.Event()
@@ -114,9 +133,9 @@ class RendezvousMongo(threading.Thread):
             "consecutive_fail": 0,
         }
 
-    # --------------------------------------------------------
-    # SETUP
-    # --------------------------------------------------------
+    # ============================================================
+    # COLECÇÃO MONGO
+    # ============================================================
     def _get_collection(self):
         """Retorna a collection `rendezvous` ou None se Mongo indisponível."""
         try:
@@ -128,7 +147,7 @@ class RendezvousMongo(threading.Thread):
                 return None
             coll = db.rendezvous
 
-            # Índices (uma vez por processo)
+            # Cria índices só uma vez por processo
             if not self._indexes_ok:
                 try:
                     coll.create_index(
@@ -150,12 +169,12 @@ class RendezvousMongo(threading.Thread):
             log.debug("rdv mongo indisponível: %s", e)
             return None
 
-    # --------------------------------------------------------
+    # ============================================================
     # MÉTRICAS
-    # --------------------------------------------------------
+    # ============================================================
     def _set_error(self, msg: str) -> None:
         with self._m_lock:
-            self._metrics["last_error"] = msg
+            self._metrics["last_error"] = str(msg)[:200]
             self._metrics["last_fail_ts"] = time.time()
             self._metrics["consecutive_fail"] += 1
 
@@ -165,9 +184,9 @@ class RendezvousMongo(threading.Thread):
             self._metrics["last_ok_ts"] = time.time()
             self._metrics["consecutive_fail"] = 0
 
-    # --------------------------------------------------------
-    # HEIGHT / WORK (para o anúncio)
-    # --------------------------------------------------------
+    # ============================================================
+    # STATE PARA O ANÚNCIO
+    # ============================================================
     def _current_height(self) -> int:
         if self.blockchain is None:
             return 0
@@ -184,16 +203,17 @@ class RendezvousMongo(threading.Thread):
         except Exception:
             return 0
 
-    # --------------------------------------------------------
+    # ============================================================
     # ANNOUNCE
-    # --------------------------------------------------------
+    # ============================================================
     def _announce(self) -> bool:
         coll = self._get_collection()
         if coll is None:
-            self._set_error("mongo indisponível")
+            self._set_error("mongo indisponivel")
             with self._m_lock:
                 self._metrics["announces_fail"] += 1
             return False
+
         try:
             doc = {
                 "uuid":   self.node_uuid,
@@ -220,15 +240,16 @@ class RendezvousMongo(threading.Thread):
                 self._metrics["announces_fail"] += 1
             return False
 
-    # --------------------------------------------------------
-    # DISPATCH (chama on_peer para peers novos)
-    # --------------------------------------------------------
+    # ============================================================
+    # DISPATCH
+    # ============================================================
     def _dispatch(self, peers: list) -> int:
+        """Chama on_peer() para peers ainda não vistos."""
         added = 0
         now = time.time()
 
+        # clean: se dict ficou grande, remove antigos
         with self._seen_lock:
-            # Cleanup: se dict ficou grande, remove antigos
             if len(self._seen) > 2000:
                 cutoff = now - 300
                 for k in [k for k, t in self._seen.items() if t < cutoff]:
@@ -241,10 +262,14 @@ class RendezvousMongo(threading.Thread):
                 uuid = str(p.get("uuid", ""))
             except (TypeError, ValueError):
                 continue
-            if not ip or port <= 0 or uuid == self.node_uuid:
+
+            if not ip or port <= 0:
+                continue
+            if uuid == self.node_uuid:
                 continue
 
             key = f"{ip}:{port}"
+
             with self._seen_lock:
                 if key in self._seen and (now - self._seen[key]) < 300:
                     continue
@@ -258,18 +283,18 @@ class RendezvousMongo(threading.Thread):
 
         return added
 
-    # --------------------------------------------------------
+    # ============================================================
     # FETCH
-    # --------------------------------------------------------
+    # ============================================================
     def _fetch_peers(self) -> list:
         coll = self._get_collection()
         if coll is None:
             return []
         try:
-            now = time.time()
-            cutoff = now - self.ttl_s
+            cutoff = time.time() - self.ttl_s
             cursor = coll.find(
-                {"ts": {"$gte": cutoff}, "uuid": {"$ne": self.node_uuid}},
+                {"ts": {"$gte": cutoff},
+                 "uuid": {"$ne": self.node_uuid}},
                 {"_id": 0, "uuid": 1, "ip": 1, "port": 1, "height": 1},
             ).limit(MAX_PEERS_RETURN)
             return list(cursor)
@@ -277,17 +302,18 @@ class RendezvousMongo(threading.Thread):
             log.debug("fetch_peers falhou: %s", e)
             return []
 
-    # --------------------------------------------------------
+    # ============================================================
     # LOOP
-    # --------------------------------------------------------
+    # ============================================================
     def run(self) -> None:
         if self._get_collection() is None:
-            log.warning("RendezvousMongo: mongo indisponível — pulando")
+            log.warning("RendezvousMongo: mongo indisponivel — pulando")
             return
 
-        log.info("RendezvousMongo ativo (intervalo=%ds ttl=%ds)",
-                 self.interval, self.ttl_s)
+        log.info("RendezvousMongo ativo (intervalo=%ds ttl=%ds ip=%s)",
+                 self.interval, self.ttl_s, self.ip_hint)
 
+        # Delay inicial para não competir com o boot
         if self._stop_evt.wait(INITIAL_DELAY):
             return
 
@@ -308,7 +334,7 @@ class RendezvousMongo(threading.Thread):
                 log.warning("rendezvous loop: %s", e)
                 self._set_error(str(e))
 
-            # Backoff simples se em falha
+            # Backoff se em falha
             with self._m_lock:
                 fails = self._metrics["consecutive_fail"]
             wait = self.interval if fails == 0 else min(self.interval * 2, 600)
@@ -317,11 +343,11 @@ class RendezvousMongo(threading.Thread):
 
         log.info("RendezvousMongo encerrado")
 
-    # --------------------------------------------------------
+    # ============================================================
     # STOP
-    # --------------------------------------------------------
+    # ============================================================
     def stop(self, wait: bool = True, timeout: float = 5.0) -> None:
-        # Remove nosso anúncio (para outros não tentarem conectar)
+        # Remove nosso anúncio para que outros não tentem conectar
         try:
             coll = self._get_collection()
             if coll is not None:
@@ -332,9 +358,9 @@ class RendezvousMongo(threading.Thread):
         if wait and self.is_alive():
             self.join(timeout=timeout)
 
-    # --------------------------------------------------------
+    # ============================================================
     # STATUS
-    # --------------------------------------------------------
+    # ============================================================
     def status(self) -> dict:
         with self._m_lock:
             m = dict(self._metrics)
@@ -350,7 +376,84 @@ class RendezvousMongo(threading.Thread):
             "peers_added":       m["peers_added"],
             "last_peer_count":   m["last_peer_count"],
             "consecutive_fail":  m["consecutive_fail"],
-            "last_ok_ago_s":     int(now - m["last_ok_ts"]) if m["last_ok_ts"] else None,
-            "last_fail_ago_s":   int(now - m["last_fail_ts"]) if m["last_fail_ts"] else None,
+            "last_ok_ago_s":     (int(now - m["last_ok_ts"])
+                                  if m["last_ok_ts"] else None),
+            "last_fail_ago_s":   (int(now - m["last_fail_ts"])
+                                  if m["last_fail_ts"] else None),
             "last_error":        m["last_error"],
         }
+
+    # ============================================================
+    # API EXTRA
+    # ============================================================
+    def force_announce(self) -> bool:
+        """Força um announce imediato (útil em testes)."""
+        return self._announce()
+
+    def list_remote_peers(self) -> list:
+        """Retorna todos os peers remotos (sem filtrar por visto)."""
+        return self._fetch_peers()
+
+
+# ============================================================
+# AUTO-TESTE (modo dry-run — não precisa de Mongo)
+# ============================================================
+if __name__ == "__main__":
+    import json
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    print("Testando RendezvousMongo (dry-run)...")
+
+    # ---- 1. Instanciação ----
+    stop = [False]
+
+    def running():
+        return not stop[0]
+
+    received = []
+
+    def on_peer(ip, port):
+        received.append((ip, port))
+
+    rdv = RendezvousMongo(
+        tcp_port=6001,
+        node_uuid="abc" * 21 + "def"[:2],  # 64+ chars fictícios
+        on_peer=on_peer,
+        running_flag=running,
+        blockchain=None,
+    )
+
+    print(f"  ip_hint:    {rdv.ip_hint}")
+    print(f"  interval:   {rdv.interval}")
+    print(f"  ttl_s:      {rdv.ttl_s}")
+    print(f"  backend:    mongo (lazy)")
+
+    # ---- 2. Status antes de rodar ----
+    st = rdv.status()
+    print(f"  running:    {st['running']}")
+    assert st["backend"] == "mongo"
+    assert st["running"] is False
+
+    # ---- 3. _dispatch funciona sem Mongo ----
+    fake_peers = [
+        {"uuid": "peer1", "ip": "10.0.0.1", "port": 6001},
+        {"uuid": "peer2", "ip": "10.0.0.2", "port": 6001},
+        {"uuid": "abc" * 21 + "def"[:2], "ip": "10.0.0.9", "port": 6001},  # próprio
+    ]
+    n = rdv._dispatch(fake_peers)
+    print(f"  dispatch:   +{n} peer(s) (filtrou self)")
+    assert n == 2, f"esperado 2, obteve {n}"
+    assert len(received) == 2
+
+    # ---- 4. Dispatch duplicado ----
+    n2 = rdv._dispatch(fake_peers)
+    print(f"  dispatch 2: +{n2} peer(s) (dedup)")
+    assert n2 == 0, f"esperado 0 (dedup), obteve {n2}"
+
+    # ---- 5. Status final ----
+    print(f"  status:     {json.dumps(rdv.status(), ensure_ascii=False)}")
+
+    print("RendezvousMongo OK (mongo real nao testado).")
