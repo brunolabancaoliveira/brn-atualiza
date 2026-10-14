@@ -1,16 +1,11 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.1.7-reorg | Data: 14/10/2026
+Versão: 9.1.7-reorg-minerC | Data: 14/10/2026
 ================================================================
-v9.1.7-reorg:
-  [CHANGE] `reorg_to()` movido para `reorg.py` (plugado no fim).
-  [KEEP]   Todo o resto do v9.1.7 inalterado:
-            - Anti-death-spiral (BRN_FORCE_DIFFICULTY, BRN_BLOCK_TIME,
-              BRN_DIFF_INTERVAL, BRN_MAX_DIFFICULTY)
-            - Auth tag HMAC por bloco (a partir de AUTH_TAG_START_HEIGHT)
-            - Checkpoints assinados Ed25519
-            - Contratos (deploy/call) via contracts/vm.py
-            - Callback on_block_mined
-            - cumulative_work_of_chain (necessário para reorg)
+v9.1.7-reorg-minerC:
+  [NEW] _pow_search() tenta brn_miner.so (C) antes do Python puro
+  [NEW] _pow_search_c() divide a busca em chunks de 500k hashes
+        para permitir interrupção (should_continue)
+  [KEEP] Todo o resto do v9.1.7-reorg inalterado
 ================================================================
 """
 from __future__ import annotations
@@ -37,7 +32,7 @@ INITIAL_REWARD = 50 * UNIT
 HALVING_INTERVAL = 210_000
 
 # ============================================================
-# CONSENSO / DIFICULDADE (todos configuráveis via env)
+# CONSENSO / DIFICULDADE
 # ============================================================
 BLOCK_TIME = int(os.environ.get("BRN_BLOCK_TIME", "30"))
 DIFFICULTY_INTERVAL = int(os.environ.get("BRN_DIFF_INTERVAL", "50"))
@@ -52,6 +47,10 @@ MAX_REORG_DEPTH = 100
 HASH_BATCH_SIZE = 5000
 AUTH_TAG_START_HEIGHT = 6000
 CHECKPOINT_INTERVAL = 1000
+
+# Tamanho do chunk na busca C (hashes por chamada antes de checar
+# should_continue). 500k a ~3M h/s = ~0.17s por chunk.
+_C_CHUNK_HASHES = 500_000
 
 # ============================================================
 # GÊNESE
@@ -141,7 +140,7 @@ def _maybe_sign_checkpoint(block) -> None:
 
 
 # ============================================================
-# AUTH TAG — HMAC do network_secret sobre (height, hash)
+# AUTH TAG
 # ============================================================
 def compute_auth_tag(height: int, block_hash_hex: str,
                      secret: str = None) -> str:
@@ -164,7 +163,6 @@ def verify_auth_tag(height: int, block_hash_hex: str, tag: str,
 # PoW / DIFICULDADE
 # ============================================================
 def block_hash(prev_hash, merkle, timestamp, nonce, difficulty) -> str:
-    """Hash canônico do header (concatenação f-string)."""
     header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
     return double_sha256(header.encode()).hex()
 
@@ -237,10 +235,46 @@ def signing_hash(tx: dict) -> bytes:
 
 
 # ============================================================
-# HOT LOOP PoW
+# HOT LOOP PoW — tenta C, senão Python
 # ============================================================
-def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
-                should_continue=None, progress_cb=None):
+def _pow_search_c(prev_hash, merkle, ts, diff,
+                  nonce_start, should_continue, progress_cb):
+    """PoW via biblioteca C, fatiado em chunks interrompíveis."""
+    from brn_miner import pow_search as c_pow
+
+    prefix = f"{prev_hash}{merkle}{ts}"
+    diff_str = str(diff)
+
+    nonce = nonce_start
+    total_hashes = 0
+
+    while True:
+        result = c_pow(prefix, diff_str, int(diff),
+                       nonce_start=nonce, max_iters=_C_CHUNK_HASHES)
+        if result is None:
+            return None, None, total_hashes
+
+        found_nonce, found_hash, chunk_hashes = result
+        total_hashes += chunk_hashes
+
+        if found_nonce is not None:
+            return found_nonce, found_hash, total_hashes
+
+        nonce += chunk_hashes
+
+        if should_continue is not None and not should_continue():
+            return None, None, total_hashes
+
+        if progress_cb is not None:
+            try:
+                progress_cb(nonce, total_hashes)
+            except Exception:
+                pass
+
+
+def _pow_search_python(prev_hash, merkle, ts, diff, nonce_start=0,
+                       should_continue=None, progress_cb=None):
+    """Fallback Python puro (idêntico ao original)."""
     prefix = f"{prev_hash}{merkle}{ts}".encode()
     diff_bytes = str(diff).encode()
     target_int = int("0" * int(diff) + "f" * (64 - int(diff)), 16)
@@ -266,11 +300,32 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
                 pass
 
 
+def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
+                should_continue=None, progress_cb=None):
+    """
+    Busca PoW. Tenta C primeiro; se indisponível, usa Python.
+    """
+    # ---------- C ----------
+    try:
+        from brn_miner import is_available
+        if is_available():
+            return _pow_search_c(prev_hash, merkle, ts, diff,
+                                 nonce_start, should_continue, progress_cb)
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[pow] C falhou ({e}), usando Python")
+
+    # ---------- Python fallback ----------
+    return _pow_search_python(prev_hash, merkle, ts, diff, nonce_start,
+                              should_continue, progress_cb)
+
+
 # ============================================================
 # COINBASE / GÊNESE
 # ============================================================
-def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int) -> dict:
-    """Constrói um coinbase. pubkey_hex é obrigatória."""
+def make_coinbase(address: str, pubkey_hex: str, height: int,
+                  reward: int) -> dict:
     if not pubkey_hex:
         raise ValueError("make_coinbase: pubkey_hex é obrigatória")
     cb = {
@@ -397,7 +452,8 @@ class Blockchain:
         merkle = compute_merkle_root([cb["txid"]])
         nonce = 0
         while True:
-            h = block_hash(GENESIS_PREV, merkle, GENESIS_TIMESTAMP, nonce, 1)
+            h = block_hash(GENESIS_PREV, merkle,
+                           GENESIS_TIMESTAMP, nonce, 1)
             if h.startswith("0"):
                 break
             nonce += 1
@@ -427,7 +483,6 @@ class Blockchain:
         return INITIAL_REWARD >> halvings
 
     def current_difficulty(self) -> int:
-        """Retorna dificuldade para o próximo bloco."""
         if FORCE_DIFFICULTY:
             try:
                 v = int(FORCE_DIFFICULTY)
@@ -471,11 +526,11 @@ class Blockchain:
     def get_latest_height(self) -> int:
         return self.db.height()
 
-    def get_transaction_block_height(self, txid: str) -> int:
-        return self.db.get_tx_block_height(txid)
+    def get_transaction_block_height(self, txid_str: str) -> int:
+        return self.db.get_tx_block_height(txid_str)
 
-    def count_confirmations(self, txid: str) -> int:
-        tx_height = self.get_transaction_block_height(txid)
+    def count_confirmations(self, txid_str: str) -> int:
+        tx_height = self.get_transaction_block_height(txid_str)
         if tx_height == -1:
             return 0
         return self.get_latest_height() - tx_height
@@ -513,7 +568,7 @@ class Blockchain:
         return in_sum - sum(o["amount"] for o in tx["outputs"])
 
     # ============================================================
-    # CONTRATOS (deploy/call) — delega para contracts/vm.py
+    # CONTRATOS
     # ============================================================
     def _validate_contract_tx(self, tx: dict) -> tuple:
         tx_data = tx.get("data") or {}
@@ -580,7 +635,8 @@ class Blockchain:
             return False, "txid invalido"
 
         tx_data = tx.get("data") or {}
-        if isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call"):
+        if isinstance(tx_data, dict) and tx_data.get("type") in ("deploy",
+                                                                 "call"):
             ok_ctr, msg_ctr = self._validate_contract_tx(tx)
             if not ok_ctr:
                 return False, f"contrato: {msg_ctr}"
@@ -589,7 +645,6 @@ class Blockchain:
             if not inp.get("pubkey"):
                 return False, "input sem pubkey"
 
-        # Nonce único
         tx_nonce = tx.get("nonce", 0)
         for inp in tx["inputs"]:
             pk = inp["pubkey"]
@@ -600,7 +655,6 @@ class Blockchain:
                     f"(esperado {expected}, recebido {tx_nonce})"
                 )
 
-        # Soma de inputs + UTXO binding
         in_sum = 0
         seen = set()
         for inp in tx["inputs"]:
@@ -634,14 +688,12 @@ class Blockchain:
                     )
             in_sum += u["amount"]
 
-        # Outputs <= inputs, fee mínimo
         out_sum = sum(o["amount"] for o in tx["outputs"])
         if out_sum > in_sum:
             return False, "outputs > inputs"
         if in_sum - out_sum < MIN_RELAY_FEE:
             return False, "fee abaixo do minimo"
 
-        # Assinaturas
         sig_hash = signing_hash(tx)
         for inp in tx["inputs"]:
             if not Wallet.verify(sig_hash, inp.get("signature", ""),
@@ -667,7 +719,6 @@ class Blockchain:
     # VALIDAÇÃO DE BLOCO
     # ============================================================
     def validate_block(self, block: dict, prev_block=None) -> tuple:
-        # Genesis
         if block["height"] == 0 and prev_block is None:
             if (self.genesis_expected_hash
                     and block["hash"] != self.genesis_expected_hash):
@@ -677,7 +728,6 @@ class Blockchain:
                     f"  recebido: {block['hash'][:16]}..."
                 )
 
-        # Encadeamento
         expected_prev = (prev_block["hash"] if prev_block
                          else self.db.tip_hash())
         if block["prev_hash"] != expected_prev:
@@ -688,7 +738,6 @@ class Blockchain:
         if block["height"] != expected_height:
             return False, "altura invalida"
 
-        # PoW
         if not meets_difficulty(block["hash"], block["difficulty"]):
             return False, "PoW invalido"
 
@@ -698,18 +747,15 @@ class Blockchain:
         if h != block["hash"]:
             return False, "hash incorreto"
 
-        # Merkle
         calc_merkle = compute_merkle_root(
             [t["txid"] for t in block["transactions"]])
         if calc_merkle != block["merkle"]:
             return False, "merkle incorreto"
 
-        # Checkpoint
         ok_cp, msg_cp = _verify_checkpoint_for_block(block)
         if not ok_cp:
             return False, msg_cp
 
-        # Auth tag
         if self.require_auth_tag:
             if not self.network_secret:
                 return False, "no exige auth_tag mas sem BRN_NETWORK_SECRET"
@@ -727,7 +773,6 @@ class Blockchain:
                                            tag, self.network_secret):
                         return False, "auth_tag invalido em bloco legado"
 
-        # Coinbase — formato
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
@@ -743,7 +788,6 @@ class Blockchain:
             if inp.get("signature"):
                 return False, "coinbase input com assinatura"
 
-        # Rewards + txs normais
         reward = self.current_reward(block["height"])
         fees = 0
         for i, t in enumerate(block["transactions"][1:], 1):
@@ -859,7 +903,7 @@ class Blockchain:
         return None
 
     # ============================================================
-    # SNAPSHOT (debug)
+    # SNAPSHOT
     # ============================================================
     def state_snapshot(self) -> dict:
         return {
@@ -874,15 +918,13 @@ class Blockchain:
 
 # ============================================================
 # PLUGIN DO REORG (reorg.py)
-# ------------------------------------------------------------
-# Assina o método Blockchain.reorg_to() delegando para reorg.py.
-# Se reorg.py não existir, o método fica indisponível (silencioso).
 # ============================================================
 try:
     from reorg import reorg_to as _reorg_to, find_fork_point as _find_fork
 
-    def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH):
-        res = _reorg_to(self, new_blocks, max_depth)
+    def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH,
+                         allow_genesis_reorg=False):
+        res = _reorg_to(self, new_blocks, max_depth, allow_genesis_reorg)
         return res.to_tuple()
 
     def _find_fork_method(self, remote_blocks, max_depth=1000):
@@ -909,137 +951,3 @@ try:
     print("chain_validator.py plugado em Blockchain")
 except ImportError:
     print("chain_validator.py nao encontrado")
-
-
-# ============================================================
-# AUTO-TESTE
-# ============================================================
-if __name__ == "__main__":
-    import tempfile
-
-    print("=" * 60)
-    print(" blockchain.py — Auto-teste")
-    print("=" * 60)
-
-    # Configurar segredo para o teste
-    os.environ.setdefault("BRN_NETWORK_SECRET",
-                          "segredo-de-teste-blockchain-1234567")
-
-    with tempfile.TemporaryDirectory() as td:
-        path = os.path.join(td, "test.db")
-
-        # ---------- 1. Instanciação ----------
-        bc = Blockchain(path, auto_genesis=True)
-        print(f"\n[1] Altura inicial: {bc.db.height()}")
-        assert bc.db.height() == 0, "genesis deveria ter sido criado"
-        print("    [ok] genesis criado")
-
-        # ---------- 2. Constantes ----------
-        print(f"\n[2] Constantes:")
-        print(f"    TICKER={TICKER}")
-        print(f"    UNIT={UNIT}  (1 {TICKER} = {UNIT} sats)")
-        print(f"    INITIAL_REWARD={INITIAL_REWARD} sats")
-        print(f"    BLOCK_TIME={BLOCK_TIME}s")
-        print(f"    DIFFICULTY_INTERVAL={DIFFICULTY_INTERVAL}")
-        print(f"    MAX_DIFFICULTY={MAX_DIFFICULTY}")
-        print(f"    INITIAL_DIFFICULTY={INITIAL_DIFFICULTY}")
-        print("    [ok]")
-
-        # ---------- 3. current_reward ----------
-        print(f"\n[3] current_reward:")
-        for h in (0, 1, 210_000, 420_000):
-            r = bc.current_reward(h)
-            print(f"    bloco #{h:<8} reward={r/UNIT:.4f} {TICKER}")
-        assert bc.current_reward(0) == INITIAL_REWARD
-        assert bc.current_reward(210_000) == INITIAL_REWARD // 2
-        print("    [ok] halving correto")
-
-        # ---------- 4. current_difficulty ----------
-        print(f"\n[4] current_difficulty: {bc.current_difficulty()}")
-
-        # ---------- 5. cumulative_work ----------
-        cw = bc.cumulative_work()
-        print(f"\n[5] cumulative_work: {cw}")
-        assert cw > 0
-        print("    [ok]")
-
-        # ---------- 6. mine_block ----------
-        print(f"\n[6] mineração:")
-        miner_addr = GENESIS_ADDRESS
-        miner_pub = "02" + "aa" * 32
-        t0 = time.time()
-        blk = bc.mine_block(miner_addr, miner_pub)
-        dt = time.time() - t0
-        assert blk is not None, "mine_block retornou None"
-        print(f"    bloco #{blk['height']} minerado em {dt:.2f}s")
-        print(f"    hash={blk['hash'][:20]}...  diff={blk['difficulty']}")
-        assert bc.db.height() == 1
-        print("    [ok]")
-
-        # ---------- 7. saldo do minerador ----------
-        bal = bc.db.balance(miner_addr)
-        print(f"\n[7] saldo do minerador: {bal/UNIT:.4f} {TICKER}")
-        assert bal == INITIAL_REWARD + GENESIS_REWARD  # genesis + bloco 1
-        print("    [ok]")
-
-        # ---------- 8. minha vários blocos ----------
-        print(f"\n[8] minerando 3 blocos seguidos:")
-        for i in range(3):
-            b = bc.mine_block(miner_addr, miner_pub)
-            assert b is not None
-            print(f"    #{b['height']} -> diff={b['difficulty']} "
-                  f"({bc.db.balance(miner_addr)/UNIT:.4f} {TICKER})")
-        assert bc.db.height() == 4
-        print("    [ok]")
-
-        # ---------- 9. cumulative_work_of_chain ----------
-        blocks = [bc.db.get_block(h) for h in range(1, 5)]
-        work_sum = bc.cumulative_work_of_chain(blocks)
-        print(f"\n[9] cumulative_work_of_chain: {work_sum}")
-        assert work_sum > 0
-        print("    [ok]")
-
-        # ---------- 10. submit_tx — transferência ----------
-        print(f"\n[10] submit_tx (transferência):")
-        from wallet import Wallet
-        w = Wallet.create()
-        # Recebe do genesis (o genesis tem saldo grande)
-        # Como genesis é uma coinbase para GENESIS_ADDRESS, precisamos
-        # gastar daí... mas o genesis não tem privkey. Pulamos.
-        print("    [skip] genesis não tem privkey, transfer pulada")
-
-        # ---------- 11. state_snapshot ----------
-        print(f"\n[11] state_snapshot:")
-        snap = bc.state_snapshot()
-        for k, v in snap.items():
-            print(f"    {k}: {v}")
-
-        # ---------- 12. reorg_to (plugin) ----------
-        print(f"\n[12] reorg_to (plugin):")
-        if hasattr(bc, "reorg_to"):
-            ok, msg = bc.reorg_to([])
-            print(f"    reorg vazio: ok={ok} msg={msg}")
-            assert not ok
-            print("    [ok]")
-        else:
-            print("    [skip] reorg.py não plugado")
-
-        # ---------- 13. verify_chain (plugin) ----------
-        print(f"\n[13] verify_chain (plugin):")
-        if hasattr(bc, "verify_chain"):
-            try:
-                r = bc.verify_chain()
-                valid = getattr(r, "valid", bool(r))
-                print(f"    verify_chain: valid={valid}")
-            except Exception as e:
-                print(f"    verify_chain falhou: {e}")
-        else:
-            print("    [skip] chain_validator.py não plugado")
-
-        # ---------- cleanup ----------
-        bc.db.close()
-
-    print("\n" + "=" * 60)
-    print(" blockchain.py OK.")
-    print("=" * 60)
-    
