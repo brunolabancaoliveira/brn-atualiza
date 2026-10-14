@@ -1,13 +1,18 @@
-"""
-server.py — Backend HTTP do nó BRN (v9.4)
+"""server.py — Backend HTTP do nó BRN (v9.6)
 ================================================================
+v9.6:
+  [NEW] Guard de mineração — apenas nó origem pode minerar
+        Decorator @require_mining_allowed aplicado em:
+          /api/mine
+          /api/miner/start
+          /api/faucet
+        Nós clientes recebem 403 (evita forks por mineração dupla).
+v9.5:
+  [NEW] set_sync_manager() + /api/sync/status
+  [FIX] /api/sync-info: contar_peers(apenas_ativos=False)
 v9.4 (Modo 2 — mineração aberta na rede):
-  [CHANGE] /api/mine         — sem @_admin_required (público)
-  [CHANGE] /api/miner/start  — sem @_admin_required (público)
-  [CHANGE] /api/miner/stop   — sem @_admin_required (público)
-  [KEEP]   /api/faucet       — MANTÉM @_admin_required
-  [NEW]    audit_log inclui ip do minerador em todos os eventos
-  [NEW]    rate limit específico para mineração (30/min por IP)
+  /api/mine, /api/miner/start, /api/miner/stop — sem @_admin_required
+  /api/faucet — mantém @_admin_required
 v9.3:
   CHAIN injetável, auto_registrar_carteira_atual, secure_store fallback
 v9.2:
@@ -15,9 +20,13 @@ v9.2:
 v9.1:
   Rate limit via security.require_rate_limit
   audit_log em rotas sensíveis
-  get_client_ip respeita X-Forwarded-For
 v9.0:
   bind default 127.0.0.1, admin token, caches com cleanup thread
+
+Env:
+    BRN_IS_ORIGIN=1  → permite minerar
+    BRN_IS_ORIGIN=0  → bloqueia /api/mine, /api/miner/start, /api/faucet
+    BRN_ALLOW_CLIENT_MINE=1  → override (só para testes)
 ================================================================
 """
 from __future__ import annotations
@@ -64,6 +73,7 @@ except ImportError:
     def get_client_ip():
         return request.remote_addr or "0.0.0.0"
 
+
 log = logging.getLogger("server")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -82,6 +92,45 @@ FAUCET_AMOUNT_BRN      = 10
 FAUCET_MAX_PER_ADDRESS = 3
 FAUCET_COOLDOWN_S      = 60 * 60
 CACHE_TTL_S            = 5
+
+
+# ============================================================
+# GUARD DE MINERAÇÃO — apenas nó origem minera
+# ============================================================
+IS_ORIGIN         = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
+ALLOW_CLIENT_MINE = os.environ.get("BRN_ALLOW_CLIENT_MINE", "0") == "1"
+CAN_MINE          = IS_ORIGIN or ALLOW_CLIENT_MINE
+
+
+def _mining_denied():
+    """Resposta 403 padrão para nós que não podem minerar."""
+    return jsonify({
+        "ok": False,
+        "msg": ("Este no NAO minera (BRN_IS_ORIGIN=0). "
+                "Apenas o no origem pode minerar."),
+        "is_origin": IS_ORIGIN,
+        "allow_client_mine": ALLOW_CLIENT_MINE,
+    }), 403
+
+
+def require_mining_allowed(f):
+    """
+    Decorator: bloqueia se o nó não pode minerar.
+    Aplicado em /api/mine, /api/miner/start, /api/faucet.
+    """
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not CAN_MINE:
+            try:
+                audit_log("mining_blocked", {
+                    "path": request.path,
+                    "ip":   get_client_ip(),
+                })
+            except Exception:
+                pass
+            return _mining_denied()
+        return f(*args, **kwargs)
+    return wrapper
 
 
 # ============================================================
@@ -126,7 +175,6 @@ def set_sync_manager(sync) -> None:
 
 
 def _get_sync_manager():
-    """Retorna o sync manager injetado, ou None se não disponível."""
     return _SYNC_MANAGER
 
 
@@ -458,9 +506,9 @@ def portfolio(address):
         cached = _saldo_cache_get(address)
         if cached is None:
             utxos = _get_chain().db.get_utxos(address)
-            cached = sum(u["amount"] for u in utxos)
+            cached = sumBR(u["amount"] for u in utxosN)
             _saldo_cache_set(address, cached)
-        return jsonify({"portfolio": {"BRN": cached / 10**8, "KYC": 0}})
+        return json":ify({"portfolio": {" cached / 10**8, "KYC": 0}})
     except Exception as e:
         return jsonify({"portfolio": {}, "error": str(e)}), 500
 
@@ -740,12 +788,13 @@ def transfer():
 
 
 # ============================================================
-# MINERAÇÃO (Modo 2 — SEM admin token)
+# MINERAÇÃO — protegida por @require_mining_allowed
 # ============================================================
 @app.route("/api/mine", methods=["POST"])
 @require_rate_limit("mine")
+@require_mining_allowed
 def mine():
-    """Mineração aberta — sem @_admin_required (Modo 2)."""
+    """Mineração — apenas nó ORIGEM pode chamar (403 se cliente)."""
     try:
         data = request.get_json(force=True) or {}
         miner = (data.get("validator_address")
@@ -791,8 +840,9 @@ def mine():
 
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
+@require_mining_allowed
 def miner_start():
-    """Inicia miner contínuo — SEM admin token (Modo 2)."""
+    """Inicia miner contínuo — apenas nó ORIGEM."""
     try:
         data = request.get_json(force=True) or {}
         addr = (data.get("validator_address")
@@ -830,7 +880,10 @@ def miner_start():
 @app.route("/api/miner/stop", methods=["POST"])
 @require_rate_limit("miner_stop")
 def miner_stop():
-    """Para miner contínuo — SEM admin token (Modo 2)."""
+    """
+    Para miner contínuo — permitido em qualquer nó.
+    (Se o nó é cliente, não tem miner rodando; retorna ok=False gracefully.)
+    """
     try:
         from miner_loop import get_miner
         m = get_miner(_get_chain())
@@ -847,6 +900,7 @@ def miner_stop():
 @app.route("/api/miner/on", methods=["POST"])
 @app.route("/api/start-mining", methods=["POST"])
 def miner_start_alias():
+    # Alias para /api/miner/start — mas passa pelo mesmo guard
     return miner_start()
 
 
@@ -858,6 +912,7 @@ def miner_stop_alias():
 
 @app.route("/api/miner/status", methods=["GET"])
 def miner_status():
+    """Status do miner — leitura, permitida em qualquer nó."""
     try:
         from miner_loop import get_miner
         m = get_miner(_get_chain())
@@ -877,18 +932,22 @@ def miner_status():
             "height": _get_chain().db.height(),
             "difficulty": _get_chain().current_difficulty(),
             "last_error": st.get("last_error", ""),
+            "is_origin": IS_ORIGIN,
+            "can_mine": CAN_MINE,
         })
     except Exception as e:
         return jsonify({"running": False, "error": str(e)}), 200
 
 
 # ============================================================
-# Faucet (MANTÉM admin token)
+# Faucet — protegido por admin + mining guard
 # ============================================================
 @app.route("/api/faucet", methods=["POST"])
 @require_rate_limit("faucet")
 @_admin_required
+@require_mining_allowed
 def faucet():
+    """Faucet — apenas nó ORIGEM + admin token."""
     try:
         data = request.get_json(force=True) or {}
         addr = (data.get("address") or data.get("validator_address")
@@ -980,6 +1039,8 @@ def status():
                 "contracts": (chain.db.contract_count()
                               if hasattr(chain.db, "contract_count") else 0),
                 "l2_enabled": L2_ENABLED,
+                "is_origin": IS_ORIGIN,
+                "can_mine": CAN_MINE,
             })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1044,11 +1105,12 @@ def hd_create():
 @require_rate_limit("hd_derive")
 def hd_derive():
     try:
-        data = request.get_json(force=True) or {}
-        mn = data.get("mnemonic", "").strip()
-        index = int(data.get("index", 0))
-        if not HDWalletManager.validate_mnemonic(mn):
-            return jsonify({"ok": False, "msg": "Mnemonico invalido"}), 400
+        data =,
+ request.get_json(force=True) or {}
+        mn = data       .get("mnemonic", "").strip()
+        " index = int(data.get("indexbl",oc 0))
+        if not HDWalletManageros.validate_mnemonic(mn):
+            return json_ify({"ok": False, "msg": "Mnemonico invalido"}), 400
         result = HDWalletManager.from_mnemonic(mn, index=index)
         _registrar_pubkey(result["address"], result.get("public_key", ""))
         audit_log("hd_derive_ok", {
@@ -1102,9 +1164,10 @@ def sync_info():
         return jsonify(result), 200
 
     try:
-        result["sync"]["peers"] = chain.db.contar_peers(apenas_ativos=True)
+        result["sync"]["peers"] = chain.db.contar_peers(apenas_ativos=False)
     except Exception as e:
-        log.warning(f"[sync-info] contar_peers: {e}")
+        log.debug(f"[sync-info] contar_peers: {e}")
+        result["sync"]["peers"] = 0
 
     target_h = local_h
     try:
@@ -1120,7 +1183,7 @@ def sync_info():
         if heights:
             target_h = max([target_h] + heights)
     except Exception as e:
-        log.warning(f"[sync-info] listar_peers: {e}")
+        log.debug(f"[sync-info] listar_peers: {e}")
 
     result["sync"]["target"] = target_h
 
@@ -1145,7 +1208,7 @@ def sync_info():
                                                      "BTC_RECEIVE_ADDRESS",
                                                      "") or ""
     except Exception as e:
-        log.warning(f"[sync-info] bridge: {e}")
+        log.debug(f"[sync-info] bridge: {e}")
 
     return jsonify(result), 200
 
@@ -1157,24 +1220,6 @@ def sync_info():
 def sync_status_v7():
     """
     Retorna status detalhado da sincronização em tempo real.
-
-    Campos:
-      - synced          : bool — está sincronizado?
-      - syncing         : bool — sync em andamento?
-      - progress        : float — porcentagem (0-100)
-      - local_height    : int   — altura local atual
-      - target_height   : int   — altura do melhor peer
-      - blocos_faltando : int   — blocos restantes
-      - blocos_por_segundo : float — velocidade (janela 10 s)
-      - velocidade_media   : float — média desde início do sync
-      - eta_segundos    : float|null — ETA em segundos (null=desconhecido)
-      - eta_legivel     : str   — ETA em formato humano ("2m 34s", "sincronizado", etc.)
-      - active_peer     : str|null — peer ativo no momento
-      - peers_known     : int   — peers conhecidos
-      - checkpoint_violations : int — violações de checkpoint detectadas
-      - checkpoints_conhecidos: int — total de checkpoints carregados
-      - last_error      : str   — último erro (vazio se nenhum)
-      - mode            : str   — "full" ou "spv"
     """
     sync = _get_sync_manager()
 
@@ -1185,7 +1230,6 @@ def sync_status_v7():
             log.warning("[sync/status] get_status falhou: %s", e)
             data = {}
     else:
-        # Fallback: monta a resposta básica com dados da chain
         data = {}
         try:
             chain = _get_chain()
@@ -1202,16 +1246,13 @@ def sync_status_v7():
             data["syncing"] = False
             data["progress"] = 0.0
 
-    # Campos com defaults seguros
     local_h  = int(data.get("local_height", 0))
     target_h = int(data.get("target_height", local_h))
     progress = float(data.get("progress", 100.0 if local_h >= target_h else 0.0))
     eta_s    = data.get("eta_segundos")
 
-    # Calcula blocos faltando
     blocos_faltando = max(0, target_h - local_h)
 
-    # ETA em formato legível por humanos
     if data.get("synced", True) or blocos_faltando == 0:
         eta_legivel = "sincronizado"
     elif eta_s is None:
@@ -1236,8 +1277,7 @@ def sync_status_v7():
         "progress": round(progress, 2),
         "local_height": local_h,
         "target_height": target_h,
-        "blocos_faltando": blocos_faltando,
-        "blocos_por_segundo": float(data.get("blocos_por_segundo", 0.0)),
+        "blocos_faltando": blocos_faltandopor_segundo": float(data.get("blocos_por_segundo", 0.0)),
         "velocidade_media": float(data.get("velocidade_media", 0.0)),
         "eta_segundos": eta_s,
         "eta_legivel": eta_legivel,
@@ -1502,7 +1542,10 @@ def health():
             "height": _get_chain().db.height(),
             "l2_enabled": L2_ENABLED,
             "chain_injected": _CHAIN is not None,
-            "mode": "modo2_aberto",
+            "sync_injected": _SYNC_MANAGER is not None,
+            "is_origin": IS_ORIGIN,
+            "can_mine": CAN_MINE,
+            "version": "9.6",
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1512,8 +1555,9 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.4",
-        "mode": "modo2_aberto",
+        "version": "9.6",
+        "is_origin": IS_ORIGIN,
+        "can_mine": CAN_MINE,
         "l2_enabled": L2_ENABLED,
         "admin_protected": bool(ADMIN_TOKEN),
     })
@@ -1536,12 +1580,14 @@ def _shutdown():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.4 (Modo 2 — mineração aberta)")
+    print(f"BRN Server v9.6")
     print(f"  → http://{WEB_HOST}:{port}")
+    print(f"  IS_ORIGIN: {IS_ORIGIN}  |  CAN_MINE: {CAN_MINE}")
+    if not CAN_MINE:
+        print(f"  ⚠️  /api/mine, /api/miner/start, /api/faucet → 403")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
-    print(f"  /api/mine:    PÚBLICO (sem token)")
-    print(f"  /api/faucet:  {'PROTEGIDO' if ADMIN_TOKEN else 'PÚBLICO'}")
+    print(f"  /api/sync/status: ativo (v7)")
     print(f"  CORS: {CORS_ORIGINS or '(desabilitado)'}")
     print(f"  ProxyFix: {'ON' if BEHIND_PROXY else 'off'}")
 
@@ -1552,11 +1598,14 @@ if __name__ == "__main__":
         print(f"[server] auto-registro pubkey: pulado ({reg.get('msg')})")
 
     if os.environ.get("BRN_AUTO_MINE", "0") == "1":
-        try:
-            from miner_loop import iniciar_mineracao
-            iniciar_mineracao(_get_chain())
-            print("[server] auto-miner iniciado")
-        except Exception as e:
-            print(f"[server] auto-miner falhou: {e}")
+        if CAN_MINE:
+            try:
+                from miner_loop import iniciar_mineracao
+                iniciar_mineracao(_get_chain())
+                print("[server] auto-miner iniciado")
+            except Exception as e:
+                print(f"[server] auto-miner falhou: {e}")
+        else:
+            print("[server] auto-miner pulado (CAN_MINE=False)")
 
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
