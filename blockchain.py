@@ -1042,3 +1042,4 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print(" blockchain.py OK.")
     print("=" * 60)
+    
