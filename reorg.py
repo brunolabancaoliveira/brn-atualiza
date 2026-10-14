@@ -1,470 +1,904 @@
-"""reorg.py — Reorganização de cadeia do BRN
+"""blockchain.py — Núcleo da Blockchain BRN
+Versão: 9.1.7-reorg | Data: 14/10/2026
 ================================================================
-Extrai a lógica de reorg do blockchain.py para um módulo independente.
-
-Responsabilidades:
-  1. Detectar fork (comparar cadeias locais vs remotas)
-  2. Encontrar o fork point (último bloco em comum)
-  3. Verificar se a cadeia alternativa tem mais cumulative_work
-  4. Validar que nenhum checkpoint seria violado
-  5. Aplicar reorg com rollback automático em caso de falha
-
-API pública:
-    reorg_to(chain, new_blocks, max_depth=None) -> ReorgResult
-        Executa reorg completo.
-        chain        = instância de Blockchain
-        new_blocks   = lista de blocos da cadeia alternativa
-        max_depth    = profundidade máxima (default: MAX_REORG_DEPTH)
-
-    find_fork_point(chain, remote_blocks) -> int
-        Retorna altura do último bloco em comum, ou -1.
-
-    compare_work(chain, remote_blocks) -> tuple
-        Retorna (work_local, work_remote, should_reorg: bool).
-
-    can_reorg(chain, remote_blocks) -> tuple
-        Verifica se reorg é possível sem aplicar.
-        Retorna (True, "") ou (False, "motivo").
-
-    apply_reorg_if_needed(chain, remote_blocks) -> ReorgResult
-        Wrapper: só reorga se valer a pena.
-
-Plugar no blockchain.py (adicionar no FIM do arquivo):
-
-    from reorg import reorg_to as _reorg_to, find_fork_point as _find_fork
-    Blockchain.reorg_to = lambda self, b: _reorg_to(self, b).to_tuple()
-    Blockchain.find_fork_point = lambda self, b: _find_fork(self, b)
-
-Requer:
-    blockchain.py v9.1.7+ (não importa diretamente — usa duck typing)
+v9.1.7-reorg:
+  [CHANGE] reorg_to() movido para reorg.py (plugado no fim do arquivo).
+  [KEEP]   Todo o resto do v9.1.7 inalterado:
+            - Anti-death-spiral (BRN_FORCE_DIFFICULTY, BRN_BLOCK_TIME,
+              BRN_DIFF_INTERVAL, BRN_MAX_DIFFICULTY)
+            - Auth tag HMAC por bloco (a partir de AUTH_TAG_START_HEIGHT)
+            - Checkpoints assinados Ed25519
+            - Contratos (deploy/call) via contracts/vm.py
+            - Callback on_block_mined
+            - cumulative_work_of_chain (necessário para reorg)
 ================================================================
 """
 from __future__ import annotations
 
-import logging
+import os
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+import hmac
+import hashlib
+import orjson
 
-
-log = logging.getLogger("reorg")
-
-
-# ============================================================
-# CONSTANTES
-# ============================================================
-DEFAULT_MAX_REORG_DEPTH = 100
-DEFAULT_MIN_WORK_ADVANTAGE = 1     # work_remote deve ser >= work_local + 1
+from crypto import double_sha256, sha256
+from db import ChainDB
 
 
 # ============================================================
-# RESULTADO ESTRUTURADO
+# METADADOS DA MOEDA
 # ============================================================
-@dataclass
-class ReorgResult:
-    """Resultado de uma tentativa de reorg."""
-    ok: bool = False
-    reason: str = ""
-    fork_point: int = -1
-    blocks_removed: int = 0
-    blocks_added: int = 0
-    work_local: int = 0
-    work_remote: int = 0
-    duration_s: float = 0.0
-    checkpoint_violated: int = -1
-    error: Optional[str] = None
+COIN_NAME = "BrunoCoin"
+TICKER = "BRN"
+DECIMALS = 8
+UNIT = 10 ** DECIMALS
+MAX_SUPPLY = 21_000_000 * UNIT
+INITIAL_REWARD = 50 * UNIT
+HALVING_INTERVAL = 210_000
 
-    def to_tuple(self) -> tuple:
-        """Compat: (ok: bool, msg: str)."""
-        if self.ok:
-            return True, (f"reorg ok — fork #{self.fork_point}, "
-                          f"-{self.blocks_removed} +{self.blocks_added} "
-                          f"({self.duration_s:.2f}s)")
-        return False, self.reason or self.error or "reorg falhou"
+# ============================================================
+# CONSENSO / DIFICULDADE
+# ============================================================
+BLOCK_TIME = int(os.environ.get("BRN_BLOCK_TIME", "30"))
+DIFFICULTY_INTERVAL = int(os.environ.get("BRN_DIFF_INTERVAL", "50"))
+MAX_DIFFICULTY = int(os.environ.get("BRN_MAX_DIFFICULTY", "7"))
+INITIAL_DIFFICULTY = int(os.environ.get("BRN_MIN_DIFFICULTY", "5"))
+FORCE_DIFFICULTY = os.environ.get("BRN_FORCE_DIFFICULTY", "").strip()
 
-    def to_dict(self) -> dict:
+MAX_TX_PER_BLOCK = 500
+MIN_RELAY_FEE = 1000
+MAX_REORG_DEPTH = 100
+
+HASH_BATCH_SIZE = 5000
+AUTH_TAG_START_HEIGHT = 6000
+CHECKPOINT_INTERVAL = 1000
+
+# ============================================================
+# GÊNESE
+# ============================================================
+GENESIS_PREV = "0" * 64
+GENESIS_TIMESTAMP = 1700000000
+GENESIS_REWARD = INITIAL_REWARD
+GENESIS_ADDRESS = "brn1qxyzk7y0v2j4g0a8d9n5t2k7h4s6w8c9p2e"
+GENESIS_PUBKEY = ""
+
+# ============================================================
+# DOMÍNIOS DE ASSINATURA
+# ============================================================
+SIGNING_DOMAIN = b"BRN-TX-v1|"
+AUTH_TAG_DOMAIN = b"BRN-BLOCK-AUTH-v1|"
+_CORE_V = 1
+
+NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
+
+
+# ============================================================
+# CHECKPOINTS — estado do módulo
+# ============================================================
+_checkpoints: dict = {}
+_checkpoint_priv = None
+
+
+def set_checkpoints(d: dict) -> None:
+    global _checkpoints
+    _checkpoints = {str(k): v for k, v in (d or {}).items()}
+
+
+def set_checkpoint_priv(priv) -> None:
+    global _checkpoint_priv
+    _checkpoint_priv = priv
+
+
+def get_checkpoints() -> dict:
+    return dict(_checkpoints)
+
+
+def _verify_checkpoint_for_block(block) -> tuple:
+    cp = _checkpoints.get(str(block["height"]))
+    if not cp:
+        return True, ""
+
+    if cp.get("hash") != block["hash"]:
+        return False, (
+            f"checkpoint mismatch em #{block['height']} "
+            f"(esperado {str(cp.get('hash'))[:16]}..., "
+            f"recebido {block['hash'][:16]}...)"
+        )
+
+    try:
+        from checkpoints import verify_checkpoint
+        if not verify_checkpoint(cp):
+            return False, f"checkpoint invalido em #{block['height']}"
+    except ImportError:
+        pass
+    except Exception as e:
+        return False, f"checkpoint verify erro em #{block['height']}: {e}"
+
+    return True, ""
+
+
+def _maybe_sign_checkpoint(block) -> None:
+    if _checkpoint_priv is None:
+        return
+    try:
+        h = int(block["height"])
+    except Exception:
+        return
+    if h == 0 or h % CHECKPOINT_INTERVAL != 0:
+        return
+    try:
+        from checkpoints import sign_checkpoint, save_checkpoints
+        cp = sign_checkpoint(h, block["hash"], _checkpoint_priv)
+        if not cp:
+            return
+        _checkpoints[str(h)] = cp
+        save_checkpoints(_checkpoints)
+        print(f"[CHECKPOINT] #{h} assinado e salvo")
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[CHECKPOINT] falha ao assinar #{h}: {e}")
+
+
+# ============================================================
+# AUTH TAG
+# ============================================================
+def compute_auth_tag(height: int, block_hash_hex: str,
+                     secret: str = None) -> str:
+    sec = secret if secret is not None else NETWORK_SECRET
+    if not sec:
+        return ""
+    msg = AUTH_TAG_DOMAIN + f"{int(height)}:{block_hash_hex}".encode()
+    return hmac.new(sec.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def verify_auth_tag(height: int, block_hash_hex: str, tag: str,
+                    secret: str = None) -> bool:
+    expected = compute_auth_tag(height, block_hash_hex, secret)
+    if not expected or not tag:
+        return False
+    return hmac.compare_digest(expected, tag)
+
+
+# ============================================================
+# PoW / DIFICULDADE
+# ============================================================
+def block_hash(prev_hash, merkle, timestamp, nonce, difficulty) -> str:
+    header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
+    return double_sha256(header.encode()).hex()
+
+
+def target_from_difficulty(difficulty: int) -> int:
+    return int("0" * int(difficulty) + "f" * (64 - int(difficulty)), 16)
+
+
+def meets_difficulty(h_hex: str, difficulty: int) -> bool:
+    try:
+        return int(h_hex, 16) <= target_from_difficulty(difficulty)
+    except Exception:
+        return False
+
+
+def work_from_difficulty(difficulty) -> int:
+    return 16 ** int(difficulty)
+
+
+def compute_merkle_root(txids: list) -> str:
+    if not txids:
+        return "0" * 64
+    layer = [bytes.fromhex(t) for t in txids]
+    while len(layer) > 1:
+        if len(layer) % 2:
+            layer.append(layer[-1])
+        layer = [sha256(layer[i] + layer[i + 1])
+                 for i in range(0, len(layer), 2)]
+    return layer[0].hex()
+
+
+# ============================================================
+# SERIALIZAÇÃO DE TX
+# ============================================================
+def _tx_core(tx: dict) -> dict:
+    inputs = [
+        {"txid": i["txid"], "vout": i["vout"], "pubkey": i.get("pubkey", "")}
+        for i in tx["inputs"]
+    ]
+    outputs = [
+        {"address": o["address"], "amount": o["amount"],
+         "pubkey": o.get("pubkey", "")}
+        for o in tx["outputs"]
+    ]
+    core = {
+        "v": _CORE_V,
+        "inputs": inputs,
+        "outputs": outputs,
+        "timestamp": tx["timestamp"],
+        "locktime": tx.get("locktime", 0),
+        "nonce": tx.get("nonce", 0),
+    }
+    if "data" in tx and tx["data"] is not None:
+        core["data"] = tx["data"]
+    if "height" in tx:
+        core["height"] = tx["height"]
+    return core
+
+
+def _serialize_core(tx: dict) -> bytes:
+    return orjson.dumps(_tx_core(tx), option=orjson.OPT_SORT_KEYS)
+
+
+def txid(tx: dict) -> str:
+    return double_sha256(_serialize_core(tx)).hex()
+
+
+def signing_hash(tx: dict) -> bytes:
+    return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
+
+
+# ============================================================
+# HOT LOOP PoW
+# ============================================================
+def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
+                should_continue=None, progress_cb=None):
+    prefix = f"{prev_hash}{merkle}{ts}".encode()
+    diff_bytes = str(diff).encode()
+    target_int = int("0" * int(diff) + "f" * (64 - int(diff)), 16)
+    sha = hashlib.sha256
+
+    nonce = nonce_start
+    hashes_done = 0
+    while True:
+        for _ in range(HASH_BATCH_SIZE):
+            data = prefix + str(nonce).encode() + diff_bytes
+            h = sha(sha(data).digest()).digest()
+            if int.from_bytes(h, "big") <= target_int:
+                return nonce, h.hex(), hashes_done + 1
+            nonce += 1
+        hashes_done += HASH_BATCH_SIZE
+        time.sleep(0)
+        if should_continue is not None and not should_continue():
+            return None, None, hashes_done
+        if progress_cb is not None:
+            try:
+                progress_cb(nonce, hashes_done)
+            except Exception:
+                pass
+
+
+# ============================================================
+# COINBASE / GÊNESE
+# ============================================================
+def make_coinbase(address: str, pubkey_hex: str, height: int,
+                  reward: int) -> dict:
+    """Constrói um coinbase. pubkey_hex é obrigatória."""
+    if not pubkey_hex:
+        raise ValueError("make_coinbase: pubkey_hex é obrigatória")
+    cb = {
+        "txid": "",
+        "inputs": [{
+            "txid": "0" * 64,
+            "vout": 0xFFFFFFFF,
+            "pubkey": "",
+            "signature": "",
+        }],
+        "outputs": [{
+            "address": address,
+            "amount": int(reward),
+            "pubkey": pubkey_hex,
+        }],
+        "timestamp": int(time.time()),
+        "locktime": 0,
+        "height": int(height),
+        "nonce": 0,
+    }
+    cb["txid"] = txid(cb)
+    return cb
+
+
+def build_genesis() -> dict:
+    cb = {
+        "txid": "",
+        "inputs": [{
+            "txid": "0" * 64,
+            "vout": 0xFFFFFFFF,
+            "pubkey": "",
+            "signature": "",
+        }],
+        "outputs": [{
+            "address": GENESIS_ADDRESS,
+            "amount": GENESIS_REWARD,
+            "pubkey": GENESIS_PUBKEY,
+        }],
+        "timestamp": GENESIS_TIMESTAMP,
+        "locktime": 0,
+        "height": 0,
+        "nonce": 0,
+    }
+    cb["txid"] = txid(cb)
+    merkle = compute_merkle_root([cb["txid"]])
+    nonce = 0
+    while True:
+        h = block_hash(GENESIS_PREV, merkle, GENESIS_TIMESTAMP, nonce, 1)
+        if h.startswith("0"):
+            break
+        nonce += 1
+    g = {
+        "height": 0,
+        "hash": h,
+        "prev_hash": GENESIS_PREV,
+        "timestamp": GENESIS_TIMESTAMP,
+        "nonce": nonce,
+        "merkle": merkle,
+        "difficulty": 1,
+        "transactions": [cb],
+        "cumulative_work": work_from_difficulty(1),
+    }
+    tag = compute_auth_tag(0, h)
+    if tag:
+        g["auth_tag"] = tag
+    return g
+
+
+GENESIS_BLOCK = build_genesis()
+
+
+# ============================================================
+# BLOCKCHAIN
+# ============================================================
+class Blockchain:
+    def __init__(self, db_path="brn_v2_chain.db",
+                 genesis_address=None, genesis_pubkey=None,
+                 auto_genesis=True, network_secret=None,
+                 require_auth_tag=None):
+        self.db = ChainDB(db_path)
+        self.genesis_expected_hash = None
+        self.network_secret = (network_secret
+                               if network_secret is not None
+                               else NETWORK_SECRET)
+        if require_auth_tag is None:
+            self.require_auth_tag = bool(self.network_secret)
+        else:
+            self.require_auth_tag = bool(require_auth_tag)
+
+        self.on_block_mined = None
+
+        if not auto_genesis:
+            self.genesis_expected_hash = GENESIS_BLOCK["hash"]
+            return
+
+        if self.db.height() < 0:
+            g = GENESIS_BLOCK
+            if genesis_address:
+                g = self._genesis_with_address(
+                    genesis_address,
+                    genesis_pubkey if genesis_pubkey is not None
+                    else GENESIS_PUBKEY,
+                )
+            self.db.add_block(g)
+            self.db.apply_tx(g["transactions"][0], 0, coinbase=True)
+            self.db.set_meta("genesis_hash", g["hash"])
+
+    @staticmethod
+    def _genesis_with_address(address: str, pubkey_hex: str = "") -> dict:
+        cb = {
+            "txid": "",
+            "inputs": [{
+                "txid": "0" * 64, "vout": 0xFFFFFFFF,
+                "pubkey": "", "signature": "",
+            }],
+            "outputs": [{
+                "address": address, "amount": GENESIS_REWARD,
+                "pubkey": pubkey_hex,
+            }],
+            "timestamp": GENESIS_TIMESTAMP,
+            "locktime": 0, "height": 0, "nonce": 0,
+        }
+        cb["txid"] = txid(cb)
+        merkle = compute_merkle_root([cb["txid"]])
+        nonce = 0
+        while True:
+            h = block_hash(GENESIS_PREV, merkle,
+                           GENESIS_TIMESTAMP, nonce, 1)
+            if h.startswith("0"):
+                break
+            nonce += 1
+        g = {
+            "height": 0, "hash": h, "prev_hash": GENESIS_PREV,
+            "timestamp": GENESIS_TIMESTAMP, "nonce": nonce,
+            "merkle": merkle, "difficulty": 1, "transactions": [cb],
+            "cumulative_work": work_from_difficulty(1),
+        }
+        tag = compute_auth_tag(0, h)
+        if tag:
+            g["auth_tag"] = tag
+        return g
+
+    def set_network_secret(self, secret: str) -> None:
+        self.network_secret = (secret or "").strip()
+        if self.require_auth_tag is False:
+            self.require_auth_tag = bool(self.network_secret)
+
+    # ============================================================
+    # RECOMPENSA / DIFICULDADE / WORK
+    # ============================================================
+    def current_reward(self, height: int) -> int:
+        halvings = height // HALVING_INTERVAL
+        if halvings >= 64:
+            return 0
+        return INITIAL_REWARD >> halvings
+
+    def current_difficulty(self) -> int:
+        if FORCE_DIFFICULTY:
+            try:
+                v = int(FORCE_DIFFICULTY)
+                return max(1, min(20, v))
+            except ValueError:
+                print(f"[difficulty] BRN_FORCE_DIFFICULTY inválido: "
+                      f"{FORCE_DIFFICULTY!r}")
+
+        h = self.db.height()
+        if h < DIFFICULTY_INTERVAL:
+            return INITIAL_DIFFICULTY
+
+        start = self.db.get_block(h - DIFFICULTY_INTERVAL + 1)
+        end = self.db.get_block(h)
+        if not start or not end:
+            return INITIAL_DIFFICULTY
+
+        if end["difficulty"] > MAX_DIFFICULTY:
+            return MAX_DIFFICULTY
+
+        actual = max(1, end["timestamp"] - start["timestamp"])
+        expected = BLOCK_TIME * DIFFICULTY_INTERVAL
+        prev = end["difficulty"]
+        new = int(prev * expected / actual)
+        new = max(prev // 4, min(prev * 4, new))
+        new = max(1, min(MAX_DIFFICULTY, new))
+        return new
+
+    def cumulative_work(self) -> int:
+        total = 0
+        top = self.db.height()
+        for h in range(top + 1):
+            b = self.db.get_block(h)
+            if b:
+                total += work_from_difficulty(b["difficulty"])
+        return total
+
+    def cumulative_work_of_chain(self, blocks: list) -> int:
+        return sum(work_from_difficulty(b["difficulty"]) for b in blocks)
+
+    def get_latest_height(self) -> int:
+        return self.db.height()
+
+    def get_transaction_block_height(self, txid_str: str) -> int:
+        return self.db.get_tx_block_height(txid_str)
+
+    def count_confirmations(self, txid_str: str) -> int:
+        tx_height = self.get_transaction_block_height(txid_str)
+        if tx_height == -1:
+            return 0
+        return self.get_latest_height() - tx_height
+
+    # ============================================================
+    # FEE
+    # ============================================================
+    def estimate_fee(self, priority: str = "medium") -> int:
+        try:
+            stats = self.db.mempool_stats()
+        except Exception:
+            return MIN_RELAY_FEE
+        count = stats.get("count", 0)
+        fees = stats.get("fees", [])
+        if count == 0 or not fees:
+            return MIN_RELAY_FEE
+        fees_sorted = sorted(fees, reverse=True)
+        n = len(fees_sorted)
+        if priority == "high":
+            idx = max(0, n // 10)
+            return max(MIN_RELAY_FEE, fees_sorted[idx] * 2)
+        elif priority == "low":
+            idx = min(n - 1, (n * 9) // 10)
+            return max(MIN_RELAY_FEE, fees_sorted[idx])
+        else:
+            idx = n // 2
+            return max(MIN_RELAY_FEE, fees_sorted[idx])
+
+    def tx_fee(self, tx: dict) -> int:
+        in_sum = 0
+        for inp in tx["inputs"]:
+            u = self.db.get_utxo(inp["txid"], inp["vout"])
+            if u:
+                in_sum += u["amount"]
+        return in_sum - sum(o["amount"] for o in tx["outputs"])
+
+    # ============================================================
+    # CONTRATOS
+    # ============================================================
+    def _validate_contract_tx(self, tx: dict) -> tuple:
+        tx_data = tx.get("data") or {}
+        t = tx_data.get("type")
+        if t == "deploy":
+            code = tx_data.get("code")
+            if not isinstance(code, dict):
+                return False, "deploy sem 'code' (dict)"
+            try:
+                from contracts import ContractVM
+                return ContractVM.validate(code)
+            except ImportError:
+                return False, "modulo contracts.py nao encontrado"
+            except Exception as e:
+                return False, f"erro validando contrato: {e}"
+        if t == "call":
+            cid = tx_data.get("contract_id")
+            if not cid or not isinstance(cid, str):
+                return False, "call sem 'contract_id'"
+            if not cid.startswith("ctr1"):
+                return False, "contract_id deve começar com 'ctr1'"
+            if not self.db.contract_get(cid):
+                return False, f"contrato {cid[:16]}... nao existe"
+            return True, "ok"
+        return False, f"tipo de contrato desconhecido: {t}"
+
+    def _apply_contract_tx(self, tx: dict) -> dict:
+        tx_data = tx.get("data") or {}
+        t = tx_data.get("type")
+        from contracts import deploy as _deploy, call as _call
+        if t == "deploy":
+            owner = ""
+            if tx.get("outputs"):
+                owner = tx["outputs"][0].get("address", "") or ""
+            r = _deploy(self, owner, tx_data.get("code") or {},
+                        metadata=tx_data.get("metadata"))
+            if not r.get("ok"):
+                raise ValueError(f"deploy falhou: {r.get('msg')}")
+            return r
+        if t == "call":
+            caller = ""
+            if tx.get("outputs"):
+                caller = tx["outputs"][0].get("address", "") or ""
+            r = _call(self, tx_data.get("contract_id", ""),
+                      caller, tx_data.get("args"))
+            if not r.get("ok"):
+                raise ValueError(f"call falhou: {r.get('msg')}")
+            return r
+        raise ValueError(f"tipo de contrato desconhecido: {t}")
+
+    # ============================================================
+    # VALIDAÇÃO DE TX
+    # ============================================================
+    def validate_tx(self, tx: dict, from_mempool: bool = False) -> tuple:
+        from wallet import Wallet
+
+        if not tx.get("inputs") or not tx.get("outputs"):
+            return False, "tx sem inputs/outputs"
+
+        if tx["inputs"][0]["txid"] == "0" * 64:
+            return False, "coinbase invalida"
+
+        if tx.get("txid") != txid(tx):
+            return False, "txid invalido"
+
+        tx_data = tx.get("data") or {}
+        if isinstance(tx_data, dict) and tx_data.get("type") in ("deploy",
+                                                                 "call"):
+            ok_ctr, msg_ctr = self._validate_contract_tx(tx)
+            if not ok_ctr:
+                return False, f"contrato: {msg_ctr}"
+
+        for inp in tx["inputs"]:
+            if not inp.get("pubkey"):
+                return False, "input sem pubkey"
+
+        tx_nonce = tx.get("nonce", 0)
+        for inp in tx["inputs"]:
+            pk = inp["pubkey"]
+            expected = self.db.get_nonce_for_pubkey(pk)
+            if tx_nonce != expected:
+                return False, (
+                    f"nonce invalido para {pk[:16]}... "
+                    f"(esperado {expected}, recebido {tx_nonce})"
+                )
+
+        in_sum = 0
+        seen = set()
+        for inp in tx["inputs"]:
+            key = (inp["txid"], inp["vout"])
+            if key in seen:
+                return False, "input duplicado"
+            seen.add(key)
+
+            u = self.db.get_utxo(inp["txid"], inp["vout"])
+            if not u:
+                return False, "UTXO inexistente"
+
+            stored_pk = (u["pubkey"] or "").strip()
+            if stored_pk and set(stored_pk) != {"0"}:
+                if inp["pubkey"] != stored_pk:
+                    return False, (
+                        f"pubkey mismatch: input={inp['pubkey'][:16]}... "
+                        f"utxo={stored_pk[:16]}"
+                    )
+            else:
+                try:
+                    from bech32 import address_from_pubkey
+                    derived = address_from_pubkey(
+                        bytes.fromhex(inp["pubkey"]))
+                except Exception:
+                    return False, "input pubkey invalida"
+                if derived != u["address"]:
+                    return False, (
+                        f"address mismatch: deriva {derived[:16]}... "
+                        f"utxo {u['address'][:16]}..."
+                    )
+            in_sum += u["amount"]
+
+        out_sum = sum(o["amount"] for o in tx["outputs"])
+        if out_sum > in_sum:
+            return False, "outputs > inputs"
+        if in_sum - out_sum < MIN_RELAY_FEE:
+            return False, "fee abaixo do minimo"
+
+        sig_hash = signing_hash(tx)
+        for inp in tx["inputs"]:
+            if not Wallet.verify(sig_hash, inp.get("signature", ""),
+                                 inp["pubkey"]):
+                return False, "assinatura invalida"
+
+        return True, "ok"
+
+    def submit_tx(self, tx: dict) -> tuple:
+        if self.db.has_mempool(tx["txid"]):
+            return False, "ja na mempool"
+        ok, msg = self.validate_tx(tx)
+        if not ok:
+            return False, msg
+        fee = self.tx_fee(tx)
+        if fee < 0:
+            return False, "fee negativa"
+        if not self.db.add_mempool(tx, fee):
+            return False, "falha na mempool"
+        return True, tx["txid"]
+
+    # ============================================================
+    # VALIDAÇÃO DE BLOCO
+    # ============================================================
+    def validate_block(self, block: dict, prev_block=None) -> tuple:
+        if block["height"] == 0 and prev_block is None:
+            if (self.genesis_expected_hash
+                    and block["hash"] != self.genesis_expected_hash):
+                return False, (
+                    f"genesis nao corresponde ao esperado\n"
+                    f"  esperado: {self.genesis_expected_hash[:16]}...\n"
+                    f"  recebido: {block['hash'][:16]}..."
+                )
+
+        expected_prev = (prev_block["hash"] if prev_block
+                         else self.db.tip_hash())
+        if block["prev_hash"] != expected_prev:
+            return False, "prev_hash incorreto"
+
+        expected_height = ((prev_block["height"] + 1) if prev_block
+                           else self.db.height() + 1)
+        if block["height"] != expected_height:
+            return False, "altura invalida"
+
+        if not meets_difficulty(block["hash"], block["difficulty"]):
+            return False, "PoW invalido"
+
+        h = block_hash(block["prev_hash"], block["merkle"],
+                       block["timestamp"], block["nonce"],
+                       block["difficulty"])
+        if h != block["hash"]:
+            return False, "hash incorreto"
+
+        calc_merkle = compute_merkle_root(
+            [t["txid"] for t in block["transactions"]])
+        if calc_merkle != block["merkle"]:
+            return False, "merkle incorreto"
+
+        ok_cp, msg_cp = _verify_checkpoint_for_block(block)
+        if not ok_cp:
+            return False, msg_cp
+
+        if self.require_auth_tag:
+            if not self.network_secret:
+                return False, "no exige auth_tag mas sem BRN_NETWORK_SECRET"
+            if block["height"] > AUTH_TAG_START_HEIGHT:
+                tag = block.get("auth_tag")
+                if not tag:
+                    return False, "bloco sem auth_tag"
+                if not verify_auth_tag(block["height"], block["hash"], tag,
+                                       self.network_secret):
+                    return False, "auth_tag invalido (segredo errado?)"
+            else:
+                tag = block.get("auth_tag")
+                if tag:
+                    if not verify_auth_tag(block["height"], block["hash"],
+                                           tag, self.network_secret):
+                        return False, "auth_tag invalido em bloco legado"
+
+        cb = block["transactions"][0]
+        if cb["inputs"][0]["txid"] != "0" * 64:
+            return False, "primeira tx nao e coinbase"
+        if cb.get("txid") != txid(cb):
+            return False, "coinbase txid invalido"
+
+        if block["height"] > 0:
+            for out in cb["outputs"]:
+                if not out.get("pubkey"):
+                    return False, "coinbase output sem pubkey"
+
+        for inp in cb["inputs"]:
+            if inp.get("signature"):
+                return False, "coinbase input com assinatura"
+
+        reward = self.current_reward(block["height"])
+        fees = 0
+        for i, t in enumerate(block["transactions"][1:], 1):
+            if t["txid"] != txid(t):
+                return False, "txid invalido"
+            ok_tx, msg_tx = self.validate_tx(t)
+            if not ok_tx:
+                return False, f"tx #{i}: {msg_tx}"
+            fees += self.tx_fee(t)
+
+        total_cb = sum(o["amount"] for o in cb["outputs"])
+        if total_cb > reward + fees:
+            return False, "coinbase acima do permitido"
+
+        return True, "ok"
+
+    # ============================================================
+    # ACEITAÇÃO DE BLOCO
+    # ============================================================
+    def accept_block(self, block: dict) -> tuple:
+        prev = self.db.get_block_by_hash(block["prev_hash"])
+        ok, msg = self.validate_block(block, prev)
+        if not ok:
+            return False, msg
+
+        self.db.add_block(block)
+        _maybe_sign_checkpoint(block)
+
+        for i, t in enumerate(block["transactions"]):
+            coinbase = (i == 0)
+            self.db.apply_tx(t, block["height"], coinbase=coinbase)
+            if i > 0:
+                self.db.remove_mempool(t["txid"])
+            if not coinbase:
+                tx_data = t.get("data") or {}
+                if (isinstance(tx_data, dict)
+                        and tx_data.get("type") in ("deploy", "call")):
+                    try:
+                        self._apply_contract_tx(t)
+                    except Exception as e:
+                        print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
+
+        return True, block["hash"]
+
+    # ============================================================
+    # MINERAÇÃO
+    # ============================================================
+    def _attach_auth_tag(self, block: dict) -> dict:
+        tag = compute_auth_tag(block["height"], block["hash"],
+                               self.network_secret)
+        if tag:
+            block["auth_tag"] = tag
+        return block
+
+    def _fire_block_mined(self, block: dict) -> None:
+        cb = self.on_block_mined
+        if cb is None:
+            return
+        try:
+            cb(block)
+        except Exception as e:
+            print(f"[on_block_mined] callback falhou: {e}")
+
+    def mine_block(self, miner_address: str, miner_pubkey: str) -> dict:
+        if not miner_pubkey:
+            raise ValueError("mine_block: miner_pubkey é obrigatória")
+        return self.mine_block_interruptible(miner_address, miner_pubkey, None)
+
+    def mine_block_interruptible(self, miner_address: str,
+                                 miner_pubkey: str,
+                                 should_continue=None,
+                                 progress_cb=None) -> dict:
+        if not miner_pubkey:
+            raise ValueError(
+                "mine_block_interruptible: miner_pubkey é obrigatória")
+
+        height = self.db.height() + 1
+        reward = self.current_reward(height)
+        diff = self.current_difficulty()
+
+        cb = make_coinbase(miner_address, miner_pubkey, height, reward)
+        selected = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
+        txs = [cb] + selected
+
+        merkle = compute_merkle_root([t["txid"] for t in txs])
+        prev_hash = self.db.tip_hash()
+        ts = int(time.time())
+
+        nonce, h_hex, _ = _pow_search(
+            prev_hash, merkle, ts, diff,
+            should_continue=should_continue,
+            progress_cb=progress_cb,
+        )
+        if nonce is None:
+            return None
+
+        block = {
+            "height": height,
+            "hash": h_hex,
+            "prev_hash": prev_hash,
+            "timestamp": ts,
+            "nonce": nonce,
+            "merkle": merkle,
+            "difficulty": diff,
+            "transactions": txs,
+        }
+        self._attach_auth_tag(block)
+
+        ok, _msg = self.accept_block(block)
+        if ok:
+            self._fire_block_mined(block)
+            return block
+        return None
+
+    # ============================================================
+    # SNAPSHOT
+    # ============================================================
+    def state_snapshot(self) -> dict:
         return {
-            "ok":                   self.ok,
-            "reason":               self.reason,
-            "fork_point":           self.fork_point,
-            "blocks_removed":       self.blocks_removed,
-            "blocks_added":         self.blocks_added,
-            "work_local":           self.work_local,
-            "work_remote":          self.work_remote,
-            "duration_s":           round(self.duration_s, 3),
-            "checkpoint_violated":  self.checkpoint_violated,
-            "error":                self.error,
+            "height": self.get_latest_height(),
+            "tip_hash": self.db.tip_hash(),
+            "difficulty": self.current_difficulty(),
+            "cumulative_work": self.cumulative_work(),
+            "mempool": self.db.mempool_count(),
+            "checkpoints": len(_checkpoints),
         }
 
 
 # ============================================================
-# HELPERS INTERNOS — work
+# PLUGIN DO REORG (reorg.py)
+# ------------------------------------------------------------
+# Plugado depois da classe para manter o reorg.py como módulo
+# independente. Substitui qualquer reorg_to() embutido.
 # ============================================================
-def _work_fn():
-    """Importa work_from_difficulty do blockchain (ou fallback)."""
-    try:
-        from blockchain import work_from_difficulty
-        return work_from_difficulty
-    except ImportError:
-        def _fallback(d):
-            return 16 ** int(d)
-        return _fallback
+try:
+    from reorg import reorg_to as _reorg_to, find_fork_point as _find_fork
 
+    def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH,
+                         allow_genesis_reorg=False):
+        res = _reorg_to(self, new_blocks, max_depth, allow_genesis_reorg)
+        return res.to_tuple()
 
-def _cumulative_work_of_chain(blocks: list) -> int:
-    """Soma do work de todos os blocos de uma lista."""
-    if not blocks:
-        return 0
-    work_fn = _work_fn()
-    total = 0
-    for b in blocks:
-        try:
-            total += work_fn(int(b.get("difficulty", 0)))
-        except Exception:
-            continue
-    return total
+    def _find_fork_method(self, remote_blocks, max_depth=1000):
+        return _find_fork(self, remote_blocks, max_depth)
 
-
-def _local_work_above(chain, fork_height: int) -> int:
-    """Work acumulado dos blocos locais acima do fork."""
-    if fork_height < 0:
-        return 0
-    work_fn = _work_fn()
-    total = 0
-    top = chain.db.height()
-    for h in range(fork_height + 1, top + 1):
-        b = chain.db.get_block(h)
-        if b:
-            try:
-                total += work_fn(int(b.get("difficulty", 0)))
-            except Exception:
-                continue
-    return total
+    Blockchain.reorg_to = _reorg_to_method
+    Blockchain.find_fork_point = _find_fork_method
+    print("reorg.py plugado em Blockchain")
+except ImportError:
+    print("reorg.py nao encontrado (reorg desabilitado)")
 
 
 # ============================================================
-# HELPERS INTERNOS — validação de checkpoint
+# PLUGIN DO CHAIN_VALIDATOR
 # ============================================================
-def _check_checkpoints(chain, alt_blocks: list, fork_height: int) -> tuple:
-    """
-    Verifica se a cadeia alternativa viola algum checkpoint conhecido.
+try:
+    from chain_validator import verify_chain as _verify_ext
 
-    Retorna (ok: bool, violated_height: int, msg: str).
-    """
-    try:
-        from checkpoints import load_checkpoints
-        cps = load_checkpoints()
-    except ImportError:
-        return True, -1, ""
+    def _verify_chain_method(self, full=True):
+        return _verify_ext(self)
 
-    if not cps:
-        return True, -1, ""
-
-    # Indexa alt_blocks por altura para lookup O(1)
-    alt_by_h = {}
-    for b in alt_blocks:
-        try:
-            alt_by_h[int(b["height"])] = b
-        except (KeyError, ValueError, TypeError):
-            continue
-
-    for h_str, cp in cps.items():
-        try:
-            h_int = int(h_str)
-        except (ValueError, TypeError):
-            continue
-
-        # checkpoints abaixo do fork não são afetados
-        if h_int <= fork_height:
-            continue
-
-        # Verifica se o checkpoint está na cadeia alternativa
-        alt_block = alt_by_h.get(h_int)
-        if alt_block is None:
-            # O bloco do checkpoint não está na alternativa — viola
-            return False, h_int, f"checkpoint #{h_int} nao esta na nova cadeia"
-
-        if alt_block.get("hash") != cp.get("hash"):
-            return False, h_int, (
-                f"checkpoint #{h_int} hash diverge "
-                f"(esperado {str(cp.get('hash'))[:16]}..., "
-                f"alt {str(alt_block.get('hash'))[:16]}...)"
-            )
-
-        # Também valida a assinatura do checkpoint
-        try:
-            from checkpoints import verify_checkpoint
-            if not verify_checkpoint(cp):
-                return False, h_int, f"checkpoint #{h_int} assinatura invalida"
-        except ImportError:
-            pass
-        except Exception as e:
-            return False, h_int, f"checkpoint #{h_int} verify falhou: {e}"
-
-    return True, -1, ""
-
-
-# ============================================================
-# find_fork_point
-# ============================================================
-def find_fork_point(chain, remote_blocks: list,
-                    max_depth: int = 1000) -> int:
-    """
-    Encontra a altura do último bloco em comum entre a cadeia local
-    e a lista `remote_blocks`.
-
-    Retorna:
-        >= 0 → altura do bloco comum
-        -1   → nenhum bloco em comum (nem genesis bate)
-    """
-    if not remote_blocks:
-        return -1
-
-    local_h = chain.db.height()
-    if local_h < 0:
-        return -1
-
-    # Indexa remote por altura
-    remote_by_h = {}
-    for b in remote_blocks:
-        try:
-            remote_by_h[int(b["height"])] = b
-        except (KeyError, ValueError, TypeError):
-            continue
-
-    # Procura de trás para frente
-    stop = max(-1, local_h - max_depth)
-    for h in range(local_h, stop, -1):
-        local_blk = chain.db.get_block(h)
-        if not local_blk:
-            continue
-        remote_blk = remote_by_h.get(h)
-        if remote_blk and remote_blk.get("hash") == local_blk.get("hash"):
-            return h
-    return -1
-
-
-# ============================================================
-# compare_work
-# ============================================================
-def compare_work(chain, remote_blocks: list,
-                 fork_height: int) -> tuple:
-    """
-    Compara cumulative_work local vs remoto acima do fork.
-
-    Retorna (work_local: int, work_remote: int, should_reorg: bool).
-    """
-    work_local = _local_work_above(chain, fork_height)
-    alt_above = [b for b in remote_blocks
-                 if int(b.get("height", -1)) > fork_height]
-    work_remote = _cumulative_work_of_chain(alt_above)
-
-    should_reorg = work_remote >= (work_local + DEFAULT_MIN_WORK_ADVANTAGE)
-    return work_local, work_remote, should_reorg
-
-
-# ============================================================
-# can_reorg (dry-run)
-# ============================================================
-def can_reorg(chain, remote_blocks: list,
-              max_depth: int = DEFAULT_MAX_REORG_DEPTH) -> tuple:
-    """
-    Verifica se um reorg é possível SEM aplicar nada.
-
-    Retorna (True, ReorgResult vazio) se pode;
-    (False, ReorgResult com reason) se não pode.
-    """
-    res = ReorgResult()
-
-    if not remote_blocks:
-        res.reason = "lista de blocos vazia"
-        return False, res
-
-    # 1. Fork point
-    fork = find_fork_point(chain, remote_blocks)
-    res.fork_point = fork
-    if fork < 0:
-        res.reason = "nenhum ponto em comum com a cadeia remota"
-        return False, res
-
-    # 2. Blocos a adicionar
-    to_add = [b for b in remote_blocks
-              if int(b.get("height", -1)) > fork]
-    if not to_add:
-        res.reason = "nada novo acima do fork"
-        return False, res
-
-    # 3. Profundidade
-    depth = chain.db.height() - fork
-    if depth > max_depth:
-        res.reason = f"reorg muito profundo ({depth} > {max_depth})"
-        return False, res
-
-    # 4. Checkpoints
-    ok_cp, violated, msg_cp = _check_checkpoints(chain, remote_blocks, fork)
-    if not ok_cp:
-        res.reason = msg_cp
-        res.checkpoint_violated = violated
-        return False, res
-
-    # 5. Work
-    work_local, work_remote, should = compare_work(
-        chain, remote_blocks, fork)
-    res.work_local = work_local
-    res.work_remote = work_remote
-    if not should:
-        res.reason = (f"cadeia local tem mais/igual trabalho "
-                      f"({work_local} vs {work_remote})")
-        return False, res
-
-    # 6. Pré-validação de cada bloco da alternativa
-    prev = chain.db.get_block(fork) if fork >= 0 else None
-    for b in to_add:
-        try:
-            ok, msg = chain.validate_block(b, prev)
-        except Exception as e:
-            res.reason = f"erro validando #{b.get('height')}: {e}"
-            return False, res
-        if not ok:
-            res.reason = f"bloco #{b.get('height')} invalido: {msg}"
-            return False, res
-        prev = b
-
-    res.reason = "ok"
-    return True, res
-
-
-# ============================================================
-# REORG — função principal
-# ============================================================
-def reorg_to(chain, new_blocks: list,
-             max_depth: int = DEFAULT_MAX_REORG_DEPTH) -> ReorgResult:
-    """
-    Executa o reorg da cadeia local para a cadeia alternativa.
-
-    Passos:
-      1. can_reorg() — dry-run completo
-      2. Backup dos blocos locais acima do fork
-      3. delete_blocks_above(fork)
-      4. accept_block() para cada bloco da alternativa
-      5. Em caso de falha: rollback (reaplica os backups)
-      6. Atualiza métricas e retorna ReorgResult
-
-    Retorna ReorgResult com todos os detalhes.
-    """
-    t0 = time.time()
-    res = ReorgResult()
-
-    log.info("[REORG] iniciando — %d bloco(s) recebidos", len(new_blocks))
-
-    # ---------- 1. Dry-run ----------
-    ok, dry = can_reorg(chain, new_blocks, max_depth)
-    if not ok:
-        log.info("[REORG] recusado: %s", dry.reason)
-        dry.duration_s = time.time() - t0
-        return dry
-
-    fork = dry.fork_point
-    res.fork_point = fork
-    res.work_local = dry.work_local
-    res.work_remote = dry.work_remote
-
-    to_add = [b for b in new_blocks if int(b.get("height", -1)) > fork]
-
-    # ---------- 2. Backup ----------
-    backups = []
-    top = chain.db.height()
-    for h in range(fork + 1, top + 1):
-        b = chain.db.get_block(h)
-        if b:
-            backups.append(b)
-    res.blocks_removed = len(backups)
-
-    log.info("[REORG] fork em #%d — removendo %d, adicionando %d",
-             fork, len(backups), len(to_add))
-
-    # ---------- 3. Deletar ----------
-    try:
-        chain.db.delete_blocks_above(fork)
-    except Exception as e:
-        res.reason = f"falha ao deletar blocos: {e}"
-        res.error = str(e)
-        res.duration_s = time.time() - t0
-        log.error("[REORG] %s", res.reason)
-        return res
-
-    # ---------- 4. Aplicar alternativa ----------
-    applied = 0
-    for b in to_add:
-        try:
-            ok_blk, msg_blk = chain.accept_block(b)
-        except Exception as e:
-            ok_blk, msg_blk = False, f"excecao: {e}"
-
-        if not ok_blk:
-            # ---------- 5. Rollback ----------
-            log.error("[REORG] falha em #%d: %s — restaurando",
-                      b.get("height"), msg_blk)
-            _rollback(chain, fork, backups)
-            res.reason = f"falha ao aplicar #{b.get('height')}: {msg_blk}"
-            res.error = msg_blk
-            res.blocks_added = applied
-            res.duration_s = time.time() - t0
-            return res
-
-        applied += 1
-
-    # ---------- 6. Sucesso ----------
-    res.ok = True
-    res.blocks_added = applied
-    res.reason = "ok"
-    res.duration_s = time.time() - t0
-
-    log.warning("[REORG] concluido! fork=#%d -%d +%d "
-                "(work: %d → %d) em %.2fs",
-                fork, res.blocks_removed, res.blocks_added,
-                res.work_local, res.work_remote, res.duration_s)
-
-    return res
-
-
-# ============================================================
-# Rollback interno
-# ============================================================
-def _rollback(chain, fork: int, backups: list) -> None:
-    """Restaura a cadeia ao estado anterior ao reorg."""
-    try:
-        chain.db.delete_blocks_above(fork)
-    except Exception as e:
-        log.error("[REORG] rollback: falha ao limpar: %s", e)
-
-    for b in backups:
-        try:
-            chain.accept_block(b)
-        except Exception as e:
-            log.error("[REORG] rollback: falha reaplicando #%d: %s",
-                      b.get("height"), e)
-
-    log.info("[REORG] rollback concluido — altura restaurada: %d",
-             chain.db.height())
-
-
-# ============================================================
-# apply_reorg_if_needed — wrapper de alto nível
-# ============================================================
-def apply_reorg_if_needed(chain, remote_blocks: list,
-                          max_depth: int = DEFAULT_MAX_REORG_DEPTH) -> ReorgResult:
-    """
-    Só executa reorg se valer a pena (mais work). Caso contrário,
-    retorna ReorgResult com ok=False e reason explicando.
-
-    Use este em produção. Chame reorg_to() só quando quiser forçar.
-    """
-    ok, dry = can_reorg(chain, remote_blocks, max_depth)
-    if not ok:
-        dry.duration_s = 0.0
-        return dry
-    return reorg_to(chain, remote_blocks, max_depth)
+    Blockchain.verify_chain = _verify_chain_method
+    Blockchain.verify_chain_dict = lambda self: _verify_ext(self).to_dict()
+    print("chain_validator.py plugado em Blockchain")
+except ImportError:
+    print("chain_validator.py nao encontrado")
 
 
 # ============================================================
@@ -473,173 +907,70 @@ def apply_reorg_if_needed(chain, remote_blocks: list,
 if __name__ == "__main__":
     import tempfile
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    print("=" * 60)
+    print(" blockchain.py — Auto-teste")
+    print("=" * 60)
 
-    print("Testando reorg.py (com blockchain mock)...")
+    os.environ.setdefault("BRN_NETWORK_SECRET",
+                          "segredo-de-teste-blockchain-1234567")
 
-    # ------------------------------------------------------------
-    # Mock mínimo de ChainDB e Blockchain
-    # ------------------------------------------------------------
-    class MockDB:
-        def __init__(self):
-            self._blocks = {}
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "test.db")
 
-        def height(self):
-            if not self._blocks:
-                return -1
-            return max(self._blocks.keys())
+        print("\n[1] Instanciação + genesis:")
+        bc = Blockchain(path, auto_genesis=True)
+        print(f"    altura: {bc.db.height()}")
+        assert bc.db.height() == 0
+        print("    [ok]")
 
-        def get_block(self, h):
-            return self._blocks.get(h)
+        print("\n[2] current_reward (halving):")
+        for h in (0, 210_000, 420_000):
+            print(f"    #{h:<8} → {bc.current_reward(h)/UNIT:.4f} BRN")
+        assert bc.current_reward(0) == INITIAL_REWARD
+        assert bc.current_reward(210_000) == INITIAL_REWARD // 2
+        print("    [ok]")
 
-        def add_block(self, b):
-            self._blocks[b["height"]] = dict(b)
+        print(f"\n[3] current_difficulty: {bc.current_difficulty()}")
+        print(f"[4] cumulative_work: {bc.cumulative_work():,}")
 
-        def delete_blocks_above(self, h):
-            for k in [k for k in self._blocks.keys() if k > h]:
-                del self._blocks[k]
+        print("\n[5] Mineração de 3 blocos:")
+        addr = GENESIS_ADDRESS
+        pub = "02" + "aa" * 32
+        for i in range(3):
+            blk = bc.mine_block(addr, pub)
+            assert blk is not None
+            print(f"    #{blk['height']} diff={blk['difficulty']} "
+                  f"hash={blk['hash'][:16]}...")
+        assert bc.db.height() == 3
+        print("    [ok]")
 
-    class MockChain:
-        def __init__(self):
-            self.db = MockDB()
+        print(f"\n[6] Saldo: {bc.db.balance(addr)/UNIT:.4f} BRN")
+        print("\n[7] state_snapshot:")
+        for k, v in bc.state_snapshot().items():
+            print(f"    {k}: {v}")
 
-        def validate_block(self, b, prev):
-            if prev is None and b["height"] != 0:
-                return False, "sem prev"
-            if prev and b.get("prev_hash") != prev.get("hash"):
-                return False, "prev_hash"
-            return True, "ok"
+        print("\n[8] reorg_to (plugin):")
+        if hasattr(bc, "reorg_to"):
+            ok, msg = bc.reorg_to([])
+            print(f"    reorg vazio: ok={ok} msg={msg}")
+            assert not ok
+            print("    [ok]")
+        else:
+            print("    [skip] reorg.py nao plugado")
 
-        def accept_block(self, b):
-            # rejeita se altura não for sequencial
-            expected = self.db.height() + 1
-            if b["height"] != expected:
-                return False, f"altura {b['height']} != {expected}"
-            self.db.add_block(b)
-            return True, "ok"
+        print("\n[9] verify_chain (plugin):")
+        if hasattr(bc, "verify_chain"):
+            try:
+                r = bc.verify_chain()
+                valid = getattr(r, "valid", bool(r))
+                print(f"    verify_chain: valid={valid}")
+            except Exception as e:
+                print(f"    verify_chain erro: {e}")
+        else:
+            print("    [skip] chain_validator nao plugado")
 
-    # ------------------------------------------------------------
-    # Helper para criar blocos
-    # ------------------------------------------------------------
-    def mk_block(h, prev_hash, diff=4, seed=""):
-        import hashlib
-        raw = f"{h}:{prev_hash}:{diff}:{seed}".encode()
-        h_hash = hashlib.sha256(raw).hexdigest()
-        return {
-            "height": h,
-            "hash": h_hash,
-            "prev_hash": prev_hash,
-            "merkle": "0" * 64,
-            "timestamp": 1700000000 + h,
-            "nonce": 0,
-            "difficulty": diff,
-            "transactions": [],
-        }
+        bc.db.close()
 
-    # ------------------------------------------------------------
-    # 1. Setup — cadeia local com 10 blocos
-    # ------------------------------------------------------------
-    chain = MockChain()
-
-    # Cadeia local (canônica até altura 10)
-    prev = "0" * 64
-    for h in range(0, 11):
-        b = mk_block(h, prev, diff=4, seed=f"local-{h}")
-        chain.db.add_block(b)
-        prev = b["hash"]
-
-    print(f"  altura local: {chain.db.height()}")
-    assert chain.db.height() == 10
-
-    # ------------------------------------------------------------
-    # 2. Fork em #5, alternativa com 15 blocos (mais longa)
-    # ------------------------------------------------------------
-    fork_h = 5
-    fork_hash = chain.db.get_block(fork_h)["hash"]
-
-    alt = []
-    prev_alt = fork_hash
-    for h in range(fork_h + 1, 16):
-        b = mk_block(h, prev_alt, diff=4, seed=f"alt-{h}")
-        alt.append(b)
-        prev_alt = b["hash"]
-
-    # ------------------------------------------------------------
-    # 3. find_fork_point
-    # ------------------------------------------------------------
-    fp = find_fork_point(chain, alt)
-    print(f"  find_fork_point: #{fp}")
-    assert fp == fork_h, f"esperado {fork_h}, obteve {fp}"
-
-    # ------------------------------------------------------------
-    # 4. compare_work
-    # ------------------------------------------------------------
-    wl, wr, should = compare_work(chain, alt, fp)
-    print(f"  work local={wl}  remote={wr}  should_reorg={should}")
-    assert should is True
-
-    # ------------------------------------------------------------
-    # 5. can_reorg (dry-run)
-    # ------------------------------------------------------------
-    ok, dry = can_reorg(chain, alt)
-    print(f"  can_reorg: {ok} — {dry.reason}")
-    assert ok
-    assert dry.fork_point == fork_h
-
-    # ------------------------------------------------------------
-    # 6. reorg_to (aplica)
-    # ------------------------------------------------------------
-    res = reorg_to(chain, alt)
-    print(f"  reorg_to: ok={res.ok} fork=#{res.fork_point} "
-          f"-{res.blocks_removed} +{res.blocks_added} "
-          f"({res.duration_s:.3f}s)")
-    assert res.ok, f"reorg falhou: {res.reason}"
-    assert res.fork_point == 5
-    assert res.blocks_removed == 5   # #6..#10
-    assert res.blocks_added == 10    # #6..#15
-
-    # Confere que a nova tip é a da alternativa
-    new_tip = chain.db.get_block(chain.db.height())
-    print(f"  nova tip: #{new_tip['height']} hash={new_tip['hash'][:16]}...")
-    assert new_tip["height"] == 15
-    assert new_tip["hash"] == alt[-1]["hash"]
-
-    # ------------------------------------------------------------
-    # 7. Reorg com menos work (deve ser recusado)
-    # ------------------------------------------------------------
-    alt_fraca = [
-        mk_block(11, chain.db.get_block(10)["hash"], diff=2, seed="fraca-11"),
-        mk_block(12, chain.db.get_block(11)["hash"] if False else "x",
-                 diff=2, seed="fraca-12"),
-    ]
-    # reencadeia
-    alt_fraca[1]["prev_hash"] = alt_fraca[0]["hash"]
-
-    ok2, dry2 = can_reorg(chain, alt_fraca)
-    print(f"  reorg fraca: ok={ok2} — {dry2.reason}")
-    assert not ok2
-
-    # ------------------------------------------------------------
-    # 8. Reorg vazio
-    # ------------------------------------------------------------
-    ok3, dry3 = can_reorg(chain, [])
-    assert not ok3
-    print(f"  reorg vazio: ok={ok3} — {dry3.reason}")
-
-    # ------------------------------------------------------------
-    # 9. Reorg com profundidade excessiva
-    # ------------------------------------------------------------
-    ok4, dry4 = can_reorg(chain, alt, max_depth=1)
-    assert not ok4
-    print(f"  reorg fundo: ok={ok4} — {dry4.reason}")
-
-    # ------------------------------------------------------------
-    # 10. apply_reorg_if_needed — wrapper
-    # ------------------------------------------------------------
-    # (aplica com sucesso)
-    r2 = apply_reorg_if_needed(chain, alt)
-    print(f"  apply_reorg_if_needed (mesma cadeia): ok={r2.ok}")
-
-    print("reorg.py OK.")
+    print("\n" + "=" * 60)
+    print(" blockchain.py OK.")
+    print("=" * 60)
