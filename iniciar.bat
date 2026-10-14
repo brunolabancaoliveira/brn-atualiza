@@ -1,18 +1,16 @@
 @echo off
 REM ============================================================
-REM   iniciar.bat - BRN Node CLIENTE (Windows) - v4
+REM   iniciar.bat - BRN Node CLIENTE (Windows) - v5
 REM ============================================================
+REM   v5:
+REM     [FIX] Remove sintaxe bash que quebrava o resumo
+REM     [FIX] Lista de arquivos obrigatorios completa
+REM     [NEW] Auto-detecta IP Tailscale do peer
+REM     [NEW] Cria pasta contracts/ se faltar
+REM     [NEW] Verifica escrow_btc_brn/factory/vm
 REM   v4:
 REM     [NEW] Verifica Tailscale antes de subir
 REM     [NEW] Faz tailscale ping no peer do brn_network.env
-REM     [NEW] Mostra versao do Waitress
-REM     [NEW] Info sobre Modo 2 (mineracao aberta)
-REM     [CHANGE] Nao forca --no-tailscale
-REM   v3:
-REM     [NEW] Cria brn_network.env automaticamente se faltar
-REM   v2:
-REM     [FIX] Carrega brn_network.env ANTES do tailscale
-REM     [FIX] Checa todos os modulos obrigatorios
 REM ============================================================
 
 setlocal EnableDelayedExpansion
@@ -47,7 +45,7 @@ exit /b 0
 :args_done
 
 echo ============================================================
-echo   BRN Node - CLIENTE (sincroniza da Maquina A) - v4
+echo   BRN Node - CLIENTE (sincroniza da Maquina A) - v5
 echo ============================================================
 echo.
 
@@ -65,8 +63,8 @@ if "%PY%"=="" (
 
 if "%PY%"=="" (
     echo [X] Python 3 nao encontrado
-    echo     Rode primeiro: instalar.bat
-    echo     Ou instale manualmente: https://www.python.org/downloads/
+    echo     Instale: https://www.python.org/downloads/
+    echo     Marque "Add Python to PATH" na instalacao.
     pause
     exit /b 1
 )
@@ -87,7 +85,7 @@ if not exist "brn_network.env" (
         echo BRN_WEB_PASS=senha-temp-123
         echo BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
         echo BRN_ADMIN_TOKEN=
-        echo BRN_BOOTSTRAP_PEERS=100.111.253.8:6001
+        echo BRN_BOOTSTRAP_PEERS=
         echo BRN_IS_ORIGIN=0
         echo BRN_ALL_MINERS=0
         echo BRN_MIN_DIFFICULTY=6
@@ -124,7 +122,7 @@ echo [ok] brn_network.env carregado
 echo.
 
 REM ============================================================
-REM  2) DEFAULTS (se .env nao definiu)
+REM  2) DEFAULTS
 REM ============================================================
 if "%BRN_NODE_PASSWORD%"==""       set "BRN_NODE_PASSWORD=senha-no-temp-123"
 if "%BRN_WEB_PASS%"==""            set "BRN_WEB_PASS=senha-temp-123"
@@ -141,19 +139,24 @@ REM ============================================================
 set "FALTA="
 for %%F in (
     main.py server.py explorer.py
-    blockchain.py db.py crypto.py wallet.py
+    blockchain.py db.py crypto.py wallet.py bech32.py
     chain_validator.py checkpoints.py
     brn_config.py brn_logger.py version.py
     security.py secure_store.py
     p2p_unified.py p2p_auth.py p2p_secure.py p2p_cipher.py p2p_relay.py
-    discovery_v2.py rendezvous_discovery.py network_guard.py
-    miner_loop.py update_peers.py bech32.py sync_manager.py
+    discovery_v2.py rendezvous_discovery.py rendezvous_mongo.py
+    miner_loop.py sync_manager.py
+    l2_manager.py btc_watcher.py btc_config.py
+    contracts\__init__.py contracts\vm.py contracts\escrow_btc_brn.py contracts\factory.py
 ) do (
     if not exist "%%F" set "FALTA=!FALTA! %%F"
 )
 
 if not "%FALTA%"=="" (
     echo [X] Arquivos faltando:%FALTA%
+    echo.
+    echo     Verifique se todos os arquivos foram salvos na pasta:
+    echo     %~dp0
     pause
     exit /b 1
 )
@@ -161,14 +164,8 @@ echo [ok] Arquivos essenciais OK
 echo.
 
 REM ============================================================
-REM  4) TAILSCALE (obrigatorio)
+REM  4) TAILSCALE
 REM ============================================================
-set "TS_BOOTSTRAP=%BRN_BOOTSTRAP_PEERS%"
-set "TS_PEER=%TS_BOOTSTRAP%"
-for /f "tokens=1 delims=," %%P in ("%TS_BOOTSTRAP%") do set "TS_PEER=%%P"
-set "TS_PEER_IP=%TS_PEER%"
-for /f "tokens=1 delims=:" %%I in ("%TS_PEER%") do set "TS_PEER_IP=%%I"
-
 if "%SKIP_TAILSCALE%"=="1" (
     echo [*] Tailscale: pulado ^(--skip-tailscale^)
     goto tailscale_done
@@ -177,8 +174,7 @@ if "%SKIP_TAILSCALE%"=="1" (
 where tailscale >nul 2>&1
 if errorlevel 1 (
     echo [!] Tailscale NAO instalado.
-    echo     Rode: instalar.bat
-    echo     Ou baixe: https://tailscale.com/download/windows
+    echo     Baixe: https://tailscale.com/download/windows
     pause
     exit /b 1
 )
@@ -189,8 +185,6 @@ if errorlevel 1 (
     echo [!] Tailscale NAO esta logado.
     echo     Clique com botao direito no icone do Tailscale
     echo     perto do relogio e escolha "Log in".
-    echo.
-    echo     Depois rode este script novamente.
     pause
     exit /b 1
 )
@@ -207,24 +201,49 @@ if "%MY_TS_IP%"=="" (
 )
 echo [ok] Meu IP Tailscale: %MY_TS_IP%
 
-echo [*] Testando peer %TS_PEER_IP%...
-tailscale ping -c 1 "%TS_PEER_IP%" >nul 2>&1
-if errorlevel 1 (
-    echo [!] Peer %TS_PEER_IP% NAO respondeu ao ping.
-    echo     Verifique:
-    echo       - A outra maquina esta ligada?
-    echo       - Tailscale dela esta logado?
-    echo       - IP %TS_PEER_IP% esta correto no brn_network.env?
+REM ---- Auto-detectar IP do peer no Tailscale ----
+set "TS_PEER_IP="
+if not "%BRN_BOOTSTRAP_PEERS%"=="" (
+    for /f "tokens=1 delims=,:" %%I in ("%BRN_BOOTSTRAP_PEERS%") do set "TS_PEER_IP=%%I"
+)
+
+REM Se bootstrap vazio, descobre pelo tailscale status (primeiro IP que nao seja o nosso)
+if "%TS_PEER_IP%"=="" (
+    echo [*] Bootstrap vazio - auto-detectando peer via Tailscale...
+    for /f "tokens=1" %%I in ('tailscale status 2^>nul ^| findstr /R "^100\."') do (
+        if not "%%I"=="%MY_TS_IP%" (
+            if "!TS_PEER_IP!"=="" set "TS_PEER_IP=%%I"
+        )
+    )
+    if not "!TS_PEER_IP!"=="" (
+        echo [ok] Peer detectado: !TS_PEER_IP!
+        set "BRN_BOOTSTRAP_PEERS=!TS_PEER_IP!:6001"
+        REM salva de volta no env
+        (
+            echo !BRN_BOOTSTRAP_PEERS!
+        ) > nul
+    )
+)
+
+if "%TS_PEER_IP%"=="" (
+    echo [!] Nenhum peer Tailscale encontrado.
     echo     Continuando mesmo assim...
 ) else (
-    echo [ok] Peer %TS_PEER_IP% alcancavel
+    echo [*] Testando peer %TS_PEER_IP%...
+    tailscale ping -c 1 "%TS_PEER_IP%" >nul 2>&1
+    if errorlevel 1 (
+        echo [!] Peer %TS_PEER_IP% NAO respondeu ao ping.
+        echo     Verifique se a outra maquina esta ligada e logada.
+    ) else (
+        echo [ok] Peer %TS_PEER_IP% alcancavel
+    )
 )
 
 :tailscale_done
 echo.
 
 REM ============================================================
-REM  5) WAITRESS
+REM  5) WAITRESS (opcional)
 REM ============================================================
 %PY% -c "import waitress" >nul 2>&1
 if errorlevel 1 (
@@ -275,7 +294,13 @@ if "%HEADLESS_FLAG%"=="--headless" set "GUI_STATUS=HEADLESS"
 echo.
 
 REM ============================================================
-REM  8) VERSAO main.py
+REM  8) RESOLVE ADMIN TOKEN STATUS (sintaxe batch correta)
+REM ============================================================
+set "ADMIN_STATUS=NAO"
+if not "%BRN_ADMIN_TOKEN%"=="" set "ADMIN_STATUS=SIM"
+
+REM ============================================================
+REM  9) VERSAO main.py
 REM ============================================================
 set "NODE_VERSION=?"
 for /f "tokens=*" %%V in ('%PY% main.py --version 2^>nul') do set "NODE_VERSION=%%V"
@@ -283,7 +308,7 @@ echo [ok] main.py versao: %NODE_VERSION%
 echo.
 
 REM ============================================================
-REM  9) RESUMO
+REM 10) RESUMO
 REM ============================================================
 echo ============================================================
 echo   CONFIGURACAO ATUAL (CLIENTE)
@@ -293,9 +318,9 @@ echo   Versao     : %NODE_VERSION%
 echo   Bootstrap  : %BRN_BOOTSTRAP_PEERS%
 echo   All miners : %BRN_ALL_MINERS%
 echo   Min diff   : %BRN_MIN_DIFFICULTY%
-echo   Admin tok  : %([ -n "%BRN_ADMIN_TOKEN%" ] && echo SIM || echo NAO)
+echo   Admin tok  : %ADMIN_STATUS%
 echo   P2P porta  : %BRN_P2P_PORT%
-echo   HTTP       : http://0.0.0.0:%BRN_WEB_PORT%  (Waitress, %BRN_HTTP_THREADS% threads)
+echo   HTTP       : http://0.0.0.0:%BRN_WEB_PORT%
 echo   Explorer   : http://0.0.0.0:%BRN_EXPLORER_PORT%
 echo   Python     : %PYVER%
 echo   pywebview  : %GUI_STATUS%
@@ -310,7 +335,7 @@ echo   ATENCAO: deixe esta janela ABERTA enquanto o cliente roda.
 echo.
 
 REM ============================================================
-REM 10) INICIA O NO
+REM 11) INICIA O NO
 REM ============================================================
 echo [*] Iniciando CLIENTE BRN... ^(Ctrl+C para encerrar^)
 echo.
