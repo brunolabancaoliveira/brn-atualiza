@@ -1,6 +1,11 @@
 """
-p2p_unified.py — BRN P2P Network v6.6.3
+p2p_unified.py — BRN P2P Network v6.6.4
 ================================================================
+v6.6.4:
+  [FIX] _on_new_block detecta forks (bloco com hash diferente na
+        mesma altura) e loga, mas NÃO aplica. Deixa o ChainSyncManager
+        (v8) resolver via cumulative_work + reorg_to().
+        Antes, forks eram silenciosamente ignorados.
 v6.6.3:
   [FIX] _refresh_heights_loop agora atualiza last_seen no DB
         a cada ciclo. Antes, o peer só era registrado na primeira
@@ -194,10 +199,6 @@ def _carregar_bootstrap() -> set[str]:
 
 def _registrar_peer_no_db(blockchain, ip: str, port: int,
                            peer_id: Optional[str] = None) -> None:
-    """
-    Registra/atualiza peer no DB. Atualiza last_seen — usado tanto na
-    descoberta inicial quanto no _refresh_heights_loop (a cada 60s).
-    """
     if blockchain is None:
         return
     try:
@@ -256,6 +257,7 @@ class Metrics:
             "last_sync_duration_ms": 0.0, "last_sync_height": 0,
             "auth_ok": 0, "auth_failed": 0,
             "auth_replay_blocked": 0, "auth_payload_swap_blocked": 0,
+            "forks_detected": 0,
         }
         self.peer_metrics: dict[str, dict] = defaultdict(lambda: {
             "last_seen": 0, "latency_ms": 0.0, "blocks_contributed": 0,
@@ -669,7 +671,6 @@ class P2PServer(threading.Thread):
 
             response = self._process_message(msg, addr, peer_id)
             if response:
-                # [FIX v6.6.1] _chain e _uuid ANTES de assinar
                 response["_chain"] = CHAIN_ID
                 response["_uuid"] = self.node_uuid
 
@@ -1136,7 +1137,6 @@ class PeerDiscovery:
                             novo = self._add_peer(peer)
                             if resp.get("_uuid"):
                                 self.register_uuid(resp["_uuid"], ip, port)
-                            # [v6.6.3] Atualiza last_seen no DB
                             _registrar_peer_no_db(self.bc, ip, port,
                                                   resp.get("_uuid"))
                             if novo:
@@ -1237,14 +1237,11 @@ class PeerDiscovery:
             except Exception:
                 pass
 
-    # ============================================================
-    # [v6.6.3] Refresh heights — AGORA ATUALIZA last_seen NO DB
-    # ============================================================
     def _refresh_heights_loop(self) -> None:
         """
         A cada 60s, faz get_chain_height() para cada peer e:
           1. Atualiza o cache de alturas (usado pelo sync_manager)
-          2. [v6.6.3] Atualiza last_seen no DB (para a GUI mostrar Peers)
+          2. Atualiza last_seen no DB (para a GUI mostrar Peers)
           3. Registra uuid no directory (para o relay)
         """
         while self.running:
@@ -1259,9 +1256,6 @@ class PeerDiscovery:
                         if not resp:
                             continue
 
-                        # [v6.6.3] FIX PRINCIPAL: atualiza last_seen no DB.
-                        # Sem isso, contar_peers(apenas_ativos=True) retornava 0
-                        # depois de 5min, e a GUI mostrava "Peers: 0".
                         try:
                             _registrar_peer_no_db(
                                 self.bc, ip, int(port),
@@ -1655,32 +1649,63 @@ class P2PManager:
                 pass
 
     # ============================================================
-    # _on_new_block com GOSSIP (v6.6.2)
+    # v6.6.4: _on_new_block com DETECÇÃO DE FORK
     # ============================================================
     def _on_new_block(self, block_dict: dict) -> bool:
+        """
+        Chamado quando um bloco é recebido via P2P.
+
+        Casos:
+          1. Bloco estende a tip (h == local_h + 1) → aplica + gossip
+          2. Bloco com altura local mas hash diferente → FORK, loga
+          3. Bloco muito à frente → ignora (sync pega depois)
+        """
         try:
-            h = block_dict.get("height", -1)
-            if h == self.bc.db.height() + 1:
+            h = int(block_dict.get("height", -1))
+            local_h = self.bc.db.height()
+
+            # ---- Caso 1: estende a tip ----
+            if h == local_h + 1:
                 ok, msg = self.bc.accept_block(block_dict)
                 if ok:
                     self.metrics.inc("blocks_accepted")
                     log.info(f"novo bloco aceito: #{h}")
-
-                    # [GOSSIP] Propaga para os outros peers
+                    # Gossip: retransmite para outros peers
                     try:
-                        threading.Thread(
-                            target=self.broadcast_block,
-                            args=(block_dict,),
-                            daemon=True,
-                            name=f"Gossip-{h}",
-                        ).start()
+                        self._broadcast_pool.submit(
+                            self.broadcast_block, block_dict)
                     except Exception as e:
                         log.debug(f"gossip falhou: {e}")
                 else:
                     self.metrics.inc("blocks_rejected")
+                    log.warning(f"bloco #{h} rejeitado: {msg}")
                 return ok
+
+            # ---- Caso 2: FORK (mesma altura, hash diferente) ----
+            if h <= local_h:
+                try:
+                    local_blk = self.bc.db.get_block(h)
+                except Exception:
+                    local_blk = None
+
+                if local_blk and local_blk.get("hash") != block_dict.get("hash"):
+                    self.metrics.inc("forks_detected")
+                    local_hash = str(local_blk.get("hash", ""))[:16]
+                    peer_hash = str(block_dict.get("hash", ""))[:16]
+                    log.warning(
+                        f"[P2P] FORK detectado em #{h} — "
+                        f"local={local_hash}... peer={peer_hash}... "
+                        f"(ChainSyncManager vai resolver via reorg)"
+                    )
+                return False
+
+            # ---- Caso 3: muito à frente ----
+            log.debug(f"[P2P] bloco #{h} muito à frente (local={local_h}), "
+                      f"ignorando — sync pega depois")
             return False
-        except Exception:
+
+        except Exception as e:
+            log.debug(f"_on_new_block: {e}")
             return False
 
     def _on_new_tx(self, tx_dict: dict) -> bool:
@@ -1689,6 +1714,11 @@ class P2PManager:
             if ok:
                 self.metrics.inc("txs_accepted")
                 log.info(f"nova tx: {str(tx_dict.get('txid', '?'))[:16]}")
+                # Gossip: retransmite a tx para outros peers
+                try:
+                    self._broadcast_pool.submit(self.broadcast_tx, tx_dict)
+                except Exception as e:
+                    log.debug(f"tx gossip falhou: {e}")
             else:
                 self.metrics.inc("txs_rejected")
             return ok

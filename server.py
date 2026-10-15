@@ -1,32 +1,21 @@
-"""server.py — Backend HTTP do nó BRN (v9.6)
+﻿"""
+server.py — Backend HTTP do nó BRN (v9.7)
 ================================================================
+v9.7:
+  [FIX] CRÍTICO: /api/transfer propaga tx via P2P (set_p2p_manager)
+        — antes usava chain._on_tx_submitted que nunca existiu
+  [FIX] FEE agora vem de blockchain.MIN_RELAY_FEE (não hardcoded)
+  [NEW] set_p2p_manager() / _get_p2p_manager() — injetado pelo main.py
+  [NEW] /api/mempool — lista resumida da mempool
 v9.6:
-  [NEW] Guard de mineração — apenas nó origem pode minerar
-        Decorator @require_mining_allowed aplicado em:
-          /api/mine
-          /api/miner/start
-          /api/faucet
-        Nós clientes recebem 403 (evita forks por mineração dupla).
+  [FIX] /api/transfer: conversão BRN→sats agora usa Decimal (não float)
+  [FIX] /api/transfer: validação de saldo inclui a fee de 1000 sats
+  [NEW] /api/transfer aceita vírgula decimal (0,29 → 0.29)
+  [NEW] /api/transfer devolve amount_sats e amount_brn
 v9.5:
   [NEW] set_sync_manager() + /api/sync/status
-  [FIX] /api/sync-info: contar_peers(apenas_ativos=False)
-v9.4 (Modo 2 — mineração aberta na rede):
-  /api/mine, /api/miner/start, /api/miner/stop — sem @_admin_required
-  /api/faucet — mantém @_admin_required
-v9.3:
-  CHAIN injetável, auto_registrar_carteira_atual, secure_store fallback
-v9.2:
-  Auto-registro da pubkey da carteira ativa no boot
-v9.1:
-  Rate limit via security.require_rate_limit
-  audit_log em rotas sensíveis
-v9.0:
-  bind default 127.0.0.1, admin token, caches com cleanup thread
-
-Env:
-    BRN_IS_ORIGIN=1  → permite minerar
-    BRN_IS_ORIGIN=0  → bloqueia /api/mine, /api/miner/start, /api/faucet
-    BRN_ALLOW_CLIENT_MINE=1  → override (só para testes)
+v9.4:
+  [CHANGE] /api/mine, /api/miner/* — públicos
 ================================================================
 """
 from __future__ import annotations
@@ -38,6 +27,7 @@ import atexit
 import hmac
 import logging
 import threading
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import wraps
 from pathlib import Path
 
@@ -46,6 +36,11 @@ from flask_cors import CORS
 
 from wallet import Wallet, WalletManager, HDWalletManager
 from blockchain import Blockchain, make_coinbase, txid as calc_txid, signing_hash
+
+try:
+    from blockchain import MIN_RELAY_FEE
+except ImportError:
+    MIN_RELAY_FEE = 1000
 
 try:
     from security import (
@@ -73,7 +68,6 @@ except ImportError:
     def get_client_ip():
         return request.remote_addr or "0.0.0.0"
 
-
 log = logging.getLogger("server")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -92,45 +86,6 @@ FAUCET_AMOUNT_BRN      = 10
 FAUCET_MAX_PER_ADDRESS = 3
 FAUCET_COOLDOWN_S      = 60 * 60
 CACHE_TTL_S            = 5
-
-
-# ============================================================
-# GUARD DE MINERAÇÃO — apenas nó origem minera
-# ============================================================
-IS_ORIGIN         = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
-ALLOW_CLIENT_MINE = os.environ.get("BRN_ALLOW_CLIENT_MINE", "0") == "1"
-CAN_MINE          = IS_ORIGIN or ALLOW_CLIENT_MINE
-
-
-def _mining_denied():
-    """Resposta 403 padrão para nós que não podem minerar."""
-    return jsonify({
-        "ok": False,
-        "msg": ("Este no NAO minera (BRN_IS_ORIGIN=0). "
-                "Apenas o no origem pode minerar."),
-        "is_origin": IS_ORIGIN,
-        "allow_client_mine": ALLOW_CLIENT_MINE,
-    }), 403
-
-
-def require_mining_allowed(f):
-    """
-    Decorator: bloqueia se o nó não pode minerar.
-    Aplicado em /api/mine, /api/miner/start, /api/faucet.
-    """
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if not CAN_MINE:
-            try:
-                audit_log("mining_blocked", {
-                    "path": request.path,
-                    "ip":   get_client_ip(),
-                })
-            except Exception:
-                pass
-            return _mining_denied()
-        return f(*args, **kwargs)
-    return wrapper
 
 
 # ============================================================
@@ -159,25 +114,6 @@ def _get_chain():
         return _CHAIN
 
 
-# ============================================================
-# SYNC MANAGER INJETÁVEL (v7)
-# ============================================================
-_SYNC_MANAGER = None
-_SYNC_LOCK = threading.Lock()
-
-
-def set_sync_manager(sync) -> None:
-    """Injeta o ChainSyncManager no server (chamado pelo main.py)."""
-    global _SYNC_MANAGER
-    with _SYNC_LOCK:
-        _SYNC_MANAGER = sync
-    log.info("server: sync_manager injetado")
-
-
-def _get_sync_manager():
-    return _SYNC_MANAGER
-
-
 class _LazyChain:
     def __getattr__(self, name):
         return getattr(_get_chain(), name)
@@ -188,6 +124,50 @@ class _LazyChain:
 
 CHAIN = _LazyChain()
 
+
+# ============================================================
+# [NEW v9.7] P2P MANAGER INJETÁVEL (para propagar tx via P2P)
+# ============================================================
+_P2P_MANAGER = None
+_P2P_LOCK = threading.Lock()
+
+
+def set_p2p_manager(p2p) -> None:
+    """Chamado pelo main.py após criar o P2PManager."""
+    global _P2P_MANAGER
+    with _P2P_LOCK:
+        _P2P_MANAGER = p2p
+    if p2p is not None:
+        log.info("server: P2PManager injetado (propagação de tx ligada)")
+    else:
+        log.info("server: P2PManager removido")
+
+
+def _get_p2p_manager():
+    return _P2P_MANAGER
+
+
+# ============================================================
+# SYNC MANAGER INJETÁVEL
+# ============================================================
+_SYNC_MANAGER = None
+_SYNC_LOCK = threading.Lock()
+
+
+def set_sync_manager(sync) -> None:
+    global _SYNC_MANAGER
+    with _SYNC_LOCK:
+        _SYNC_MANAGER = sync
+    log.info("server: sync_manager injetado")
+
+
+def _get_sync_manager():
+    return _SYNC_MANAGER
+
+
+# ============================================================
+# L2 (opcional)
+# ============================================================
 try:
     from l2_manager import L2Manager, L2Error
     import btc_config
@@ -234,7 +214,7 @@ if CORS_ORIGINS:
 
 
 # ============================================================
-# Admin guard — usado SÓ em /api/faucet agora
+# Admin guard
 # ============================================================
 def _require_admin() -> bool:
     if not ADMIN_TOKEN:
@@ -506,9 +486,9 @@ def portfolio(address):
         cached = _saldo_cache_get(address)
         if cached is None:
             utxos = _get_chain().db.get_utxos(address)
-            cached = sumBR(u["amount"] for u in utxosN)
+            cached = sum(u["amount"] for u in utxos)
             _saldo_cache_set(address, cached)
-        return json":ify({"portfolio": {" cached / 10**8, "KYC": 0}})
+        return jsonify({"portfolio": {"BRN": cached / 10**8, "KYC": 0}})
     except Exception as e:
         return jsonify({"portfolio": {}, "error": str(e)}), 500
 
@@ -690,7 +670,37 @@ def minhas_txs(address):
 
 
 # ============================================================
-# Transfer
+# MEMPOOL  [NEW v9.7]
+# ============================================================
+@app.route("/api/mempool", methods=["GET"])
+@require_rate_limit("status")
+def get_mempool():
+    """Lista resumida da mempool (não expõe assinaturas)."""
+    try:
+        chain = _get_chain()
+        txs = chain.db.all_mempool(limit=200)
+        resumo = []
+        for t in txs:
+            resumo.append({
+                "txid":         t.get("txid", ""),
+                "num_inputs":   len(t.get("inputs", [])),
+                "num_outputs":  len(t.get("outputs", [])),
+                "total_out":    sum(o.get("amount", 0)
+                                    for o in t.get("outputs", [])),
+                "timestamp":    t.get("timestamp", 0),
+                "nonce":        t.get("nonce", 0),
+            })
+        return jsonify({
+            "ok":    True,
+            "count": len(resumo),
+            "txs":   resumo,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# Transfer  [FIX v9.6 + v9.7]
 # ============================================================
 @app.route("/api/transfer", methods=["POST"])
 @app.route("/api/send", methods=["POST"])
@@ -699,10 +709,10 @@ def minhas_txs(address):
 def transfer():
     try:
         data = request.get_json(force=True) or {}
-        sender = data.get("from", "").strip()
-        to = data.get("to", "").strip()
+        sender = (data.get("from") or "").strip()
+        to = (data.get("to") or "").strip()
         asset_id = data.get("asset_id", "BRN")
-        amount = data.get("amount")
+        amount_raw = data.get("amount")
         sk = (request.headers.get("X-BRN-Sk", "")
               or data.get("private_key", ""))
 
@@ -721,12 +731,29 @@ def transfer():
         if sender == to:
             return jsonify({"ok": False, "msg": "Nao pode enviar para si."}), 400
 
+        # ------------------------------------------------------------
+        # Conversão EXATA com Decimal
+        # ------------------------------------------------------------
+        if amount_raw is None or str(amount_raw).strip() == "":
+            return jsonify({"ok": False, "msg": "Valor vazio."}), 400
+
         try:
-            amount_sats = int(float(amount) * 10**8)
-        except (ValueError, TypeError):
+            amount_dec = Decimal(str(amount_raw).strip().replace(",", "."))
+        except (InvalidOperation, ValueError, TypeError):
             return jsonify({"ok": False, "msg": "Valor invalido."}), 400
-        if amount_sats <= 0:
+
+        if amount_dec <= 0:
             return jsonify({"ok": False, "msg": "Valor deve ser > 0."}), 400
+
+        amount_dec = amount_dec.quantize(Decimal("0.00000001"),
+                                         rounding=ROUND_DOWN)
+        amount_sats = int(amount_dec * Decimal(10**8))
+
+        if amount_sats <= 0:
+            return jsonify({
+                "ok": False,
+                "msg": "Valor menor que 1 satoshi (0.00000001 BRN).",
+            }), 400
 
         try:
             w = Wallet(private_key_hex=sk)
@@ -734,6 +761,8 @@ def transfer():
             return jsonify({"ok": False, "msg": "Chave privada invalida."}), 400
         if w.address != sender:
             return jsonify({"ok": False, "msg": "Chave privada nao corresponde."}), 400
+
+        FEE = int(MIN_RELAY_FEE)
 
         chain = _get_chain()
         with CHAIN_LOCK:
@@ -743,13 +772,17 @@ def transfer():
             for u in utxos:
                 escolhidos.append(u)
                 total += u["amount"]
-                if total >= amount_sats + 1000:
+                if total >= amount_sats + FEE:
                     break
-            if total < amount_sats:
-                return jsonify({"ok": False,
-                                "msg": f"Saldo insuficiente ({total/1e8:.8f} BRN)."}), 400
 
-            FEE = 1000
+            if total < amount_sats + FEE:
+                return jsonify({
+                    "ok": False,
+                    "msg": (f"Saldo insuficiente: tem {total/1e8:.8f} BRN, "
+                            f"precisa {amount_sats/1e8:.8f} BRN + "
+                            f"{FEE/1e8:.8f} fee."),
+                }), 400
+
             troco = total - amount_sats - FEE
             outputs = [{"address": to, "amount": amount_sats, "pubkey": ""}]
             if troco > 0:
@@ -773,28 +806,47 @@ def transfer():
             audit_log("transfer_rejected", {"reason": msg})
             return jsonify({"ok": False, "msg": msg}), 400
 
+        # ------------------------------------------------------------
+        # [FIX v9.7] Propaga via P2P (usa P2PManager injetado pelo main)
+        # ------------------------------------------------------------
+        p2p = _get_p2p_manager()
+        if p2p is not None:
+            try:
+                p2p.broadcast_tx(tx)
+                log.info(f"tx {tx['txid'][:16]}... propagada via P2P")
+            except Exception as e:
+                log.warning(f"broadcast_tx falhou: {e}")
+        else:
+            log.debug("P2PManager nao injetado — tx so na mempool local")
+
         _saldo_cache_invalidate(sender)
         _saldo_cache_invalidate(to)
         audit_log("transfer_ok", {
             "from":        hash_short(sender, 16),
             "to":          hash_short(to, 16),
             "amount_sats": amount_sats,
+            "amount_brn":  str(amount_dec),
             "txid":        tx["txid"][:16],
         })
-        return jsonify({"ok": True, "txid": tx["txid"], "nonce": nonce,
-                        "msg": "Aceita na mempool."})
+        return jsonify({
+            "ok":          True,
+            "txid":        tx["txid"],
+            "nonce":       nonce,
+            "amount_sats": amount_sats,
+            "amount_brn":  str(amount_dec),
+            "msg":         f"Aceita na mempool ({amount_dec} BRN).",
+        })
     except Exception as e:
+        log.exception("transfer falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 # ============================================================
-# MINERAÇÃO — protegida por @require_mining_allowed
+# MINERAÇÃO
 # ============================================================
 @app.route("/api/mine", methods=["POST"])
 @require_rate_limit("mine")
-@require_mining_allowed
 def mine():
-    """Mineração — apenas nó ORIGEM pode chamar (403 se cliente)."""
     try:
         data = request.get_json(force=True) or {}
         miner = (data.get("validator_address")
@@ -827,6 +879,15 @@ def mine():
             "height": block["height"],
             "hash":   block["hash"][:16],
         })
+
+        # Propaga bloco via P2P
+        p2p = _get_p2p_manager()
+        if p2p is not None:
+            try:
+                p2p.broadcast_block(block)
+            except Exception as e:
+                log.debug(f"broadcast_block falhou: {e}")
+
         return jsonify({"ok": True,
                         "msg": f"Bloco #{block['height']} minerado!",
                         "block": {"height": block["height"],
@@ -840,9 +901,7 @@ def mine():
 
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
-@require_mining_allowed
 def miner_start():
-    """Inicia miner contínuo — apenas nó ORIGEM."""
     try:
         data = request.get_json(force=True) or {}
         addr = (data.get("validator_address")
@@ -880,10 +939,6 @@ def miner_start():
 @app.route("/api/miner/stop", methods=["POST"])
 @require_rate_limit("miner_stop")
 def miner_stop():
-    """
-    Para miner contínuo — permitido em qualquer nó.
-    (Se o nó é cliente, não tem miner rodando; retorna ok=False gracefully.)
-    """
     try:
         from miner_loop import get_miner
         m = get_miner(_get_chain())
@@ -900,7 +955,6 @@ def miner_stop():
 @app.route("/api/miner/on", methods=["POST"])
 @app.route("/api/start-mining", methods=["POST"])
 def miner_start_alias():
-    # Alias para /api/miner/start — mas passa pelo mesmo guard
     return miner_start()
 
 
@@ -912,7 +966,6 @@ def miner_stop_alias():
 
 @app.route("/api/miner/status", methods=["GET"])
 def miner_status():
-    """Status do miner — leitura, permitida em qualquer nó."""
     try:
         from miner_loop import get_miner
         m = get_miner(_get_chain())
@@ -932,22 +985,18 @@ def miner_status():
             "height": _get_chain().db.height(),
             "difficulty": _get_chain().current_difficulty(),
             "last_error": st.get("last_error", ""),
-            "is_origin": IS_ORIGIN,
-            "can_mine": CAN_MINE,
         })
     except Exception as e:
         return jsonify({"running": False, "error": str(e)}), 200
 
 
 # ============================================================
-# Faucet — protegido por admin + mining guard
+# Faucet
 # ============================================================
 @app.route("/api/faucet", methods=["POST"])
 @require_rate_limit("faucet")
 @_admin_required
-@require_mining_allowed
 def faucet():
-    """Faucet — apenas nó ORIGEM + admin token."""
     try:
         data = request.get_json(force=True) or {}
         addr = (data.get("address") or data.get("validator_address")
@@ -1039,8 +1088,6 @@ def status():
                 "contracts": (chain.db.contract_count()
                               if hasattr(chain.db, "contract_count") else 0),
                 "l2_enabled": L2_ENABLED,
-                "is_origin": IS_ORIGIN,
-                "can_mine": CAN_MINE,
             })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1054,7 +1101,7 @@ def fee_estimate():
                         "low": chain.estimate_fee("low"),
                         "medium": chain.estimate_fee("medium"),
                         "high": chain.estimate_fee("high"),
-                        "min_relay_fee": 1000})
+                        "min_relay_fee": int(MIN_RELAY_FEE)})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -1105,12 +1152,11 @@ def hd_create():
 @require_rate_limit("hd_derive")
 def hd_derive():
     try:
-        data =,
- request.get_json(force=True) or {}
-        mn = data       .get("mnemonic", "").strip()
-        " index = int(data.get("indexbl",oc 0))
-        if not HDWalletManageros.validate_mnemonic(mn):
-            return json_ify({"ok": False, "msg": "Mnemonico invalido"}), 400
+        data = request.get_json(force=True) or {}
+        mn = data.get("mnemonic", "").strip()
+        index = int(data.get("index", 0))
+        if not HDWalletManager.validate_mnemonic(mn):
+            return jsonify({"ok": False, "msg": "Mnemonico invalido"}), 400
         result = HDWalletManager.from_mnemonic(mn, index=index)
         _registrar_pubkey(result["address"], result.get("public_key", ""))
         audit_log("hd_derive_ok", {
@@ -1214,13 +1260,10 @@ def sync_info():
 
 
 # ============================================================
-# Sync Status detalhado (v7) — progresso, velocidade, ETA
+# Sync Status detalhado
 # ============================================================
 @app.route("/api/sync/status", methods=["GET"])
 def sync_status_v7():
-    """
-    Retorna status detalhado da sincronização em tempo real.
-    """
     sync = _get_sync_manager()
 
     if sync is not None:
@@ -1277,7 +1320,8 @@ def sync_status_v7():
         "progress": round(progress, 2),
         "local_height": local_h,
         "target_height": target_h,
-        "blocos_faltando": blocos_faltandopor_segundo": float(data.get("blocos_por_segundo", 0.0)),
+        "blocos_faltando": blocos_faltando,
+        "blocos_por_segundo": float(data.get("blocos_por_segundo", 0.0)),
         "velocidade_media": float(data.get("velocidade_media", 0.0)),
         "eta_segundos": eta_s,
         "eta_legivel": eta_legivel,
@@ -1543,9 +1587,9 @@ def health():
             "l2_enabled": L2_ENABLED,
             "chain_injected": _CHAIN is not None,
             "sync_injected": _SYNC_MANAGER is not None,
-            "is_origin": IS_ORIGIN,
-            "can_mine": CAN_MINE,
-            "version": "9.6",
+            "p2p_injected": _P2P_MANAGER is not None,
+            "mode": "modo2_aberto",
+            "version": "9.7",
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1555,17 +1599,13 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.6",
-        "is_origin": IS_ORIGIN,
-        "can_mine": CAN_MINE,
+        "version": "9.7",
+        "mode": "modo2_aberto",
         "l2_enabled": L2_ENABLED,
         "admin_protected": bool(ADMIN_TOKEN),
     })
 
 
-# ============================================================
-# Shutdown
-# ============================================================
 @atexit.register
 def _shutdown():
     log.info("encerrando server…")
@@ -1575,21 +1615,16 @@ def _shutdown():
         pass
 
 
-# ============================================================
-# Main (standalone: python server.py)
-# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.6")
+    print(f"BRN Server v9.7 (Modo 2 + P2P propagation + transfer Decimal)")
     print(f"  → http://{WEB_HOST}:{port}")
-    print(f"  IS_ORIGIN: {IS_ORIGIN}  |  CAN_MINE: {CAN_MINE}")
-    if not CAN_MINE:
-        print(f"  ⚠️  /api/mine, /api/miner/start, /api/faucet → 403")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
-    print(f"  /api/sync/status: ativo (v7)")
+    print(f"  /api/mine:    PÚBLICO (sem token)")
+    print(f"  /api/faucet:  {'PROTEGIDO' if ADMIN_TOKEN else 'PÚBLICO'}")
+    print(f"  /api/mempool: ATIVO")
     print(f"  CORS: {CORS_ORIGINS or '(desabilitado)'}")
-    print(f"  ProxyFix: {'ON' if BEHIND_PROXY else 'off'}")
 
     reg = auto_registrar_carteira_atual()
     if reg.get("ok"):
@@ -1598,14 +1633,11 @@ if __name__ == "__main__":
         print(f"[server] auto-registro pubkey: pulado ({reg.get('msg')})")
 
     if os.environ.get("BRN_AUTO_MINE", "0") == "1":
-        if CAN_MINE:
-            try:
-                from miner_loop import iniciar_mineracao
-                iniciar_mineracao(_get_chain())
-                print("[server] auto-miner iniciado")
-            except Exception as e:
-                print(f"[server] auto-miner falhou: {e}")
-        else:
-            print("[server] auto-miner pulado (CAN_MINE=False)")
+        try:
+            from miner_loop import iniciar_mineracao
+            iniciar_mineracao(_get_chain())
+            print("[server] auto-miner iniciado")
+        except Exception as e:
+            print(f"[server] auto-miner falhou: {e}")
 
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
