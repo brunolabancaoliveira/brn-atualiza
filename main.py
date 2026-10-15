@@ -1,30 +1,49 @@
 """main.py — Entrypoint unificado do nó BRN (v12.6)
 ================================================================
 v12.6:
-  [NEW] Integração finality: chain.set_checkpoints(cps) após carregar
-        checkpoints.json — permite que validate_reorg() bloqueie
-        reorgs que violem finality
-  [NEW] _log_finality_status() — mostra FINALITY_DEPTH no boot
-  [NEW] do_status mostra Finality
-  [NEW] status_loop mostra fork/reorgs em tempo real
-  [KEEP] Todo o v12.5 inalterado.
+  [FIX] CRÍTICO: injeta P2PManager no server.py (set_p2p_manager)
+        para propagação de tx/blocks via P2P
+        — antes o server.py usava chain._on_tx_submitted que nunca existiu
 v12.5:
-  [FIX] auto_genesis=is_origin (não "not is_origin")
+  [NEW] Sync manager (ChainSyncManager) + rendezvous + relay
 ================================================================
 Amarra tudo:
   1. Config (brn_config.Config) + env
   2. Senha do nó
   3. Identidade Ed25519 (node_identity.enc)
-  4. Blockchain (blockchain.py v9.2.0)
+  4. Blockchain (blockchain.py v9.1.8)
   5. P2P (p2p_unified.P2PManager)
   6. Sync (sync_manager.ChainSyncManager)
   7. Rendezvous (rendezvous_discovery.RendezvousDiscovery)
   8. Relay (p2p_relay.RelayManager)
   9. L2 (btc_watcher.BTCWatcher)
- 10. HTTP server (server.py v9.5)
+ 10. HTTP server (server.py v9.7)
  11. Explorer (explorer.py)
  12. Miner (miner_loop.get_miner)
  13. Loop principal até Ctrl+C
+
+Argumentos:
+    --status               Mostra diagnóstico
+    --headless             Sem GUI
+    --read-only            Nó não assina blocos
+    --version              Mostra versão
+    --check-update         Consulta GitHub
+    --config PATH          Config.json (default config.json)
+    --log-level LEVEL      INFO/DEBUG/WARNING
+    --log-file PATH
+    --password-file PATH   Arquivo com senha (uma linha)
+    --rotate-node-id       Nova identidade Ed25519
+    --client-mode          Não cria genesis local
+    --discover             Diagnóstico de descoberta
+    --l2                   Habilita BTC watcher
+    --l2-stats             Mostra stats do L2 e sai
+    --mine                 Inicia miner
+    --no-p2p               Desabilita P2P
+    --no-sync              Não sincroniza
+    --no-tailscale         Pula Tailscale
+    --relay / --no-relay   Força relay on/off
+    --verify-only          Só verifica cadeia
+    --skip-verify          Pula verificação no boot
 
 Prioridade de env:
     Shell / .bat  >  brn_network.env  >  _HARDCODED_DEFAULTS
@@ -456,23 +475,6 @@ def check_for_update(timeout: int = 5):
 
 
 # ============================================================
-# [v12.6] FINALITY — status no boot
-# ============================================================
-def _log_finality_status(chain, log):
-    """[v12.6] Loga configuração de finality no boot."""
-    try:
-        from blockchain import FINALITY_DEPTH
-        current = chain.db.height()
-        final_height = max(0, current - FINALITY_DEPTH + 1)
-        log.info(f"Finality: depth={FINALITY_DEPTH} "
-                 f"(blocos até #{final_height} são irreversíveis)")
-    except ImportError:
-        log.info("Finality: não disponível (blockchain.py antigo)")
-    except Exception as e:
-        log.warning(f"Finality: erro ao consultar — {e}")
-
-
-# ============================================================
 # DIAGNÓSTICO
 # ============================================================
 def do_status(cfg):
@@ -520,13 +522,6 @@ def do_status(cfg):
         print(" Checkpoints : " + str(len(cps)) + " carregados")
     except Exception as e:
         print(" Checkpoints : indisponível (" + str(e) + ")")
-
-    # [v12.6] Finality
-    try:
-        from blockchain import FINALITY_DEPTH
-        print(" Finality    : depth=" + str(FINALITY_DEPTH))
-    except ImportError:
-        print(" Finality    : não disponível")
 
     origin = _is_origin(False)
     print(" Role (auto) : " + ("ORIGEM" if origin else "CLIENTE"))
@@ -712,11 +707,6 @@ def run_status_loop(chain, p2p, l2_manager=None, sync=None):
                             + "/" + str(s.get("local_height", 0))
                             + "→" + str(s.get("target_height", 0))
                             + " (" + str(s.get("progress", 0)) + "%)")
-                    # [v12.6] fork / reorg
-                    if s.get("forking"):
-                        msg += " ⚠FORK"
-                    if s.get("reorgs_total"):
-                        msg += " reorgs=" + str(s.get("reorgs_total"))
                     if s.get("active_peer"):
                         msg += " via " + str(s["active_peer"])[:12]
                     if s.get("last_error"):
@@ -1086,15 +1076,12 @@ def main():
     chain = Blockchain(cfg["db_path"], auto_genesis=is_origin)
     log.info("Altura atual: " + str(chain.db.height()))
 
-    # ---- checkpoints + finality [v12.6] ----
+    # ---- checkpoints ----
     try:
         from checkpoints import load_checkpoints
         from blockchain import set_checkpoints, set_checkpoint_priv
         cps = load_checkpoints()
         set_checkpoints(cps)
-        # [v12.6] Sincroniza com a instância
-        chain.set_checkpoints(cps)
-
         if is_origin and node_id_priv is not None:
             set_checkpoint_priv(node_id_priv)
             log.info("Checkpoints: " + str(len(cps)) + " carregados (assinatura ATIVA)")
@@ -1102,9 +1089,6 @@ def main():
             log.info("Checkpoints: " + str(len(cps)) + " carregados (só valida)")
     except Exception as e:
         log.warning("Checkpoints desativados: " + str(e))
-
-    # [v12.6] Log de finality
-    _log_finality_status(chain, log)
 
     # ---- verify ----
     if args.verify_only:
@@ -1216,6 +1200,24 @@ def main():
     elif args.l2:
         log.warning("--l2 solicitado, mas L2 não disponível. Ignorando.")
 
+    # ---- [NEW v12.6] Injeta P2PManager no server.py ----
+    # Propaga transações e blocos via P2P.
+    # ANTES: server.py usava chain._on_tx_submitted (nunca existiu) →
+    #        transações ficavam presas na mempool local.
+    if p2p is not None:
+        try:
+            import server as _srv
+            if hasattr(_srv, "set_p2p_manager"):
+                _srv.set_p2p_manager(p2p)
+                log.info("P2PManager injetado no server.py (propagação ativa)")
+            else:
+                log.warning("server.py sem set_p2p_manager — "
+                            "tx nao serao propagadas via P2P")
+        except Exception as e:
+            log.warning("Falha injetando P2P no server: " + str(e))
+    else:
+        log.warning("Sem P2PManager — tx nao serao propagadas")
+
     # ---- HTTP ----
     http_app = _init_http_server(chain, log)
     if http_app is not None:
@@ -1299,6 +1301,7 @@ def main():
         "rendezvous": bool(rdv and rdv.is_active()),
         "relay":      bool(relay),
         "sync":       bool(sync),
+        "p2p":        bool(p2p),
         "tailscale":  bool(os.environ.get("TS_TAILNET", "").strip()),
     })
 

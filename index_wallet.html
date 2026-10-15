@@ -388,8 +388,12 @@
       <input id="txFrom" readonly placeholder="brn1...">
       <label>Para</label>
       <input id="txTo" placeholder="brn1...">
-      <label>Valor (BRN)</label>
-      <input id="txAmount" type="number" step="0.00001" min="0.00001" placeholder="1.5">
+      <label>Valor (BRN) — até 8 casas decimais (ex: 0.29)</label>
+      <input id="txAmount" type="text"
+             inputmode="decimal"
+             pattern="[0-9]*[.,]?[0-9]*"
+             placeholder="1.5"
+             autocomplete="off">
       <div class="row">
         <button class="btn p" id="bEnviar">📤 Enviar</button>
       </div>
@@ -522,7 +526,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.8 · ponte pywebview · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.9 · ponte pywebview · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
@@ -965,30 +969,58 @@ async function carregarMinhasTxs() {
 }
 
 // ============================================================
-// ENVIO
+// ENVIO  [FIX v3.9 — passa amount como STRING]
 // ============================================================
 async function enviar() {
   clearMsg("mEnviar");
-  if (!wallet.address) { msg("mEnviar", "❌ Gere/carregue uma carteira.", "err"); return; }
+  if (!wallet.address) {
+    msg("mEnviar", "❌ Gere/carregue uma carteira.", "err");
+    return;
+  }
+
   const to = $("txTo").value.trim();
-  const amt = parseFloat($("txAmount").value);
-  if (!to)        { msg("mEnviar", "❌ Informe o destinatário.", "err"); return; }
-  if (!(amt > 0)) { msg("mEnviar", "❌ Valor inválido.", "err"); return; }
+  const amtStr = $("txAmount").value.trim().replace(",", ".");
+
+  if (!to) {
+    msg("mEnviar", "❌ Informe o destinatário.", "err");
+    return;
+  }
+  if (!amtStr) {
+    msg("mEnviar", "❌ Informe o valor.", "err");
+    return;
+  }
+
+  // Validação de UX (backend volta a validar com Decimal)
+  const amtNum = Number(amtStr);
+  if (!isFinite(amtNum) || amtNum <= 0) {
+    msg("mEnviar", "❌ Valor inválido.", "err");
+    return;
+  }
+  if (!/^\d+(\.\d{1,8})?$/.test(amtStr)) {
+    msg("mEnviar",
+        "❌ Formato inválido (use ponto, até 8 casas: ex 0.29).",
+        "err");
+    return;
+  }
 
   const btn = $("bEnviar");
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span>Enviando…';
   try {
+    // IMPORTANTE: passa amtStr como STRING — o backend converte com Decimal
     const r = await api("transfer",
-      wallet.address, to, "BRN", amt,
+      wallet.address, to, "BRN", amtStr,
       wallet.private_key, wallet.public_key);
+
     if (r.ok) {
       lastSentTxid = r.txid || "";
+      const enviado = r.amount_brn || amtStr;
       msg("mEnviar",
-          "✅ Aceita na mempool. TXID: " + shortHash(r.txid, 20) +
-          " — veja em 🔎 Verificar",
+          "✅ " + enviado + " BRN aceite na mempool. TXID: " +
+          shortHash(r.txid, 20) + " — veja em 🔎 Verificar",
           "ok", 8000);
-      $("txTo").value = ""; $("txAmount").value = "";
+      $("txTo").value = "";
+      $("txAmount").value = "";
       await atualizarSaldo();
       await carregarMinhasTxs();
     } else {
@@ -997,7 +1029,8 @@ async function enviar() {
   } catch (e) {
     msg("mEnviar", "❌ " + e.message, "err");
   } finally {
-    btn.disabled = false; btn.textContent = "📤 Enviar";
+    btn.disabled = false;
+    btn.textContent = "📤 Enviar";
   }
 }
 

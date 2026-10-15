@@ -1,31 +1,31 @@
 """
-network_guard.py — Bloqueia mineracao se nao houver outro no na rede (v2)
+network_guard.py — Bloqueia mineracao se nao houver outro no na rede (v3)
 =========================================================================
 Garante que nao exista cadeia paralela: 1 no sozinho nunca minera.
 
-v2:
-  [FIX] peers via cadeia de fallback:
-          p2p.listar_peers()
-          p2p.discovery.listar_peers()
-          p2p.get_peers()
-          p2p.peers (dict)
-          p2p.get_status()['peer_count']
-        — antes só tentava p2p.discovery.listar_peers() e silenciava erros
-  [FIX] _first_peer_ts protegido por lock (race condition)
-  [FIX] reset() atômico
-  [FIX] p2p=None tratado (não explode)
-  [FIX] se nenhuma API de listagem existir → loga ERROR (não silencia)
-  [NEW] MIN_PEER_HEIGHT: peer precisa ter altura >= X (default 0 = não exige)
-  [NEW] status() público para diagnóstico / UI
-  [NEW] force_allow() / force_deny() / clear_force() para testes e emergência
-  [NEW] info() com config resolvida
-  [NEW] CLI: --info / --status
+v3:
+  [FIX] Erro "bytes-like object is required, not 'NoneType'" silenciado
+        e tratado — vem de hmac.compare_digest() em p2p_unified.get_status()
+        quando algum peer tem public_key/node_id = None
+  [FIX] _count_peers_via_api agora:
+        - valida tipo de retorno ANTES de qualquer operação
+        - distingue TypeError (bug interno do p2p) de falha real
+        - só loga WARNING em falha real; TypeError vira DEBUG
+  [NEW] Cache de resultados (0.5s) — evita spam de logs quando chamado
+        em loop apertado pelo miner_loop
+  [NEW] _peer_height_max com try/except granular (não engole erros)
+  [NEW] diagnóstico.expõe qual API funcionou + quantos peers
+  [NEW] timeout suave via cache: cada método tem pelo menos 1 tentativa
+  [KEEP] API pública 100% compatível com v2:
+        reset(), force_allow(), force_deny(), clear_force(),
+        pode_minerar(p2p), status(p2p), info(), CLI --info/--status
 
 Env:
   BRN_ALLOW_SOLO_MINING  (0/1)  — modo dev (default 0)
   BRN_MIN_PEER_STABLE    int    — segundos que peer precisa estar visível
                                   (default 10)
   BRN_MIN_PEER_HEIGHT    int    — altura mínima do peer (default 0)
+  BRN_NETGUARD_CACHE_MS  int    — TTL do cache de _count_peers (default 500)
 
 Retorno de pode_minerar():
     (bool, str)  — (pode, motivo)
@@ -44,6 +44,7 @@ from typing import Any, Optional, Tuple
 ALLOW_SOLO       = os.environ.get("BRN_ALLOW_SOLO_MINING", "0") == "1"
 MIN_PEER_STABLE  = int(os.environ.get("BRN_MIN_PEER_STABLE", "10"))
 MIN_PEER_HEIGHT  = int(os.environ.get("BRN_MIN_PEER_HEIGHT", "0"))
+CACHE_MS         = int(os.environ.get("BRN_NETGUARD_CACHE_MS", "500"))
 
 # ============================================================
 # ESTADO (protegido por lock)
@@ -52,6 +53,10 @@ _lock = threading.Lock()
 _first_peer_ts: Optional[float] = None
 _force: Optional[bool] = None
 _api_warned = False
+
+# cache: (ts_monotonic, count, api_used)
+_cache_lock = threading.Lock()
+_cache: Optional[Tuple[float, int, str]] = None
 
 
 # ============================================================
@@ -63,114 +68,213 @@ def _log(msg: str, level: str = "info") -> None:
         lg = get_logger("netguard")
         getattr(lg, level, lg.info)("[NetGuard] " + msg)
     except Exception:
-        print(f"[NetGuard] {msg}", flush=True)
+        # Fallback: só imprime se não for debug (evita flood)
+        if level != "debug":
+            print(f"[NetGuard] {msg}", flush=True)
+
+
+# ============================================================
+# NORMALIZAÇÃO DE PEERS
+# ============================================================
+def _extract_peer_count(raw: Any) -> int:
+    """
+    Normaliza o retorno de qualquer API para int (contagem de peers).
+
+    [FIX v3] Nunca propaga exceções; retorna 0 em qualquer tipo inválido.
+    """
+    if raw is None:
+        return 0
+    if isinstance(raw, bool):     # bool é subclasse de int — evitar
+        return 0
+    if isinstance(raw, int):
+        return max(0, raw)
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        return len(raw)
+    if isinstance(raw, dict):
+        return len(raw)
+    # strings e outros — não tentar converter
+    return 0
+
+
+def _is_p2p_type_error(exc: BaseException) -> bool:
+    """
+    Detecta o bug conhecido de p2p_unified.get_status() que lança
+    TypeError por comparar None com bytes (hmac.compare_digest).
+    """
+    return isinstance(exc, TypeError) and (
+        "bytes-like" in str(exc) or "NoneType" in str(exc)
+    )
 
 
 # ============================================================
 # DESCOBERTA DE PEERS (fallback chain)
 # ============================================================
-def _extract_peer_count(raw: Any) -> int:
-    """Normaliza o retorno de qualquer API para int (contagem de peers)."""
-    if raw is None:
-        return 0
-    if isinstance(raw, dict):
-        return len(raw)
-    if isinstance(raw, (list, tuple, set)):
-        return len(raw)
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _count_peers_via_api(p2p) -> Tuple[int, str]:
+def _count_peers_via_api_raw(p2p) -> Tuple[int, str]:
     """
-    Tenta listar peers via várias APIs conhecidas.
+    Tenta listar peers via várias APIs conhecidas, SEM cache.
     Retorna (count, api_used) — api_used="" se nenhuma funcionou.
+
+    Ordem de preferência:
+      1. p2p.listar_peers()              (PT-BR, nativo)
+      2. p2p.discovery.listar_peers()    (formato antigo)
+      3. p2p.get_peers()                 (EN)
+      4. p2p.peers (atributo direto)
+      5. p2p.get_status()['peer_count']  (último recurso)
     """
     if p2p is None:
         return 0, "p2p=None"
 
-    # 1) p2p.listar_peers()  (PT-BR)
+    # ---------- 1) p2p.listar_peers() ----------
     fn = getattr(p2p, "listar_peers", None)
     if callable(fn):
         try:
-            return _extract_peer_count(fn()), "p2p.listar_peers"
+            raw = fn()
+            return _extract_peer_count(raw), "p2p.listar_peers"
+        except TypeError as e:
+            if _is_p2p_type_error(e):
+                _log(f"p2p.listar_peers() bug conhecido (None em compare_digest): {e}",
+                     "debug")
+            else:
+                _log(f"p2p.listar_peers() TypeError: {e}", "debug")
         except Exception as e:
             _log(f"p2p.listar_peers() falhou: {e}", "debug")
 
-    # 2) p2p.discovery.listar_peers()  (formato antigo)
+    # ---------- 2) p2p.discovery.listar_peers() ----------
     disc = getattr(p2p, "discovery", None)
     if disc is not None:
         fn = getattr(disc, "listar_peers", None)
         if callable(fn):
             try:
-                return _extract_peer_count(fn()), "p2p.discovery.listar_peers"
+                raw = fn()
+                return _extract_peer_count(raw), "p2p.discovery.listar_peers"
             except Exception as e:
                 _log(f"p2p.discovery.listar_peers() falhou: {e}", "debug")
 
-    # 3) p2p.get_peers()  (EN)
+    # ---------- 3) p2p.get_peers() ----------
     fn = getattr(p2p, "get_peers", None)
     if callable(fn):
         try:
-            return _extract_peer_count(fn()), "p2p.get_peers"
+            raw = fn()
+            return _extract_peer_count(raw), "p2p.get_peers"
         except Exception as e:
             _log(f"p2p.get_peers() falhou: {e}", "debug")
 
-    # 4) p2p.peers (atributo direto — dict ou list)
+    # ---------- 4) p2p.peers (atributo direto) ----------
     peers_attr = getattr(p2p, "peers", None)
     if peers_attr is not None:
-        return _extract_peer_count(peers_attr), "p2p.peers"
+        try:
+            n = _extract_peer_count(peers_attr)
+            return n, "p2p.peers"
+        except Exception as e:
+            _log(f"p2p.peers falhou: {e}", "debug")
 
-    # 5) get_status() com 'peer_count'
+    # ---------- 5) p2p.get_status() ----------
     fn = getattr(p2p, "get_status", None)
     if callable(fn):
         try:
             st = fn()
             if isinstance(st, dict):
-                n = st.get("peer_count") or st.get("peers")
-                return _extract_peer_count(n), "p2p.get_status"
-        except Exception:
-            pass
+                # tenta 'peer_count' primeiro, depois 'peers'
+                n_raw = st.get("peer_count")
+                if n_raw is None:
+                    n_raw = st.get("peers")
+                n = _extract_peer_count(n_raw)
+                return n, "p2p.get_status"
+            # se não for dict, tenta normalizar
+            return _extract_peer_count(st), "p2p.get_status"
+        except TypeError as e:
+            # [FIX] Este é o erro que aparecia no log:
+            # "a bytes-like object is required, not 'NoneType'"
+            if _is_p2p_type_error(e):
+                _log(
+                    "p2p.get_status() bug interno (compare_digest com None) "
+                    "— ignorado; p2p_unified precisa de patch",
+                    "debug",
+                )
+            else:
+                _log(f"p2p.get_status() TypeError: {e}", "debug")
+        except Exception as e:
+            _log(f"p2p.get_status() falhou: {e}", "debug")
 
     return 0, ""
 
 
+def _count_peers_via_api(p2p) -> Tuple[int, str]:
+    """
+    Igual a _count_peers_via_api_raw, mas com cache curto (CACHE_MS).
+    Evita que o loop do miner_loop spame logs idênticos a cada 500ms.
+    """
+    global _cache
+
+    now = time.monotonic()
+    with _cache_lock:
+        if _cache is not None:
+            ts, n, api = _cache
+            if (now - ts) * 1000 < CACHE_MS:
+                return n, api
+
+    # Cache expirado (ou vazio) → consulta real
+    n, api = _count_peers_via_api_raw(p2p)
+
+    with _cache_lock:
+        _cache = (now, n, api)
+    return n, api
+
+
+# ============================================================
+# ALTURA MÁXIMA DE PEERS
+# ============================================================
 def _peer_height_max(p2p) -> int:
     """
     Tenta descobrir a altura máxima entre os peers.
     Retorna 0 se não conseguir.
+
+    [FIX v3] Try/except granular por peer — um peer corrompido
+    não invalida a leitura dos outros.
     """
     if p2p is None:
         return 0
 
+    heights: list[int] = []
+
+    # ---------- via atributo peers / peer_status ----------
     for attr in ("peers", "peer_status"):
         peers_attr = getattr(p2p, attr, None)
-        if isinstance(peers_attr, dict):
-            heights = []
-            for v in peers_attr.values():
+        if not isinstance(peers_attr, dict):
+            continue
+
+        for v in peers_attr.values():
+            try:
                 if isinstance(v, dict):
                     h = v.get("height")
-                    if isinstance(h, int):
+                    if isinstance(h, int) and not isinstance(h, bool):
                         heights.append(h)
                 elif hasattr(v, "height"):
-                    try:
-                        heights.append(int(v.height))
-                    except Exception:
-                        pass
-            if heights:
-                return max(heights)
+                    hv = getattr(v, "height", None)
+                    if isinstance(hv, int) and not isinstance(hv, bool):
+                        heights.append(hv)
+            except Exception:
+                # um peer mau não invalida os outros
+                continue
 
+        if heights:
+            return max(heights)
+
+    # ---------- via get_status() ----------
     fn = getattr(p2p, "get_status", None)
     if callable(fn):
         try:
             st = fn()
             if isinstance(st, dict):
-                h = st.get("max_peer_height") or st.get("peer_height_max")
-                if isinstance(h, int):
-                    return h
-        except Exception:
-            pass
+                for key in ("max_peer_height", "peer_height_max"):
+                    h = st.get(key)
+                    if isinstance(h, int) and not isinstance(h, bool):
+                        return h
+        except TypeError as e:
+            if _is_p2p_type_error(e):
+                _log("_peer_height_max: p2p.get_status() bug NoneType", "debug")
+        except Exception as e:
+            _log(f"_peer_height_max: {e}", "debug")
 
     return 0
 
@@ -180,9 +284,12 @@ def _peer_height_max(p2p) -> int:
 # ============================================================
 def reset() -> None:
     """Chamar quando p2p inicia/para. Idempotente e thread-safe."""
-    global _first_peer_ts, _api_warned
+    global _first_peer_ts, _api_warned, _cache
     with _lock:
         _first_peer_ts = None
+    with _cache_lock:
+        _cache = None
+    # _api_warned não é resetado — evita re-logar o mesmo erro N vezes
 
 
 def force_allow() -> None:
@@ -233,19 +340,20 @@ def pode_minerar(p2p) -> Tuple[bool, str]:
     if ALLOW_SOLO:
         return True, "BRN_ALLOW_SOLO_MINING=1 (dev mode)"
 
-    # 3) Conta peers
+    # 3) Conta peers (com cache)
     n, api_used = _count_peers_via_api(p2p)
 
     if not api_used:
+        # Nenhuma API funcionou — loga UMA vez e bloqueia
         with _lock:
             warned = _api_warned
             _api_warned = True
         if not warned:
             _log(
                 "Nenhuma API de listagem de peers encontrada em p2p. "
-                "Mineração ficará BLOQUEADA até corrigir. "
-                "Esperado: p2p.listar_peers() / p2p.discovery.listar_peers() "
-                "/ p2p.get_peers() / p2p.peers / p2p.get_status()",
+                "Mineração BLOQUEADA. Esperado: p2p.listar_peers() / "
+                "p2p.discovery.listar_peers() / p2p.get_peers() / "
+                "p2p.peers / p2p.get_status()",
                 "error",
             )
         return False, "sem API de listagem de peers em p2p"
@@ -260,17 +368,14 @@ def pode_minerar(p2p) -> Tuple[bool, str]:
     if MIN_PEER_HEIGHT > 0:
         h = _peer_height_max(p2p)
         if h < MIN_PEER_HEIGHT:
-            return False, (
-                f"peer com altura baixa ({h} < {MIN_PEER_HEIGHT})"
-            )
+            return False, f"peer com altura baixa ({h} < {MIN_PEER_HEIGHT})"
 
-    # 6) Estabilização
+    # 6) Estabilização (peer precisa estar visível N segundos)
     with _lock:
         if _first_peer_ts is None:
             _first_peer_ts = time.time()
             return False, (
-                f"peer detectado, aguardando estabilizar "
-                f"({MIN_PEER_STABLE}s)"
+                f"peer detectado, aguardando estabilizar ({MIN_PEER_STABLE}s)"
             )
         elapsed = time.time() - _first_peer_ts
 
@@ -290,14 +395,17 @@ def pode_minerar(p2p) -> Tuple[bool, str]:
 def status(p2p=None) -> dict:
     """
     Snapshot do estado atual. Útil para UI / health check.
-    Se p2p for passado, conta peers na hora.
+    Se p2p for passado, conta peers na hora (sem cache).
     """
     with _lock:
         first_ts = _first_peer_ts
         force = _force
         warned = _api_warned
 
-    n, api_used = _count_peers_via_api(p2p) if p2p is not None else (0, "")
+    if p2p is not None:
+        n, api_used = _count_peers_via_api_raw(p2p)
+    else:
+        n, api_used = 0, ""
 
     elapsed = int(time.time() - first_ts) if first_ts else 0
     wait_remaining = 0
@@ -305,15 +413,16 @@ def status(p2p=None) -> dict:
         wait_remaining = MIN_PEER_STABLE - elapsed
 
     return {
-        "allow_solo": ALLOW_SOLO,
-        "min_peer_stable": MIN_PEER_STABLE,
-        "min_peer_height": MIN_PEER_HEIGHT,
-        "force_override": force,
-        "api_warned": warned,
-        "peers_count": n,
-        "api_used": api_used or "(nenhuma)",
-        "first_peer_ts": first_ts,
-        "stable_for_s": elapsed,
+        "allow_solo":       ALLOW_SOLO,
+        "min_peer_stable":  MIN_PEER_STABLE,
+        "min_peer_height":  MIN_PEER_HEIGHT,
+        "cache_ms":         CACHE_MS,
+        "force_override":   force,
+        "api_warned":       warned,
+        "peers_count":      n,
+        "api_used":         api_used or "(nenhuma)",
+        "first_peer_ts":    first_ts,
+        "stable_for_s":     elapsed,
         "wait_remaining_s": wait_remaining,
     }
 
@@ -321,10 +430,11 @@ def status(p2p=None) -> dict:
 def info() -> dict:
     """Config resolvida (sem consultar p2p)."""
     return {
-        "allow_solo": ALLOW_SOLO,
+        "allow_solo":      ALLOW_SOLO,
         "min_peer_stable": MIN_PEER_STABLE,
         "min_peer_height": MIN_PEER_HEIGHT,
-        "force": _force,
+        "cache_ms":        CACHE_MS,
+        "force":           _force,
     }
 
 
@@ -345,5 +455,5 @@ if __name__ == "__main__":
 
     print("Uso:")
     print("  python network_guard.py --info     # config")
-    print("  python network_guard.py --status   # estado atual")
+    print("  python network_guard.py --status   # estado atual (sem p2p)")
     sys.exit(0)

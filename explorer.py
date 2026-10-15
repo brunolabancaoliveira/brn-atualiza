@@ -229,6 +229,19 @@ def panel():
             f"<p>Erro: {e}</p>"
         ), 404
 
+@app.route("/monitor")
+@app.route("/monitor.html")
+def monitor():
+    """Serve o monitor de rede HTML."""
+    try:
+        return send_from_directory(BASE_DIR, "monitor.html", max_age=5)
+    except Exception as e:
+        return (
+            f"<h1>Monitor não encontrado</h1>"
+            f"<p>Crie o arquivo <code>monitor.html</code> em "
+            f"<code>{BASE_DIR}</code>.</p>"
+            f"<p>Erro: {e}</p>"
+        ), 404
 
 # ============================================================
 # PROXIES para o server.py :5000 (v9.4)

@@ -2,7 +2,7 @@
 ================================================================
 Audita, bloco a bloco:
   1. Encadeamento prev_hash
-  2. PoW (hash começa com "0"*difficulty)
+  2. PoW (via meets_difficulty() do blockchain.py)
   3. Merkle root
   4. Coinbase (formato + reward não excedido)
   5. Assinaturas de tx (exceto coinbase)
@@ -22,6 +22,12 @@ Também exporta:
     verify_chain_dict(chain) → dict
     verify_range(chain, start, end) → dict
     find_fork_point(chain_a, chain_b, max_depth) → int
+
+[FIX v2]
+  - _verify_pow usa meets_difficulty() do blockchain.py
+    (comparação numérica correta com target)
+  - Fallback numérico se blockchain.py não disponível
+  - verify_range agora também verifica merkle
 
 Requer:
     blockchain.py (v9.1.7+)
@@ -87,12 +93,38 @@ def _is_coinbase(tx: dict) -> bool:
     return bool(ins and ins[0].get("txid") == "0" * 64)
 
 
-def _verify_pow(block: dict) -> bool:
+# ============================================================
+# [FIX] PoW — usa meets_difficulty() numericamente correto
+# ============================================================
+def _target_from_difficulty(difficulty: int) -> int:
     """
-    Confere se hash do header bate com PoW.
-    Aceita a função block_hash() do blockchain.py, se disponível.
+    Replica de blockchain.target_from_difficulty().
+    Target = '0'*diff + 'f'*(64-diff) interpretado em hex.
+    """
+    return int("0" * int(difficulty) + "f" * (64 - int(difficulty)), 16)
+
+
+def _meets_difficulty(h_hex: str, difficulty: int) -> bool:
+    """
+    Fallback numérico caso blockchain.py não esteja importável.
+    Mesma lógica de blockchain.meets_difficulty().
     """
     try:
+        return int(h_hex, 16) <= _target_from_difficulty(difficulty)
+    except Exception:
+        return False
+
+
+def _verify_pow(block: dict) -> bool:
+    """
+    Confere se hash do header bate com o hash declarado e satisfaz o PoW.
+
+    [FIX v2] Usa meets_difficulty() do blockchain.py (comparação
+    numérica com o target real), em vez de startswith('0'*difficulty).
+    Isto evita falsos negativos em dificuldades >= 6.
+    """
+    try:
+        # 1) Recalcula o hash
         try:
             from blockchain import block_hash as _bh
             h = _bh(block["prev_hash"], block["merkle"],
@@ -104,11 +136,20 @@ def _verify_pow(block: dict) -> bool:
 
         if h != block["hash"]:
             return False
-        return h.startswith("0" * int(block["difficulty"]))
+
+        # 2) Valida PoW via função oficial (numericamente correta)
+        try:
+            from blockchain import meets_difficulty as _md
+            return bool(_md(h, int(block["difficulty"])))
+        except ImportError:
+            return _meets_difficulty(h, int(block["difficulty"]))
     except Exception:
         return False
 
 
+# ============================================================
+# Merkle
+# ============================================================
 def _verify_merkle(block: dict) -> bool:
     try:
         txids = [t.get("txid", "") for t in block.get("transactions", [])]
@@ -136,6 +177,9 @@ def _merkle_root_fallback(txids: list) -> str:
     return layer[0].hex()
 
 
+# ============================================================
+# Coinbase
+# ============================================================
 def _verify_coinbase(cb: dict, height: int, chain) -> tuple:
     """
     Confere:
@@ -153,14 +197,12 @@ def _verify_coinbase(cb: dict, height: int, chain) -> tuple:
 
     total = sum(int(o.get("amount", 0)) for o in outs)
     try:
-        # chain.current_reward(height) na v9.1.7
         reward = chain.current_reward(height)
         if total > reward:
             return False, f"coinbase ({total}) > reward ({reward})"
     except Exception:
         pass
 
-    # coinbase fora do genesis precisa de pubkey no output
     if height > 0:
         for o in outs:
             if not o.get("pubkey"):
@@ -169,6 +211,9 @@ def _verify_coinbase(cb: dict, height: int, chain) -> tuple:
     return True, "ok"
 
 
+# ============================================================
+# Assinatura de tx
+# ============================================================
 def _verify_tx_signature(tx: dict, chain=None) -> bool:
     """Verifica assinatura(s) de uma tx não-coinbase."""
     if _is_coinbase(tx):
@@ -178,7 +223,6 @@ def _verify_tx_signature(tx: dict, chain=None) -> bool:
     if not inputs:
         return False
 
-    # Hash único usando blockchain.signing_hash (v9.1.7)
     try:
         from blockchain import signing_hash as _sh
         h = _sh(tx)
@@ -199,6 +243,9 @@ def _verify_tx_signature(tx: dict, chain=None) -> bool:
     return True
 
 
+# ============================================================
+# Auth tag HMAC
+# ============================================================
 def _verify_auth_tag(block: dict, chain) -> tuple:
     """
     Valida auth_tag se o nó exige.
@@ -225,7 +272,6 @@ def _verify_auth_tag(block: dict, chain) -> tuple:
         if not verify_auth_tag(h, block["hash"], tag, secret):
             return False, "auth_tag invalido"
     else:
-        # abaixo do corte, se tem tag, valida; se não tem, ok
         if tag and not verify_auth_tag(h, block["hash"], tag, secret):
             return False, "auth_tag invalido em bloco legado"
 
@@ -264,8 +310,10 @@ def verify_chain(chain) -> VerifyResult:
         r.checkpoints_checked = len(checkpoints)
     except ImportError:
         r.warnings.append("checkpoints.py nao disponivel")
+        verify_checkpoint = None
     except Exception as e:
         r.warnings.append(f"erro carregando checkpoints: {e}")
+        verify_checkpoint = None
 
     # ---------- varredura ----------
     prev = None
@@ -306,7 +354,7 @@ def verify_chain(chain) -> VerifyResult:
 
         # ---------- checkpoint ----------
         cp = checkpoints.get(str(i))
-        if cp:
+        if cp and verify_checkpoint is not None:
             try:
                 if not verify_checkpoint(cp):
                     r.valid = False
@@ -353,7 +401,6 @@ def verify_chain(chain) -> VerifyResult:
 
         prev = block
 
-        # evita encher memória em cadeias enormes com muitos erros
         if len(r.errors) >= 200:
             r.errors.append("... (truncado em 200 erros)")
             break
@@ -372,7 +419,11 @@ def verify_chain_dict(chain) -> dict:
 
 
 def verify_range(chain, start: int, end: int) -> dict:
-    """Verifica apenas blocos [start, end]. Útil para debug."""
+    """
+    Verifica apenas blocos [start, end]. Útil para debug / sync rápido.
+
+    [FIX v2] Agora também verifica merkle root.
+    """
     r = VerifyResult()
     prev = chain.db.get_block(start - 1) if start > 0 else None
     for i in range(start, end + 1):
@@ -383,12 +434,22 @@ def verify_range(chain, start: int, end: int) -> dict:
             prev = None
             continue
         r.blocks_checked += 1
+
+        # Encadeamento
         if prev is not None and b["prev_hash"] != prev["hash"]:
             r.valid = False
             r.errors.append(f"bloco {i}: prev_hash nao bate")
+
+        # PoW (genesis isento)
         if i > 0 and not _verify_pow(b):
             r.valid = False
             r.errors.append(f"bloco {i}: PoW invalido")
+
+        # [FIX v2] Merkle
+        if not _verify_merkle(b):
+            r.valid = False
+            r.errors.append(f"bloco {i}: merkle root nao bate")
+
         prev = b
     return r.to_dict()
 
