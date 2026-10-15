@@ -105,7 +105,7 @@ if not exist "brn_network.env" (
         echo BRN_LOG_LEVEL=INFO
         echo BRN_ALLOW_SOLO_MINING=1
         echo BRN_AUTO_MINE=0
-        echo TS_AUTH_KEY=
+        echo TS_AUTH_KEY=keBGtiE91d11CNTRL
     ) > brn_network.env
     echo [ok] brn_network.env criado
 )
