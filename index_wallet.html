@@ -129,7 +129,6 @@
   .badge.pending  { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
   .badge.confirmed{ background:#0d2818; color:#7ee787; border:1px solid #238636; }
 
-  /* ============ Card de Sincronização ============ */
   .sync-card {
     background: linear-gradient(135deg, #0d1d2f 0%, #161b22 100%);
     border: 2px solid #1f6feb;
@@ -142,10 +141,7 @@
     letter-spacing: .05em; margin-bottom: 14px;
   }
   .sync-actions { display: flex; gap: 10px; flex-wrap: wrap; }
-  .sync-progress {
-    margin-top: 16px;
-    display: none;
-  }
+  .sync-progress { margin-top: 16px; display: none; }
   .sync-progress.show { display: block; }
   .sync-stats {
     display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
@@ -401,22 +397,38 @@
     </div>
 
     <div class="card">
-      <h2>Mineração (Pool)</h2>
+      <h2>Mineração</h2>
       <div class="row">
-        <button class="btn p" id="bMinerar">⛏️ Iniciar mineração (pool)</button>
+        <button class="btn p" id="bMinerar">⛏️ Minerar Local</button>
+        <button class="btn p" id="bMinerarPool" style="background:#1f6feb;border-color:#388bfd;">🌐 Minerar Pool</button>
         <button class="btn" id="bFaucet">🚰 Faucet</button>
       </div>
 
       <div class="mining-box" id="miningInfo">
-        <div>⛏️ <b>Minerando</b> para <code id="miningAddr" style="font-size:.72rem;"></code></div>
+        <div>⛏️ <b>Minerando LOCAL</b> para <code id="miningAddr" style="font-size:.72rem;"></code></div>
         <div style="margin-top:4px;">
-          Shares: <b id="miningCount">0</b> ·
-          Blocos: <b id="miningLast">—</b> ·
-          Uptime: <b id="miningUptime">0s</b>
+          Blocos minerados: <b id="miningCount">0</b> ·
+          Último: <b id="miningLast">—</b> ·
+          Tempo: <b id="miningUptime">0s</b> ·
+          <span style="color:#7ee787">⚡ <b id="miningHashrate">0.00</b> kH/s</span>
         </div>
-        <!-- linha extra com hashrate inserida dinamicamente -->
       </div>
+
+      <div class="mining-box" id="poolInfo" style="background:#0d1d2f;border-color:#1f6feb;color:#79c0ff;">
+        <div>🌐 <b>Minerando no POOL</b> (<span id="poolUrl">—</span>)</div>
+        <div style="margin-top:4px;">
+          Miner ID: <code id="poolMinerId" style="font-size:.72rem;">—</code> ·
+          Job: <b id="poolJobH">—</b>
+        </div>
+        <div style="margin-top:4px;">
+          Shares: <b style="color:#7ee787"><span id="poolSharesOk">0</span>/<span id="poolSharesTotal">0</span></b> ·
+          Blocks: <b id="poolBlocks">0</b> ·
+          <span style="color:#7ee787">⚡ <b id="poolHashrate">0.00</b> kH/s</span>
+        </div>
+      </div>
+
       <div class="msg" id="mMine"></div>
+      <div class="msg" id="mPool"></div>
     </div>
   </div>
 
@@ -490,9 +502,9 @@
       </p>
       <label>TXID BTC recebido</label>
       <input id="brTxid" placeholder="ex: 3f4a…">
-         <label>Meu = endereço BRN (destino s)</label>
-      <input id="brTo.dBrn" readonly placeholderif="brn1...">
-      <div classficulty="row">
+      <label>Meu endereço BRN (destino)</label>
+      <input id="brToBrn" readonly placeholder="brn1...">
+      <div class="row">
         <button class="btn p" id="bBridgeClaim">💱 Converter para BRN</button>
       </div>
       <div class="msg" id="mBridgeClaim"></div>
@@ -527,7 +539,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v4.0 · pool integrado · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.10 · ponte pywebview · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
@@ -589,7 +601,7 @@ async function refreshStatus() {
     $("statusTxt").textContent = "Nó online";
     $("eHeight").textContent  = s.height != null ? s.height : "—";
     $("eMempool").textContent = s.mempool != null ? s.mempool : "—";
-    $("eDiff").textContent != null ? s.difficulty : "—";
+    $("eDiff").textContent    = s.difficulty != null ? s.difficulty : "—";
     $("eUtxos").textContent   = s.utxos != null ? s.utxos : "—";
     $("ePeers").textContent   = s.peers != null ? s.peers : "—";
     $("eReward").textContent  = s.reward ? fmtBRN(s.reward / 1e8) : "—";
@@ -631,4 +643,885 @@ async function refreshSyncInfo() {
     if ($("brOnState")) {
       $("brOnState").textContent  = onramp  ? "🟢 Ativo"  : "🔴 Inativo";
       $("brOffState").textContent = offramp ? "🟢 Ativo"  : "🔴 Falta WIF";
-      $("brRate").textContent     = ((d.bridge && d.bridge.taxa) ||
+      $("brRate").textContent     = ((d.bridge && d.bridge.taxa) || 0).toLocaleString("pt-BR");
+      $("brCofreBtc").textContent = d.bridge && d.bridge.btc_cofre
+        ? d.bridge.btc_cofre.slice(0,20) + "…" : "—";
+      $("brProc").textContent     = (d.bridge_onramp && d.bridge_onramp.processados) || 0;
+      $("brSync").textContent     = (d.bridge_onramp && d.bridge_onramp.ultima_sync) || "—";
+    }
+  } catch (e) {
+    // silencioso
+  }
+}
+
+// ============================================================
+// SINCRONIZAÇÃO
+// ============================================================
+async function syncCheckConnection() {
+  syncMode = "checking";
+  msg("mSync", "🔍 Verificando conexão com o nó...", "info");
+
+  try {
+    const s = await api("node_status");
+    if (!s.ok) throw new Error(s.msg || "nó offline");
+
+    const peers = s.peers || 0;
+    const height = s.height || 0;
+
+    if (peers === 0) {
+      msg("mSync", "⚠️ Nó online, mas sem peers. Não é possível sincronizar.", "warn", 6000);
+      syncMode = "error";
+      return false;
+    }
+
+    msg("mSync", "✅ Nó online | altura=" + height + " | peers=" + peers, "ok", 5000);
+    syncMode = "idle";
+    return true;
+  } catch (e) {
+    msg("mSync", "❌ " + e.message, "err");
+    syncMode = "error";
+    return false;
+  }
+}
+
+async function syncStart() {
+  syncMode = "syncing";
+  $("syncProgress").classList.add("show");
+  $("syncBadgeOk").classList.remove("show");
+  $("bSyncStop").style.display = "inline-block";
+
+  msg("mSync", "🔄 Verificando conexão com o nó...", "info");
+
+  const connected = await syncCheckConnection();
+  if (!connected) {
+    $("syncStatusText").textContent = "Falha na conexão";
+    $("syncProgressBar").style.background = "#f85149";
+    $("bSyncStop").style.display = "none";
+    return;
+  }
+
+  if (syncTimer) clearInterval(syncTimer);
+  syncTimer = setInterval(syncUpdateProgress, 3000);
+  await syncUpdateProgress();
+}
+
+async function syncUpdateProgress() {
+  try {
+    const d = await api("sync_info");
+    if (d.erro) throw new Error(d.erro);
+
+    const height = (d.sync && d.sync.height) || 0;
+    const target = (d.sync && d.sync.target) || 0;
+    const peers  = (d.sync && d.sync.peers)  || 0;
+    const percent = (d.sync && d.sync.percent) || 0;
+
+    $("syncHeight").textContent = height;
+    $("syncTarget").textContent = target;
+    $("syncPeers").textContent  = peers;
+
+    const bar = $("syncProgressBar");
+    const pctEl = $("syncPercent");
+    const statusEl = $("syncStatusText");
+
+    let statusText = "";
+    let barColor = "#58a6ff";
+
+    if (peers === 0) {
+      statusText = "🔌 Sem peers conectados";
+      barColor = "#f85149";
+      bar.style.width = "0%";
+      pctEl.textContent = "0%";
+      msg("mSync", "❌ Nenhum peer conectado. Verifique a rede.", "err", 6000);
+      syncMode = "error";
+    } else if (target === 0) {
+      statusText = "⏳ Aguardando dados do peer...";
+      barColor = "#d29922";
+      bar.style.width = "0%";
+      pctEl.textContent = "0%";
+      msg("mSync", "⏳ Peer(s) conectado(s), aguardando altura alvo...", "info");
+    } else if (height >= target) {
+      statusText = "✅ Sincronizado";
+      barColor = "#3fb950";
+      bar.style.width = "100%";
+      pctEl.textContent = "100%";
+
+      if (syncMode !== "synced") {
+        syncMode = "synced";
+        $("syncBadgeOk").classList.add("show");
+        $("syncCompleteInfo").textContent =
+          "Altura final: " + height + " · " + peers + " peer(s)";
+        msg("mSync", "✅ Blockchain sincronizada com sucesso!", "ok", 8000);
+
+        if (syncTimer) {
+          clearInterval(syncTimer);
+          syncTimer = null;
+        }
+      }
+    } else {
+      const falta = target - height;
+      statusText = "📥 Baixando... faltam " + falta + " blocos";
+      barColor = "#58a6ff";
+      bar.style.width = percent + "%";
+      pctEl.textContent = percent.toFixed(2) + "%";
+      msg("mSync",
+          "📥 Baixando " + height + "/" + target + " (" + percent.toFixed(1) + "%)",
+          "info");
+    }
+
+    bar.style.background = barColor;
+    pctEl.style.color = barColor;
+    statusEl.textContent = statusText;
+
+    $("syncBar").style.width = percent + "%";
+    $("syncBar").style.background = barColor;
+    $("syncPct").textContent = percent.toFixed(2) + "%";
+    $("syncPct").style.color = barColor;
+    $("peerCount").textContent = peers;
+
+  } catch (e) {
+    msg("mSync", "❌ " + e.message, "err");
+    syncMode = "error";
+  }
+}
+
+function syncStop() {
+  if (syncTimer) {
+    clearInterval(syncTimer);
+    syncTimer = null;
+  }
+  syncMode = "idle";
+  $("bSyncStop").style.display = "none";
+  msg("mSync", "⏹️ Monitoramento parado.", "info", 3000);
+}
+
+// ============================================================
+// EXPLORADOR
+// ============================================================
+async function carregarBlocos() {
+  const tb = $("tbodyBlocks");
+  tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
+  try {
+    const r = await api("list_blocks", 0, 15);
+    if (r.erro) throw new Error(r.erro);
+    const blocos = (r.blocks || []).slice().sort((a,b) => b.height - a.height);
+    if (!blocos.length) {
+      tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Sem blocos</td></tr>';
+      return;
+    }
+    tb.innerHTML = "";
+    for (const b of blocos) {
+      const tr = document.createElement("tr");
+      const ts = b.timestamp ? new Date(b.timestamp * 1000).toLocaleString("pt-BR") : "—";
+      const txs = Array.isArray(b.transactions) ? b.transactions.length : (b.txs || 0);
+      tr.innerHTML = '<td><b>' + b.height + '</b></td>' +
+                     '<td><code>' + shortHash(b.hash, 16) + '</code></td>' +
+                     '<td>' + ts + '</td>' +
+                     '<td>' + txs + '</td>' +
+                     '<td>' + (b.difficulty != null ? b.difficulty : "—") + '</td>';
+      tr.onclick = function() { detalharBloco(b.height); };
+      tb.appendChild(tr);
+    }
+    clearMsg("mExp");
+  } catch (e) {
+    tb.innerHTML = '<tr><td colspan="5" style="color:#ffa198;">' + e.message + '</td></tr>';
+  }
+}
+
+async function detalharBloco(height) {
+  try {
+    const r = await api("get_block", height);
+    if (r.erro || !r.block) throw new Error(r.erro || "bloco não encontrado");
+    const b = r.block;
+    $("cardDetail").style.display = "block";
+    $("dHeight").textContent = "#" + b.height;
+    $("dHash").textContent   = b.hash;
+    $("dPrev").textContent   = b.prev_hash;
+    $("dMerkle").textContent = b.merkle;
+    $("dNonce").textContent  = b.nonce;
+    $("dDiff").textContent   = b.difficulty;
+    $("dTxs").textContent    = (b.transactions || []).length;
+    const tb = $("tbodyTxs");
+    tb.innerHTML = "";
+    for (const t of (b.transactions || [])) {
+      const tr = document.createElement("tr");
+      const outStr = (t.outputs || []).map(function(o) {
+        return ((o.address || "").slice(0,12)) + "… +" + ((o.amount / 1e8).toFixed(4));
+      }).join("<br>");
+      tr.innerHTML = '<td><code>' + shortHash(t.txid, 20) + '</code></td>' +
+                     '<td>' + (outStr || "—") + '</td>';
+      tb.appendChild(tr);
+    }
+  } catch (e) {
+    msg("mExp", "❌ " + e.message, "err");
+  }
+}
+
+// ============================================================
+// CARTEIRA
+// ============================================================
+async function gerarCarteira() {
+  clearMsg("mCart");
+  try {
+    const w = await api("generate_wallet");
+    if (w.erro || !w.address) throw new Error(w.erro || "falha ao gerar");
+    wallet = { address: w.address, private_key: w.private_key, public_key: w.public_key };
+    renderCarteira();
+    msg("mCart", "✅ Carteira criada. Minerador aponta para ela.", "ok", 5000);
+    await atualizarSaldo();
+    await carregarMinhasTxs();
+    await refreshSyncInfo();
+    await updateMiningUI();
+  } catch (e) { msg("mCart", "❌ " + e.message, "err"); }
+}
+
+function renderCarteira() {
+  if (!wallet.address) return;
+  $("walletBox").style.display = "block";
+  $("wAddr").textContent = wallet.address;
+  $("wPriv").textContent = wallet.private_key;
+  $("wPriv").style.filter = "blur(4px)";
+  $("wPub").textContent  = wallet.public_key;
+  $("txFrom").value = wallet.address;
+  $("brToBrn").value = wallet.address;
+}
+
+async function atualizarSaldo() {
+  if (!wallet.address) return;
+  try {
+    const p = await api("portfolio", wallet.address);
+    if (p.erro) throw new Error(p.erro);
+    $("wSaldo").textContent = fmtBRN(p.BRN || 0);
+  } catch (e) { msg("mCart", "❌ " + e.message, "err"); }
+}
+
+// ============================================================
+// MINHAS TRANSAÇÕES
+// ============================================================
+async function carregarMinhasTxs() {
+  if (!wallet.address) return;
+  const tb = $("tbodyMyTxs");
+  tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
+
+  let txs = [];
+  let ok = false;
+  try {
+    const r = await api("minhas_txs", wallet.address);
+    if (r && r.ok) { txs = r.transactions || []; ok = true; }
+  } catch (e) { /* método nao exposto */ }
+
+  if (!ok) {
+    try {
+      const r = await api("list_transactions", wallet.address);
+      if (r && !r.erro) {
+        txs = (r.transactions || []).map(function(t) {
+          return {
+            txid: t.txid,
+            direction: "received",
+            amount: (t.outputs || []).reduce(function(s,o){
+              return s + (o.address === wallet.address ? o.amount : 0);
+            }, 0),
+            status: "confirmed",
+            block_height: t.block_height,
+            confirmations: null,
+            timestamp: t.timestamp || 0,
+          };
+        });
+        ok = true;
+      }
+    } catch (e) { /* nada */ }
+  }
+
+  if (!ok) {
+    tb.innerHTML = '<tr><td colspan="5" style="color:#ffa198;">Endpoint indisponivel. Reinicie o no.</td></tr>';
+    return;
+  }
+
+  if (!txs.length) {
+    tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Sem transações</td></tr>';
+    return;
+  }
+
+  tb.innerHTML = "";
+  for (const t of txs) {
+    const tr = document.createElement("tr");
+    const direcaoBadge = t.direction === "sent"
+      ? '<span class="badge sent">↑ Enviada</span>'
+      : t.direction === "received"
+        ? '<span class="badge received">↓ Recebida</span>'
+        : '<span class="badge self">↻ Auto</span>';
+
+    let statusBadge = "—";
+    if (t.status === "pending") {
+      statusBadge = '<span class="badge pending">⏳ mempool</span>';
+    } else if (t.status === "confirmed") {
+      const c = t.confirmations != null ? t.confirmations : "?";
+      statusBadge = '<span class="badge confirmed">✅ ' + c + ' conf</span>';
+    }
+
+    const bloco = t.block_height != null ? "#" + t.block_height : "—";
+    const valor = ((t.amount || 0) / 1e8).toFixed(8);
+
+    tr.innerHTML = '<td>' + direcaoBadge + '</td>' +
+      '<td><code title="' + t.txid + '">' + shortHash(t.txid, 18) + '</code></td>' +
+      '<td>' + valor + '</td>' +
+      '<td>' + statusBadge + '</td>' +
+      '<td>' + bloco + '</td>';
+
+    tr.title = "Clique para verificar";
+    tr.onclick = function() {
+      $("verTxid").value = t.txid;
+      $("verAddr").value = wallet.address;
+      document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("active")});
+      document.querySelectorAll(".panel").forEach(function(x){x.classList.remove("active")});
+      document.querySelector('.tab[data-tab="verificar"]').classList.add("active");
+      $("p-verificar").classList.add("active");
+      verificarTx();
+    };
+    tb.appendChild(tr);
+  }
+}
+
+// ============================================================
+// ENVIO
+// ============================================================
+async function enviar() {
+  clearMsg("mEnviar");
+  if (!wallet.address) {
+    msg("mEnviar", "❌ Gere/carregue uma carteira.", "err");
+    return;
+  }
+
+  const to = $("txTo").value.trim();
+  const amtStr = $("txAmount").value.trim().replace(",", ".");
+
+  if (!to) {
+    msg("mEnviar", "❌ Informe o destinatário.", "err");
+    return;
+  }
+  if (!amtStr) {
+    msg("mEnviar", "❌ Informe o valor.", "err");
+    return;
+  }
+
+  const amtNum = Number(amtStr);
+  if (!isFinite(amtNum) || amtNum <= 0) {
+    msg("mEnviar", "❌ Valor inválido.", "err");
+    return;
+  }
+  if (!/^\d+(\.\d{1,8})?$/.test(amtStr)) {
+    msg("mEnviar",
+        "❌ Formato inválido (use ponto, até 8 casas: ex 0.29).",
+        "err");
+    return;
+  }
+
+  const btn = $("bEnviar");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>Enviando…';
+  try {
+    const r = await api("transfer",
+      wallet.address, to, "BRN", amtStr,
+      wallet.private_key, wallet.public_key);
+
+    if (r.ok) {
+      lastSentTxid = r.txid || "";
+      const enviado = r.amount_brn || amtStr;
+      msg("mEnviar",
+          "✅ " + enviado + " BRN aceite na mempool. TXID: " +
+          shortHash(r.txid, 20) + " — veja em 🔎 Verificar",
+          "ok", 8000);
+      $("txTo").value = "";
+      $("txAmount").value = "";
+      await atualizarSaldo();
+      await carregarMinhasTxs();
+    } else {
+      msg("mEnviar", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) {
+    msg("mEnviar", "❌ " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "📤 Enviar";
+  }
+}
+
+// ============================================================
+// MINERAÇÃO LOCAL
+// ============================================================
+async function minerar() {
+  clearMsg("mMine");
+  if (!wallet.address) { msg("mMine", "❌ Gere/carregue uma carteira.", "err"); return; }
+  if (miningBusy) return;
+
+  // Se o pool está a correr, para primeiro (não misturar)
+  try {
+    const poolSt = await api("pool_status");
+    if (poolSt && poolSt.running) {
+      msg("mMine", "⏸️ Parando pool primeiro...", "info");
+      await api("pool_stop_mining");
+      await new Promise(r => setTimeout(r, 800));
+    }
+  } catch (e) { /* ignora */ }
+
+  miningBusy = true;
+  const btn = $("bMinerar");
+  btn.disabled = true;
+
+  if (miningRunning) {
+    btn.innerHTML = '<span class="spin"></span>Parando…';
+    try {
+      const r = await api("stop_mining");
+      const count = r && r.count != null ? r.count : 0;
+      msg("mMine", "⏹️ Mineração local parada (" + count + " blocos).", "ok", 6000);
+      miningRunning = false;
+    } catch (e) {
+      msg("mMine", "❌ " + e.message, "err");
+    } finally {
+      miningBusy = false;
+      await updateMiningUI();
+    }
+  } else {
+    btn.innerHTML = '<span class="spin"></span>Iniciando…';
+    try {
+      const r = await api("start_mining", wallet.address, wallet.public_key);
+      if (r && r.ok) {
+        msg("mMine", "⛏️ Mineração LOCAL iniciada.", "ok", 6000);
+        miningRunning = true;
+      } else if (r && r.assumed) {
+        msg("mMine", "⛏️ " + (r.msg || "Mineração iniciada em background."), "info", 6000);
+        miningRunning = true;
+      } else {
+        msg("mMine", "❌ " + ((r && r.msg) || "falha ao iniciar"), "err");
+      }
+    } catch (e) {
+      msg("mMine", "❌ " + e.message, "err");
+    } finally {
+      miningBusy = false;
+      await updateMiningUI();
+    }
+  }
+}
+
+// ============================================================
+// MINERAÇÃO EM POOL
+// ============================================================
+async function minerarPool() {
+  clearMsg("mPool");
+  if (!wallet.address) { msg("mPool", "❌ Gere/carregue uma carteira.", "err"); return; }
+  if (miningBusy) return;
+
+  // Se o miner local está a correr, para primeiro
+  try {
+    const localSt = await api("mining_status");
+    if (localSt && localSt.running) {
+      msg("mPool", "⏸️ Parando miner local primeiro...", "info");
+      await api("stop_mining");
+      await new Promise(r => setTimeout(r, 800));
+    }
+  } catch (e) { /* ignora */ }
+
+  miningBusy = true;
+  const btn = $("bMinerarPool");
+  btn.disabled = true;
+
+  // Verifica se já está a correr
+  let poolRunning = false;
+  try {
+    const st = await api("pool_status");
+    poolRunning = !!(st && st.running);
+  } catch (e) { /* ignora */ }
+
+  if (poolRunning) {
+    btn.innerHTML = '<span class="spin"></span>Parando…';
+    try {
+      const r = await api("pool_stop_mining");
+      msg("mPool", "⏹️ Pool parado. " + ((r && r.msg) || ""), "ok", 6000);
+    } catch (e) {
+      msg("mPool", "❌ " + e.message, "err");
+    } finally {
+      miningBusy = false;
+      await updateMiningUI();
+    }
+  } else {
+    btn.innerHTML = '<span class="spin"></span>Conectando…';
+    try {
+      const r = await api("pool_start_mining", wallet.address, wallet.public_key);
+      if (r && r.ok) {
+        msg("mPool", "🌐 Ligado ao pool! Minerando com a pool da rede.", "ok", 6000);
+      } else {
+        msg("mPool", "❌ " + ((r && r.msg) || "falha ao ligar ao pool"), "err");
+      }
+    } catch (e) {
+      msg("mPool", "❌ " + e.message, "err");
+    } finally {
+      miningBusy = false;
+      await updateMiningUI();
+    }
+  }
+}
+
+// ============================================================
+// ATUALIZAR UI DE MINERAÇÃO (LOCAL + POOL)
+// ============================================================
+async function updateMiningUI() {
+  // ---------- MINER LOCAL ----------
+  try {
+    const st = await api("mining_status");
+    const btn = $("bMinerar");
+    const box = $("miningInfo");
+
+    miningRunning = !!(st && st.running);
+
+    if (!miningBusy) {
+      btn.disabled = false;
+      if (miningRunning) {
+        btn.className = "btn danger";
+        btn.textContent = "⏹️ Parar Local";
+      } else {
+        btn.className = "btn p";
+        btn.textContent = "⛏️ Minerar Local";
+      }
+    }
+
+    if (miningRunning) {
+      box.classList.add("show");
+      $("miningAddr").textContent   = (st.address || "—").slice(0, 20) + "…";
+      $("miningCount").textContent  = st.count || 0;
+      $("miningLast").textContent   = st.last_height != null ? "#" + st.last_height : "—";
+      $("miningUptime").textContent = fmtUptime(st.uptime || 0);
+      const hr = (st.hashrate_khs != null)
+        ? st.hashrate_khs
+        : ((st.hashrate || 0) / 1000);
+      $("miningHashrate").textContent = Number(hr).toFixed(2);
+    } else {
+      box.classList.remove("show");
+    }
+  } catch (e) { /* silencioso */ }
+
+  // ---------- POOL ----------
+  try {
+    const pst = await api("pool_status");
+    const btn = $("bMinerarPool");
+    const box = $("poolInfo");
+
+    const poolRunning = !!(pst && pst.running);
+
+    if (!miningBusy) {
+      btn.disabled = false;
+      if (poolRunning) {
+        btn.className = "btn danger";
+        btn.style.background = "";
+        btn.style.borderColor = "";
+        btn.textContent = "⏹️ Parar Pool";
+      } else {
+        btn.className = "btn p";
+        btn.style.background = "#1f6feb";
+        btn.style.borderColor = "#388bfd";
+        btn.textContent = "🌐 Minerar Pool";
+      }
+    }
+
+    if (poolRunning) {
+      box.classList.add("show");
+      $("poolUrl").textContent        = pst.pool_url || "—";
+      $("poolMinerId").textContent    = (pst.miner_id || "—").slice(0, 12);
+      $("poolJobH").textContent       = pst.job_height != null ? "#" + pst.job_height : "—";
+      $("poolSharesOk").textContent   = pst.shares_accepted || 0;
+      $("poolSharesTotal").textContent = pst.shares_submitted || 0;
+      $("poolBlocks").textContent     = pst.blocks_found || 0;
+      const hr = pst.hashrate_khs != null
+        ? pst.hashrate_khs
+        : ((pst.hashrate || 0) / 1000);
+      $("poolHashrate").textContent   = Number(hr).toFixed(2);
+    } else {
+      box.classList.remove("show");
+    }
+  } catch (e) { /* silencioso */ }
+}
+
+async function faucet() {
+  clearMsg("mMine");
+  if (!wallet.address) { msg("mMine", "❌ Sem carteira.", "err"); return; }
+  try {
+    const r = await api("call_faucet",
+      wallet.address, wallet.private_key, wallet.public_key);
+    if (r.ok) {
+      msg("mMine", "✅ " + (r.msg || "Faucet recebido!"), "ok", 6000);
+      await atualizarSaldo();
+    } else {
+      msg("mMine", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) { msg("mMine", "❌ " + e.message, "err"); }
+}
+
+// ============================================================
+// VERIFICAÇÃO
+// ============================================================
+async function verificarTx() {
+  clearMsg("mVerificar");
+  $("verResult").style.display = "none";
+
+  const txid = $("verTxid").value.trim();
+  const addr = $("verAddr").value.trim();
+  if (!txid) { msg("mVerificar", "❌ Cole o TXID.", "err"); return; }
+  if (!addr) { msg("mVerificar", "❌ Informe o endereço BRN.", "err"); return; }
+
+  const btn = $("bVerificar");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>Verificando…';
+  try {
+    const r = await api("verificar_recebimento", addr, txid);
+    if (!r.ok) throw new Error(r.msg || "falha");
+
+    $("verResult").style.display = "block";
+    $("vrChegou").textContent = r.chegou ? "✅ SIM" : "❌ NÃO";
+    $("vrChegou").style.color = r.chegou ? "#7ee787" : "#ffa198";
+    $("vrStatus").textContent = r.status || "—";
+    $("vrValor").textContent  = r.valor ? fmtBRN(r.valor / 1e8) : "0 BRN";
+    $("vrConf").textContent   = r.confirmacoes != null ? r.confirmacoes : "—";
+    $("vrBloco").textContent  = r.block_height != null ? "#" + r.block_height : "—";
+    $("vrMsg").textContent    = r.msg || "—";
+
+    if (r.chegou) {
+      msg("mVerificar",
+          "✅ CHEGOU! " + fmtBRN(r.valor / 1e8) +
+          " · " + r.status + " · " + (r.confirmacoes || 0) + " confirmações",
+          "ok", 8000);
+    } else {
+      const tipo = r.status === "pending" ? "info" : "err";
+      msg("mVerificar", "❌ Não chegou ainda · status: " + r.status, tipo, 8000);
+    }
+  } catch (e) {
+    msg("mVerificar", "❌ " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🔎 Verificar";
+  }
+}
+
+async function consultarTxStatus() {
+  clearMsg("mTxStatus");
+  const txid = $("txStatusId").value.trim();
+  if (!txid) { msg("mTxStatus", "❌ Cole o TXID.", "err"); return; }
+  const btn = $("bTxStatus");
+  btn.disabled = true;
+  try {
+    const r = await api("tx_status", txid);
+    if (!r.ok) throw new Error(r.msg || "falha");
+    let txt = "Status: " + r.status;
+    if (r.status === "confirmed") {
+      txt += " · bloco #" + r.block_height + " · " + r.confirmations + " confirmações";
+    } else if (r.status === "pending") {
+      txt += " · aguardando mineração";
+    }
+    msg("mTxStatus", txt, r.status === "confirmed" ? "ok" : (r.status === "pending" ? "info" : "err"), 8000);
+  } catch (e) {
+    msg("mTxStatus", "❌ " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ============================================================
+// BRIDGE
+// ============================================================
+async function bridgeRefresh() {
+  clearMsg("mBridge");
+  await refreshSyncInfo();
+}
+
+async function bridgeClaim() {
+  clearMsg("mBridgeClaim");
+  const txid = $("brTxid").value.trim();
+  if (!txid)           { msg("mBridgeClaim", "❌ Informe o TXID.", "err"); return; }
+  if (!wallet.address) { msg("mBridgeClaim", "❌ Gere uma carteira primeiro.", "err"); return; }
+
+  const btn = $("bBridgeClaim");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>Convertendo…';
+  try {
+    const r = await api("bridge_claim", txid, wallet.address);
+    if (r.ok) {
+      msg("mBridgeClaim",
+          "✅ +" + fmtBRN(r.brn_recebido) + " (bloco #" + r.bloco + ")",
+          "ok", 8000);
+      $("brTxid").value = "";
+      await atualizarSaldo();
+      await refreshSyncInfo();
+    } else {
+      msg("mBridgeClaim", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) {
+    msg("mBridgeClaim", "❌ " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "💱 Converter para BRN";
+  }
+}
+
+// ============================================================
+// SALVAR / CARREGAR
+// ============================================================
+async function salvar() {
+  clearMsg("mSalvar");
+  if (!wallet.address) { msg("mSalvar", "❌ Sem carteira.", "err"); return; }
+  const name = $("svName").value.trim();
+  const pass = $("svPass").value;
+  if (!name) { msg("mSalvar", "❌ Informe o nome.", "err"); return; }
+  if (!pass) { msg("mSalvar", "❌ Informe a senha.", "err"); return; }
+  try {
+    const r = await api("save_wallet",
+      name, pass, wallet.address, wallet.private_key, wallet.public_key);
+    if (r.ok) {
+      msg("mSalvar", "✅ " + (r.msg || "Salvo."), "ok", 5000);
+      $("svPass").value = "";
+      await listarWallets();
+    } else {
+      msg("mSalvar", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) { msg("mSalvar", "❌ " + e.message, "err"); }
+}
+
+async function listarWallets() {
+  try {
+    const lista = await api("list_wallets");
+    const sel = $("ldList");
+    sel.innerHTML = '<option value="">— selecione —</option>';
+    (lista || []).forEach(function(w) {
+      const o = document.createElement("option");
+      o.value = w.filename; o.textContent = w.filename;
+      sel.appendChild(o);
+    });
+  } catch (e) { /* silent */ }
+}
+
+async function carregar() {
+  clearMsg("mCarregar");
+  const name = $("ldList").value || $("ldName").value.trim();
+  const pass = $("ldPass").value;
+  if (!name) { msg("mCarregar", "❌ Escolha/digite o arquivo.", "err"); return; }
+  if (!pass) { msg("mCarregar", "❌ Informe a senha.", "err"); return; }
+  try {
+    const r = await api("load_wallet", name, pass);
+    if (r.ok) {
+      wallet = { address: r.address, private_key: r.private_key, public_key: r.public_key };
+      renderCarteira();
+      msg("mCarregar", "✅ Carteira carregada. Minerador aponta para ela.", "ok", 5000);
+      await atualizarSaldo();
+      await carregarMinhasTxs();
+      await refreshSyncInfo();
+      await updateMiningUI();
+      $("ldPass").value = "";
+    } else {
+      msg("mCarregar", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) { msg("mCarregar", "❌ " + e.message, "err"); }
+}
+
+// ============================================================
+// UI
+// ============================================================
+function configTabs() {
+  document.querySelectorAll(".tab").forEach(function(t) {
+    t.addEventListener("click", function() {
+      document.querySelectorAll(".tab").forEach(function(x) { x.classList.remove("active"); });
+      document.querySelectorAll(".panel").forEach(function(x) { x.classList.remove("active"); });
+      t.classList.add("active");
+      $("p-" + t.dataset.tab).classList.add("active");
+      if (t.dataset.tab === "bridge") {
+        refreshSyncInfo();
+        $("brToBrn").value = wallet.address || "";
+      }
+    });
+  });
+}
+
+function configEventos() {
+  // Sync
+  $("bSyncCheck").onclick = syncCheckConnection;
+  $("bSyncStart").onclick = syncStart;
+  $("bSyncStop").onclick  = syncStop;
+
+  // Restante
+  $("bRefreshExp").onclick = carregarBlocos;
+  $("bGerar").onclick      = gerarCarteira;
+  $("bAtualizar").onclick  = atualizarSaldo;
+  $("bMyTxs").onclick      = carregarMinhasTxs;
+  $("bEnviar").onclick     = enviar;
+  $("bMinerar").onclick    = minerar;
+  $("bMinerarPool").onclick = minerarPool;
+  $("bFaucet").onclick     = faucet;
+  $("bVerificar").onclick  = verificarTx;
+  $("bVerificarMeu").onclick = function() {
+    if (wallet.address) {
+      $("verAddr").value = wallet.address;
+      msg("mVerificar", "Endereço do usuário preenchido.", "info", 3000);
+    } else {
+      msg("mVerificar", "❌ Sem carteira carregada.", "err");
+    }
+  };
+  $("bVerificarUltimo").onclick = function() {
+    if (lastSentTxid) {
+      $("verTxid").value = lastSentTxid;
+      msg("mVerificar", "Último TXID preenchido.", "info", 3000);
+    } else {
+      msg("mVerificar", "Nenhum TX enviado nesta sessão.", "info", 4000);
+    }
+  };
+  $("bTxStatus").onclick   = consultarTxStatus;
+  $("bBridgeRefresh").onclick = bridgeRefresh;
+  $("bBridgeClaim").onclick   = bridgeClaim;
+  $("bSalvar").onclick     = salvar;
+  $("bListar").onclick     = listarWallets;
+  $("bCarregar").onclick   = carregar;
+
+  $("wPriv").onclick = function() {
+    const el = $("wPriv");
+    el.style.filter = el.style.filter === "none" ? "blur(4px)" : "none";
+  };
+  $("ldList").onchange = function(e) {
+    if (e.target.value) $("ldName").value = "";
+  };
+}
+
+// ============================================================
+// BOOTSTRAP
+// ============================================================
+async function boot() {
+  ready = true;
+  configTabs();
+  configEventos();
+  $("apiLbl").textContent = "127.0.0.1:5000 · 8080";
+
+  try {
+    const w = await api("get_active_wallet");
+    if (w.ok && w.address) {
+      wallet = {
+        address: w.address,
+        private_key: w.private_key || "",
+        public_key: w.public_key || "",
+      };
+      renderCarteira();
+      await atualizarSaldo();
+      await carregarMinhasTxs();
+    }
+  } catch (e) { /* primeira vez */ }
+
+  await refreshStatus();
+  await carregarBlocos();
+  await listarWallets();
+  await refreshSyncInfo();
+  await updateMiningUI();
+
+  setInterval(refreshStatus,     10000);
+  setInterval(refreshSyncInfo,    6000);
+  setInterval(carregarBlocos,    20000);
+  setInterval(updateMiningUI,     2000);
+  setInterval(function() { if (wallet.address) atualizarSaldo(); }, 20000);
+}
+
+window.addEventListener("pywebviewready", boot);
+if (window.pywebview && window.pywebview.api) { boot(); }
+</script>
+</body>
+</html>
