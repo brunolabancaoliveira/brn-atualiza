@@ -1,5 +1,5 @@
 """
-miner_loop.py — Loop de mineracao do BRN (v6.3)
+miner_loop.py — Loop de mineracao do BRN (v6.4)
 ================================================================
 API publica:
     get_miner(chain) -> Miner    (singleton)
@@ -7,6 +7,10 @@ API publica:
     Miner.stop()
     Miner.status() -> dict
 
+v6.4:
+  [FIX] nome do atributo de callback: on_block_mined (sem underscore)
+        — antes era _on_block_mined (que nao existe no blockchain.py)
+        — resultado: blocos minerados localmente NAO eram propagados P2P
 v6.3:
   [NEW] _should_continue() verifica chain._fork_signal
         Se o ChainSyncManager detectar fork, o miner aborta o bloco
@@ -286,13 +290,20 @@ class Miner:
                 self.last_height = h
                 _log(f"OK Bloco #{h} minerado (total={self.blocks_mined})")
 
-                # Broadcast via P2P (se disponível)
+                # ------------------------------------------------------------
+                # [FIX v6.4] Nome correto do callback: on_block_mined
+                # (sem underscore). O blockchain.py já chama este callback
+                # automaticamente via _fire_block_mined() dentro do
+                # mine_block_interruptible(). Este getattr aqui é apenas
+                # um "safety net" — o broadcast real acontece via main.py
+                # que liga chain.on_block_mined = p2p.broadcast_block.
+                # ------------------------------------------------------------
                 try:
-                    cb = getattr(self.chain, "_on_block_mined", None)
+                    cb = getattr(self.chain, "on_block_mined", None)
                     if callable(cb):
                         cb(block)
                 except Exception as e:
-                    _log(f"broadcast_block falhou: {e}")
+                    _log(f"on_block_mined callback falhou: {e}")
 
             except ValueError as e:
                 self.last_error = str(e)
