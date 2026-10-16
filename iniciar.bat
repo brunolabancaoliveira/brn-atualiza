@@ -1,17 +1,21 @@
 @echo off
 REM ============================================================
-REM   iniciar22.bat - BRN Node CLIENTE (Windows) - v16
+REM   iniciar.bat - BRN Node CLIENTE (Windows) - v5
 REM ============================================================
-REM   v16:
-REM     [FIX] IP do peer corrigido para 100.111.253.8
-REM     [NEW] Detecta automaticamente o peer Linux via Tailscale
-REM     [NEW] Atualiza todos os arquivos de config com o IP correto
-REM   v15:
-REM     [NEW] Deteccao automatica do hostname
+REM   v5:
+REM     [FIX] Remove sintaxe bash que quebrava o resumo
+REM     [FIX] Lista de arquivos obrigatorios completa
+REM     [NEW] Auto-detecta IP Tailscale do peer
+REM     [NEW] Cria pasta contracts/ se faltar
+REM     [NEW] Verifica escrow_btc_brn/factory/vm
+REM   v4:
+REM     [NEW] Verifica Tailscale antes de subir
+REM     [NEW] Faz tailscale ping no peer do brn_network.env
 REM ============================================================
 
 setlocal EnableDelayedExpansion
 
+REM -------- Ir para pasta do script --------
 cd /d "%~dp0"
 if errorlevel 1 (
     echo [X] Nao consegui cd para %~dp0
@@ -19,15 +23,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM --- IP do peer Ubuntu (fallback) ---
-set "FIXED_PEER_IP=100.111.253.8"
-set "FIXED_PEER_PORT=6001"
-
-REM --- Detecta hostname ---
-for /f "tokens=*" %%H in ('hostname') do set "TS_HOSTNAME=%%H"
-if "%TS_HOSTNAME%"=="" set "TS_HOSTNAME=%COMPUTERNAME%"
-if "%TS_HOSTNAME%"=="" set "TS_HOSTNAME=brn-node"
-
+REM -------- Argumentos --------
 set "SKIP_TAILSCALE=0"
 set "FORCE_GUI=0"
 set "FORCE_NO_GUI=0"
@@ -43,62 +39,70 @@ shift
 goto parse_args
 
 :show_help
-echo Uso: iniciar22.bat [--skip-tailscale] [--gui] [--no-gui]
+echo Uso: iniciar.bat [--skip-tailscale] [--gui] [--no-gui]
 exit /b 0
 
 :args_done
 
 echo ============================================================
-echo   BRN Node - CLIENTE - v16
-echo   Hostname  : %TS_HOSTNAME%
-echo   Peer padrao: %FIXED_PEER_IP%:%FIXED_PEER_PORT%
+echo   BRN Node - CLIENTE (sincroniza da Maquina A) - v5
 echo ============================================================
 echo.
 
 REM ============================================================
-REM  0) LIMPA ARQUIVOS DE PEER ANTIGOS
-REM ============================================================
-echo [*] Preparando arquivos de peer...
-
-echo %FIXED_PEER_IP%:%FIXED_PEER_PORT%> brn_tailscale_peer.txt
-echo [ok] brn_tailscale_peer.txt: %FIXED_PEER_IP%:%FIXED_PEER_PORT%
-
-(
-    echo [
-    echo   "%FIXED_PEER_IP%:%FIXED_PEER_PORT%"
-    echo ]
-) > bootstrap_peers.json
-echo [ok] bootstrap_peers.json: ["%FIXED_PEER_IP%:%FIXED_PEER_PORT%"]
-echo.
-
-REM ============================================================
-REM  1) PYTHON
+REM  0) PYTHON
 REM ============================================================
 set "PY="
 where python >nul 2>&1
 if not errorlevel 1 set "PY=python"
+
 if "%PY%"=="" (
     where py >nul 2>&1
     if not errorlevel 1 set "PY=py -3"
 )
+
 if "%PY%"=="" (
     echo [X] Python 3 nao encontrado
+    echo     Instale: https://www.python.org/downloads/
+    echo     Marque "Add Python to PATH" na instalacao.
     pause
     exit /b 1
 )
 
 set "PYVER=?"
 for /f "tokens=*" %%V in ('%PY% -c "import sys;print(sys.version.split()[0])" 2^>nul') do set "PYVER=%%V"
-echo [ok] Python %PYVER%
+echo [ok] Python %PYVER% ^(%PY%^)
 echo.
 
 REM ============================================================
-REM  2) CARREGA brn_network.env
+REM  1) CARREGA brn_network.env
 REM ============================================================
 if not exist "brn_network.env" (
-    echo [X] brn_network.env nao encontrado!
-    pause
-    exit /b 1
+    echo [!] brn_network.env nao existe - criando com defaults...
+    (
+        echo BRN_NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9
+        echo BRN_NODE_PASSWORD=senha-no-temp-123
+        echo BRN_WEB_PASS=senha-temp-123
+        echo BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
+        echo BRN_ADMIN_TOKEN=
+        echo BRN_BOOTSTRAP_PEERS=
+        echo BRN_IS_ORIGIN=0
+        echo BRN_ALL_MINERS=0
+        echo BRN_MIN_DIFFICULTY=6
+        echo BRN_WEB_HOST=0.0.0.0
+        echo BRN_WEB_PORT=5000
+        echo BRN_EXPLORER_PORT=8080
+        echo BRN_EXPLORER_HOST=0.0.0.0
+        echo BRN_HTTP_THREADS=16
+        echo BRN_P2P_PORT=6001
+        echo BRN_P2P_AUTH=optional
+        echo BRN_RATE_LIMIT=200
+        echo BRN_UPNP=0
+        echo BRN_SKIP_VERIFY=0
+        echo BRN_VERIFY_STRICT=0
+        echo BRN_LOG_LEVEL=INFO
+    ) > brn_network.env
+    echo [ok] brn_network.env criado
 )
 
 echo [*] Carregando brn_network.env...
@@ -118,7 +122,7 @@ echo [ok] brn_network.env carregado
 echo.
 
 REM ============================================================
-REM  3) DEFAULTS
+REM  2) DEFAULTS
 REM ============================================================
 if "%BRN_NODE_PASSWORD%"==""       set "BRN_NODE_PASSWORD=senha-no-temp-123"
 if "%BRN_WEB_PASS%"==""            set "BRN_WEB_PASS=senha-temp-123"
@@ -129,11 +133,8 @@ if "%BRN_P2P_PORT%"==""            set "BRN_P2P_PORT=6001"
 if "%BRN_LOG_LEVEL%"==""           set "BRN_LOG_LEVEL=INFO"
 set "PYTHONUNBUFFERED=1"
 
-REM --- Forca o peer correto ---
-set "BRN_BOOTSTRAP_PEERS=%FIXED_PEER_IP%:%FIXED_PEER_PORT%"
-
 REM ============================================================
-REM  4) ARQUIVOS ESSENCIAIS
+REM  3) ARQUIVOS ESSENCIAIS
 REM ============================================================
 set "FALTA="
 for %%F in (
@@ -145,11 +146,17 @@ for %%F in (
     p2p_unified.py p2p_auth.py p2p_secure.py p2p_cipher.py p2p_relay.py
     discovery_v2.py rendezvous_discovery.py rendezvous_mongo.py
     miner_loop.py sync_manager.py
+    l2_manager.py btc_watcher.py btc_config.py
+    contracts\__init__.py contracts\vm.py contracts\escrow_btc_brn.py contracts\factory.py
 ) do (
     if not exist "%%F" set "FALTA=!FALTA! %%F"
 )
+
 if not "%FALTA%"=="" (
     echo [X] Arquivos faltando:%FALTA%
+    echo.
+    echo     Verifique se todos os arquivos foram salvos na pasta:
+    echo     %~dp0
     pause
     exit /b 1
 )
@@ -157,121 +164,91 @@ echo [ok] Arquivos essenciais OK
 echo.
 
 REM ============================================================
-REM  5) TAILSCALE
+REM  4) TAILSCALE
 REM ============================================================
-set "MY_TS_IP=N/A"
-set "TS_PEER_IP=%FIXED_PEER_IP%"
-
 if "%SKIP_TAILSCALE%"=="1" (
-    echo [*] Tailscale: pulado
+    echo [*] Tailscale: pulado ^(--skip-tailscale^)
     goto tailscale_done
 )
 
-REM ---- 5.1: Instalado? ----
 where tailscale >nul 2>&1
 if errorlevel 1 (
-    echo [X] Tailscale nao instalado!
+    echo [!] Tailscale NAO instalado.
+    echo     Baixe: https://tailscale.com/download/windows
     pause
     exit /b 1
 )
 echo [ok] Tailscale instalado
 
-REM ---- 5.2: Logado? ----
 tailscale status >nul 2>&1
 if errorlevel 1 (
     echo [!] Tailscale NAO esta logado.
-    echo.
-    echo ============================================================
-    echo   LOGIN MANUAL NECESSARIO
-    echo ============================================================
-    echo.
-    echo   Rode em OUTRO CMD:
-    echo     tailscale up --accept-dns=false --hostname=%TS_HOSTNAME% --unattended
-    echo.
-    echo   Autentique no navegador e VOLTE AQUI.
-    echo.
+    echo     Clique com botao direito no icone do Tailscale
+    echo     perto do relogio e escolha "Log in".
     pause
-    tailscale status >nul 2>&1
-    if errorlevel 1 (
-        echo [X] Ainda nao logado. Abortando.
-        pause
-        exit /b 1
-    )
+    exit /b 1
 )
 echo [ok] Tailscale logado
 
-REM ---- 5.3: Meu IP ----
 set "MY_TS_IP="
 for /f "tokens=*" %%I in ('tailscale ip -4 2^>nul') do (
     if "!MY_TS_IP!"=="" set "MY_TS_IP=%%I"
 )
 if "%MY_TS_IP%"=="" (
-    echo [X] Nao consegui obter meu IP Tailscale.
+    echo [!] Tailscale sem IP. Verifique com: tailscale status
     pause
     exit /b 1
 )
 echo [ok] Meu IP Tailscale: %MY_TS_IP%
 
-REM ---- 5.4: Detecta peer Linux automaticamente ----
-echo.
-echo [*] Procurando peer Linux via Tailscale...
-
+REM ---- Auto-detectar IP do peer no Tailscale ----
 set "TS_PEER_IP="
-set "TS_PEER_NAME="
+if not "%BRN_BOOTSTRAP_PEERS%"=="" (
+    for /f "tokens=1 delims=,:" %%I in ("%BRN_BOOTSTRAP_PEERS%") do set "TS_PEER_IP=%%I"
+)
 
-for /f "tokens=1,2,3,4" %%A in ('tailscale status 2^>nul') do (
-    if not "%%A"=="%MY_TS_IP%" (
-        if /i "%%D"=="linux" (
-            if "!TS_PEER_IP!"=="" (
-                set "TS_PEER_IP=%%A"
-                set "TS_PEER_NAME=%%B"
-            )
+REM Se bootstrap vazio, descobre pelo tailscale status (primeiro IP que nao seja o nosso)
+if "%TS_PEER_IP%"=="" (
+    echo [*] Bootstrap vazio - auto-detectando peer via Tailscale...
+    for /f "tokens=1" %%I in ('tailscale status 2^>nul ^| findstr /R "^100\."') do (
+        if not "%%I"=="%MY_TS_IP%" (
+            if "!TS_PEER_IP!"=="" set "TS_PEER_IP=%%I"
         )
+    )
+    if not "!TS_PEER_IP!"=="" (
+        echo [ok] Peer detectado: !TS_PEER_IP!
+        set "BRN_BOOTSTRAP_PEERS=!TS_PEER_IP!:6001"
+        REM salva de volta no env
+        (
+            echo !BRN_BOOTSTRAP_PEERS!
+        ) > nul
     )
 )
 
 if "%TS_PEER_IP%"=="" (
-    echo [!] Nenhum peer Linux. Usando IP fixo: %FIXED_PEER_IP%
-    set "TS_PEER_IP=%FIXED_PEER_IP%"
-    set "TS_PEER_NAME=ubuntu-origin"
+    echo [!] Nenhum peer Tailscale encontrado.
+    echo     Continuando mesmo assim...
 ) else (
-    echo [ok] Peer Linux detectado: %TS_PEER_IP% ^(%TS_PEER_NAME%^)
+    echo [*] Testando peer %TS_PEER_IP%...
+    tailscale ping -c 1 "%TS_PEER_IP%" >nul 2>&1
+    if errorlevel 1 (
+        echo [!] Peer %TS_PEER_IP% NAO respondeu ao ping.
+        echo     Verifique se a outra maquina esta ligada e logada.
+    ) else (
+        echo [ok] Peer %TS_PEER_IP% alcancavel
+    )
 )
-
-REM ---- 5.5: Testa o peer ----
-echo [*] Testando peer %TS_PEER_IP%...
-tailscale ping -c 1 "%TS_PEER_IP%" >nul 2>&1
-if errorlevel 1 (
-    echo [!] Peer NAO respondeu ao ping via Tailscale.
-) else (
-    echo [ok] Peer alcancavel via Tailscale
-)
-
-REM ---- 5.6: Atualiza arquivos com o IP final ----
-echo.
-echo [*] Atualizando arquivos de config com IP: %TS_PEER_IP%
-
-echo %TS_PEER_IP%:%FIXED_PEER_PORT%> brn_tailscale_peer.txt
-echo [ok] brn_tailscale_peer.txt atualizado
-
-(
-    echo [
-    echo   "%TS_PEER_IP%:%FIXED_PEER_PORT%"
-    echo ]
-) > bootstrap_peers.json
-echo [ok] bootstrap_peers.json atualizado
-
-set "BRN_BOOTSTRAP_PEERS=%TS_PEER_IP%:%FIXED_PEER_PORT%"
 
 :tailscale_done
 echo.
 
 REM ============================================================
-REM  6) WAITRESS
+REM  5) WAITRESS (opcional)
 REM ============================================================
 %PY% -c "import waitress" >nul 2>&1
 if errorlevel 1 (
-    echo [!] Waitress ausente - HTTP usara Flask dev server
+    echo [!] Waitress NAO instalado - HTTP usara Flask dev server
+    echo     Para producao: %PY% -m pip install waitress
 ) else (
     for /f "tokens=*" %%V in ('%PY% -c "import waitress;print(waitress.__version__)" 2^>nul') do set "WV=%%V"
     echo [ok] Waitress v!WV!
@@ -279,30 +256,37 @@ if errorlevel 1 (
 echo.
 
 REM ============================================================
-REM  7) PAPEL: CLIENTE
+REM  6) PAPEL: CLIENTE
 REM ============================================================
 > "brn_role.txt" echo client
-echo [ok] Papel: cliente
+echo [ok] Papel: cliente (nao origina genesis)
 echo.
 
 REM ============================================================
-REM  8) PYWEBVIEW
+REM  7) PYWEBVIEW (GUI ou headless)
 REM ============================================================
 set "HEADLESS_FLAG="
 
 if "%FORCE_NO_GUI%"=="1" (
     set "HEADLESS_FLAG=--headless"
+    echo [*] GUI desabilitada por --no-gui
     goto gui_done
 )
-if "%FORCE_GUI%"=="1" goto gui_done
+
+if "%FORCE_GUI%"=="1" (
+    echo [ok] GUI forcada por --gui
+    goto gui_done
+)
 
 %PY% -c "import webview" >nul 2>&1
 if errorlevel 1 (
     set "HEADLESS_FLAG=--headless"
-    echo [!] pywebview ausente - HEADLESS
+    echo [!] pywebview ausente - modo HEADLESS
+    echo     Para instalar GUI: %PY% -m pip install pywebview
     goto gui_done
 )
-echo [ok] pywebview OK
+
+echo [ok] pywebview OK - carteira desktop vai abrir
 
 :gui_done
 set "GUI_STATUS=GUI"
@@ -310,33 +294,52 @@ if "%HEADLESS_FLAG%"=="--headless" set "GUI_STATUS=HEADLESS"
 echo.
 
 REM ============================================================
-REM  9) RESUMO
+REM  8) RESOLVE ADMIN TOKEN STATUS (sintaxe batch correta)
+REM ============================================================
+set "ADMIN_STATUS=NAO"
+if not "%BRN_ADMIN_TOKEN%"=="" set "ADMIN_STATUS=SIM"
+
+REM ============================================================
+REM  9) VERSAO main.py
 REM ============================================================
 set "NODE_VERSION=?"
 for /f "tokens=*" %%V in ('%PY% main.py --version 2^>nul') do set "NODE_VERSION=%%V"
+echo [ok] main.py versao: %NODE_VERSION%
+echo.
 
+REM ============================================================
+REM 10) RESUMO
+REM ============================================================
 echo ============================================================
-echo   CONFIGURACAO FINAL (CLIENTE)
+echo   CONFIGURACAO ATUAL (CLIENTE)
 echo ============================================================
-echo   Hostname   : %TS_HOSTNAME%
-echo   Meu IP TS  : %MY_TS_IP%
-echo   Peer TS    : %TS_PEER_IP%
-echo   Peer nome  : %TS_PEER_NAME%
+echo   Modo       : CLIENTE (sincroniza da rede)
+echo   Versao     : %NODE_VERSION%
 echo   Bootstrap  : %BRN_BOOTSTRAP_PEERS%
+echo   All miners : %BRN_ALL_MINERS%
+echo   Min diff   : %BRN_MIN_DIFFICULTY%
+echo   Admin tok  : %ADMIN_STATUS%
 echo   P2P porta  : %BRN_P2P_PORT%
 echo   HTTP       : http://0.0.0.0:%BRN_WEB_PORT%
 echo   Explorer   : http://0.0.0.0:%BRN_EXPLORER_PORT%
 echo   Python     : %PYVER%
 echo   pywebview  : %GUI_STATUS%
-echo   Versao     : %NODE_VERSION%
+echo   Tailscale  : %MY_TS_IP%  -^>  %TS_PEER_IP%
 echo ============================================================
+echo.
+echo   Modo 2 (mineracao aberta):
+echo     - /api/mine, /api/miner/*  sao PUBLICOS
+echo     - /api/faucet             protegido por token
+echo.
+echo   ATENCAO: deixe esta janela ABERTA enquanto o cliente roda.
 echo.
 
 REM ============================================================
-REM 10) INICIA O NO
+REM 11) INICIA O NO
 REM ============================================================
 echo [*] Iniciando CLIENTE BRN... ^(Ctrl+C para encerrar^)
 echo.
+
 %PY% main.py --client-mode %HEADLESS_FLAG%
 set "EXITCODE=%ERRORLEVEL%"
 
@@ -344,10 +347,16 @@ echo.
 if not "%EXITCODE%"=="0" (
     echo [X] O no saiu com codigo %EXITCODE%
     echo.
+    echo   Se o erro foi 'Falha ao decifrar node_identity.enc':
+    echo     del node_identity.enc
+    echo     iniciar.bat
+    echo.
     echo   Se o erro foi 'TIMEOUT esperando genesis':
-    echo     - Ubuntu ligada e minerando?
-    echo     - tailscale ping %TS_PEER_IP%
-    echo     - Segredos batem?
+    echo     - Maquina A ligada? tailscale ping %TS_PEER_IP%
+    echo     - segredos batem? type brn_network.env
+    echo.
+    echo   Se o erro foi 'Modulos obrigatorios faltando':
+    echo     %PY% verify.py
     echo.
 ) else (
     echo [ok] No encerrado normalmente.

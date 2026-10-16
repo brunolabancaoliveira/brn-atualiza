@@ -1,15 +1,19 @@
 """
-explorer.py — Explorador de blocos BRN (Flask) v9.4
+explorer.py — Explorador de blocos BRN (Flask) v9.5
 ================================================================
-- Compatível com db.py v6.3, security.py v1, mongo_client (opcional)
+- Compatível com db.py v6.5, security.py, mongo_client (opcional)
 - Não quebra se pymongo não estiver instalado
 - Rate limit por endpoint via security.require_rate_limit
 - Audit log em rendezvous
 - Conexão SQLite por thread (evita lock exclusivo por request)
 - Endpoints de rendezvous para descoberta P2P via hub
 
+v9.5 (16/10/2026):
+  [NEW] /api/peers-discovered-proxy → proxy para /api/peers/discovered
+        (usado pelo monitor.html para auto-descoberta de peers)
 v9.4 (13/10/2026):
   [NEW] /panel + /panel.html  → serve painel de controle HTML
+  [NEW] /monitor + /monitor.html → serve monitor de rede HTML
   [NEW] /api/chain-info-proxy     → proxy para server.py :5000
   [NEW] /api/sync-status-proxy    → proxy para server.py :5000
   [NEW] /api/miner-status-proxy   → proxy para server.py :5000
@@ -110,12 +114,11 @@ log = logging.getLogger("explorer")
 # ============================================================
 app = Flask(__name__, static_folder=str(BASE_DIR))
 
-# CORS em tudo (v9.4)
+# CORS em tudo
 if _HAS_CORS:
     if CORS_ORIGIN:
         CORS(app, origins=[CORS_ORIGIN])
     else:
-        # Libera para localhost e Tailscale (100.x.x.x)
         CORS(app, origins="*")
 
 
@@ -127,7 +130,6 @@ def _before():
 
 @app.after_request
 def _after(resp):
-    # CORS legado (caso flask-cors não esteja)
     if CORS_ORIGIN:
         resp.headers["Access-Control-Allow-Origin"] = CORS_ORIGIN
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
@@ -229,6 +231,7 @@ def panel():
             f"<p>Erro: {e}</p>"
         ), 404
 
+
 @app.route("/monitor")
 @app.route("/monitor.html")
 def monitor():
@@ -243,18 +246,19 @@ def monitor():
             f"<p>Erro: {e}</p>"
         ), 404
 
+
 # ============================================================
-# PROXIES para o server.py :5000 (v9.4)
+# PROXIES para o server.py :5000
 # ------------------------------------------------------------
-# Permitem que o painel em :8080 fale com o server em :5000
-# sem problemas de CORS.
+# Permitem que o painel/monitor em :8080 falem com o server
+# em :5000 sem problemas de CORS.
 # ============================================================
 import urllib.request
 import urllib.error
 import json as _json
 
 
-def _proxy_get(path: str, timeout: float = 5.0):
+def _proxy_get(path: str, timeout: float = 8.0):
     """
     Faz GET em http://127.0.0.1:5000<path> e devolve o JSON.
     Retorna (data, status_code) — status_code é 200 se OK.
@@ -353,6 +357,23 @@ def miner_stop_proxy():
 @require_rate_limit("status")
 def peers_score_proxy():
     data, code = _proxy_get("/api/peers/score")
+    return jsonify(data), code
+
+
+# ============================================================
+# [NEW v9.5] PROXY para /api/peers/discovered
+# ------------------------------------------------------------
+# Devolve a lista de peers descobertos pelo P2P do nó local.
+# Usado pelo monitor.html para auto-descoberta de nós.
+# ============================================================
+@app.route("/api/peers-discovered-proxy")
+@require_rate_limit("status")
+def peers_discovered_proxy():
+    """
+    Proxy para /api/peers/discovered do server.py.
+    Devolve a lista de peers descobertos pelo P2P local.
+    """
+    data, code = _proxy_get("/api/peers/discovered")
     return jsonify(data), code
 
 
@@ -677,6 +698,7 @@ def health():
         "ts": time.time(),
         "server_port": SERVER_PORT,
         "panel_disponivel": (BASE_DIR / "panel.html").exists(),
+        "monitor_disponivel": (BASE_DIR / "monitor.html").exists(),
     })
 
 
@@ -702,9 +724,10 @@ def _shutdown():
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print(f"  BRN Explorer v9.4")
+    print(f"  BRN Explorer v9.5")
     print(f"  → http://{HOST}:{PORT}")
     print(f"  → Painel: http://{HOST}:{PORT}/panel")
+    print(f"  → Monitor: http://{HOST}:{PORT}/monitor")
     print(f"  → Proxies para: http://{SERVER_HOST}:{SERVER_PORT}")
     print(f"  DB: {DB_PATH}")
     print(f"  CORS: {'habilitado' if _HAS_CORS else 'desabilitado'}")

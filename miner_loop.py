@@ -1,27 +1,16 @@
 """
-miner_loop.py — Loop de mineracao do BRN (v6.4)
+miner_loop.py — Loop de mineracao do BRN (v6.5)
 ================================================================
-API publica:
-    get_miner(chain) -> Miner    (singleton)
-    Miner.start(addr, pubkey_hex)
-    Miner.stop()
-    Miner.status() -> dict
-
+v6.5:
+  [FIX] Removido callback DUPLICADO de on_block_mined. Agora o
+        miner_loop NÃO chama mais chain.on_block_mined(), porque
+        o blockchain.py v9.1.8 já chama internamente via
+        _fire_block_mined(). Antes, cada bloco era propagado 2x
+        via P2P (desperdício + race nos peers).
 v6.4:
-  [FIX] nome do atributo de callback: on_block_mined (sem underscore)
-        — antes era _on_block_mined (que nao existe no blockchain.py)
-        — resultado: blocos minerados localmente NAO eram propagados P2P
+  [FIX] status() expõe fork_aborts
 v6.3:
   [NEW] _should_continue() verifica chain._fork_signal
-        Se o ChainSyncManager detectar fork, o miner aborta o bloco
-        atual e espera o reorg terminar.
-v6.2:
-  [FIX] _ler_carteira_aberta usa secure_store.load_current_wallet
-        (current_wallet.enc) com fallback para current_wallet.json
-  [FIX] _pubkey_no_db usa db.get_utxos em vez de SQL direto
-  [FIX] paths absolutos (BASE_DIR)
-v6.1:
-  [NEW] status() expoe 'count', 'last_height', 'uptime'
 ================================================================
 """
 import os
@@ -48,7 +37,6 @@ BASE_DIR                 = Path(__file__).resolve().parent
 CURRENT_WALLET_ENC_FILE  = str(BASE_DIR / "current_wallet.enc")
 CURRENT_WALLET_FILE      = str(BASE_DIR / "current_wallet.json")
 
-# Quanto tempo esperar entre checagens do fork signal (em segundos)
 FORK_POLL_INTERVAL = float(os.environ.get("BRN_FORK_POLL_INTERVAL", "0.5"))
 
 _MINER_INSTANCE = None
@@ -71,8 +59,6 @@ def _senha_sessao() -> str:
 
 
 def _ler_carteira_aberta():
-    """Lê current_wallet.enc (novo) ou current_wallet.json (legado)."""
-    # 1) tenta .enc via secure_store
     senha = _senha_sessao()
     if senha:
         try:
@@ -89,7 +75,6 @@ def _ler_carteira_aberta():
         except Exception as e:
             _log(f"_ler_carteira_aberta(.enc) falhou: {e}")
 
-    # 2) fallback: .json legado
     try:
         p = Path(CURRENT_WALLET_FILE)
         if p.exists():
@@ -109,7 +94,6 @@ def _ler_carteira_aberta():
 
 
 def _pubkey_no_db(bc, addr):
-    """Fallback: pega pubkey da primeira UTXO da carteira."""
     try:
         utxos = bc.db.get_utxos(addr)
         for u in utxos:
@@ -133,7 +117,6 @@ class Miner:
         self.last_error = ""
         self.last_height = None
         self.started_at = 0.0
-        # v6.3: contadores para debug
         self.fork_aborts = 0
         self.last_fork_at = 0.0
 
@@ -202,7 +185,6 @@ class Miner:
             "count": self.blocks_mined,
             "last_height": self.last_height,
             "uptime": uptime,
-            # v6.3
             "fork_aborts": self.fork_aborts,
             "last_fork_ago_s": (int(time.time() - self.last_fork_at)
                                 if self.last_fork_at else None),
@@ -210,16 +192,9 @@ class Miner:
         }
 
     # ============================================================
-    # v6.3: SHOULD CONTINUE
+    # SHOULD CONTINUE
     # ============================================================
     def _should_continue(self) -> bool:
-        """
-        Retorna False se:
-          - o miner foi parado (stop_evt)
-          - o ChainSyncManager detectou fork (_fork_signal)
-
-        Se detectar fork, registra o abort e loga.
-        """
         if self._stop_evt.is_set():
             return False
 
@@ -239,7 +214,6 @@ class Miner:
     def _loop(self):
         while not self._stop_evt.is_set():
             try:
-                # Espera genesis se DB vazio
                 if self.chain.db.height() < 0:
                     _log("Aguardando genesis (DB vazio)...")
                     if self._stop_evt.wait(timeout=5):
@@ -251,10 +225,9 @@ class Miner:
                     self.running = False
                     return
 
-                # v6.3: antes de começar um bloco, checa se há fork
+                # v6.3: aguarda reorg terminar se fork signal ligado
                 fork_sig = getattr(self.chain, "_fork_signal", None)
                 if fork_sig is not None and fork_sig.is_set():
-                    # espera o reorg terminar (com timeout de segurança)
                     _log("[FORK] aguardando reorg terminar...")
                     waited = 0.0
                     while (fork_sig.is_set() and waited < 60.0
@@ -271,7 +244,6 @@ class Miner:
                         _log("[FORK] reorg concluído — retomando mineração")
                     continue
 
-                # Mina o próximo bloco (interrompível)
                 block = self.chain.mine_block_interruptible(
                     self.address,
                     self.pubkey,
@@ -279,10 +251,8 @@ class Miner:
                 )
 
                 if block is None:
-                    # Interrompido por stop_evt OU por fork signal
                     if self._stop_evt.is_set():
                         break
-                    # Foi fork — volta ao topo do loop para esperar reorg
                     continue
 
                 self.blocks_mined += 1
@@ -291,19 +261,13 @@ class Miner:
                 _log(f"OK Bloco #{h} minerado (total={self.blocks_mined})")
 
                 # ------------------------------------------------------------
-                # [FIX v6.4] Nome correto do callback: on_block_mined
-                # (sem underscore). O blockchain.py já chama este callback
-                # automaticamente via _fire_block_mined() dentro do
-                # mine_block_interruptible(). Este getattr aqui é apenas
-                # um "safety net" — o broadcast real acontece via main.py
-                # que liga chain.on_block_mined = p2p.broadcast_block.
+                # [FIX v6.5] NÃO chamar on_block_mined aqui.
+                # O blockchain.py v9.1.8 já chama internamente via
+                # _fire_block_mined() dentro de mine_block_interruptible().
+                # Chamar de novo aqui = propagação 2x via P2P.
+                # O main.py v12.8 liga chain.on_block_mined = p2p.broadcast_block,
+                # então o broadcast acontece automaticamente.
                 # ------------------------------------------------------------
-                try:
-                    cb = getattr(self.chain, "on_block_mined", None)
-                    if callable(cb):
-                        cb(block)
-                except Exception as e:
-                    _log(f"on_block_mined callback falhou: {e}")
 
             except ValueError as e:
                 self.last_error = str(e)
@@ -325,7 +289,6 @@ class Miner:
 # AUTO-START
 # ============================================================
 def loop_mineracao(chain, intervalo=None):
-    """Compat com chamadas antigas."""
     if not MINER_AUTO:
         _log("Auto-mineracao DESATIVADA")
         return

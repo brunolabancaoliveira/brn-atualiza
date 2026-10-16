@@ -1,16 +1,11 @@
 """
 server.py — Backend HTTP do nó BRN (v9.9)
 ================================================================
+v9.9.1 (FIX):
+  [FIX] Adicionados endpoints /api/blocks e /api/block/<height>
+        para corrigir o erro HTTP 404 no app da carteira.
 v9.9:
-  [NEW] Endpoints do Pool de Mineração:
-        POST /api/pool/register
-        POST /api/pool/work
-        POST /api/pool/submit
-        POST /api/pool/heartbeat
-        POST /api/pool/disconnect
-        GET  /api/pool/stats
-        GET  /api/pool/miners
-        GET  /api/pool/miner/<miner_id>
+  [NEW] Endpoints do Pool de Mineração
   [NEW] set_pool_manager() / _get_pool_manager()
 v9.8:
   [NEW] /api/peers/discovered
@@ -90,20 +85,17 @@ FAUCET_MAX_PER_ADDRESS = 3
 FAUCET_COOLDOWN_S      = 60 * 60
 CACHE_TTL_S            = 5
 
-
 # ============================================================
 # CHAIN INJETÁVEL
 # ============================================================
 _CHAIN = None
 CHAIN_LOCK = threading.RLock()
 
-
 def set_chain(chain) -> None:
     global _CHAIN
     with CHAIN_LOCK:
         _CHAIN = chain
     log.info("server: chain injetada (height=%s)", chain.db.height())
-
 
 def _get_chain():
     global _CHAIN
@@ -116,7 +108,6 @@ def _get_chain():
             log.warning("server: chain NÃO injetada — criei uma local")
         return _CHAIN
 
-
 class _LazyChain:
     def __getattr__(self, name):
         return getattr(_get_chain(), name)
@@ -124,16 +115,13 @@ class _LazyChain:
     def __repr__(self):
         return f"<LazyChain {id(self)}>"
 
-
 CHAIN = _LazyChain()
-
 
 # ============================================================
 # P2P MANAGER INJETÁVEL
 # ============================================================
 _P2P_MANAGER = None
 _P2P_LOCK = threading.Lock()
-
 
 def set_p2p_manager(p2p) -> None:
     global _P2P_MANAGER
@@ -144,17 +132,14 @@ def set_p2p_manager(p2p) -> None:
     else:
         log.info("server: P2PManager removido")
 
-
 def _get_p2p_manager():
     return _P2P_MANAGER
 
-
 # ============================================================
-# [NEW v9.9] POOL MANAGER INJETÁVEL
+# POOL MANAGER INJETÁVEL
 # ============================================================
 _POOL_MANAGER = None
 _POOL_LOCK = threading.Lock()
-
 
 def set_pool_manager(pool) -> None:
     """Chamado pelo main.py após criar o PoolManager."""
@@ -166,10 +151,8 @@ def set_pool_manager(pool) -> None:
     else:
         log.info("server: PoolManager removido")
 
-
 def _get_pool_manager():
     return _POOL_MANAGER
-
 
 # ============================================================
 # SYNC MANAGER INJETÁVEL
@@ -177,17 +160,14 @@ def _get_pool_manager():
 _SYNC_MANAGER = None
 _SYNC_LOCK = threading.Lock()
 
-
 def set_sync_manager(sync) -> None:
     global _SYNC_MANAGER
     with _SYNC_LOCK:
         _SYNC_MANAGER = sync
     log.info("server: sync_manager injetado")
 
-
 def _get_sync_manager():
     return _SYNC_MANAGER
-
 
 # ============================================================
 # L2 (opcional)
@@ -205,7 +185,6 @@ except ImportError:
 _l2_mgr = None
 _l2_lock = threading.Lock()
 
-
 def _get_l2():
     global _l2_mgr
     if not L2_ENABLED:
@@ -219,7 +198,6 @@ def _get_l2():
                 log.warning(f"L2Manager erro: {e}")
                 _l2_mgr = None
         return _l2_mgr
-
 
 # ============================================================
 # App
@@ -236,7 +214,6 @@ if BEHIND_PROXY:
 if CORS_ORIGINS:
     CORS(app, origins=CORS_ORIGINS)
 
-
 # ============================================================
 # Admin guard
 # ============================================================
@@ -247,7 +224,6 @@ def _require_admin() -> bool:
     if not hdr.startswith("Bearer "):
         return False
     return hmac.compare_digest(hdr[7:], ADMIN_TOKEN)
-
 
 def _admin_required(f):
     @wraps(f)
@@ -261,14 +237,12 @@ def _admin_required(f):
         return f(*args, **kwargs)
     return wrapper
 
-
 # ============================================================
 # Caches
 # ============================================================
 _cache_saldos: dict = {}
 _cache_lock = threading.Lock()
 _faucet_history: dict = {}
-
 
 def _saldo_cache_get(addr):
     with _cache_lock:
@@ -278,22 +252,18 @@ def _saldo_cache_get(addr):
                 return val
     return None
 
-
 def _saldo_cache_set(addr, val):
     with _cache_lock:
         _cache_saldos[addr] = (time.time(), val)
-
 
 def _saldo_cache_invalidate(addr):
     with _cache_lock:
         _cache_saldos.pop(addr, None)
 
-
 # ============================================================
 # Wallets JSON
 # ============================================================
 _wallets_lock = threading.Lock()
-
 
 def carregar_wallets() -> dict:
     if not os.path.exists(WALLETS_FILE):
@@ -304,7 +274,6 @@ def carregar_wallets() -> dict:
     except Exception:
         return {}
 
-
 def salvar_wallets(w: dict) -> None:
     with _wallets_lock:
         tmp = f"{WALLETS_FILE}.tmp.{os.getpid()}"
@@ -313,7 +282,6 @@ def salvar_wallets(w: dict) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, WALLETS_FILE)
-
 
 def _registrar_pubkey(addr, pk):
     if not addr or not pk:
@@ -325,7 +293,6 @@ def _registrar_pubkey(addr, pk):
             salvar_wallets(wallets)
     except Exception:
         pass
-
 
 # ============================================================
 # AUTO-REGISTRO DA PUBKEY
@@ -376,7 +343,6 @@ def auto_registrar_carteira_atual() -> dict:
     except Exception as e:
         return {"ok": False, "msg": f"falha gravando user_wallets.json: {e}"}
 
-
 # ============================================================
 # Pubkey resolution
 # ============================================================
@@ -426,20 +392,17 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
 
     return ""
 
-
 def _find_tx_in_mempool(txid_str: str):
     try:
         return _get_chain().db.get_mempool_tx(txid_str)
     except Exception:
         return None
 
-
 def _find_tx_in_chain(txid_str: str):
     try:
         return _get_chain().db.get_tx_by_txid(txid_str)
     except Exception:
         return None, None
-
 
 # ============================================================
 # Cleanup thread
@@ -459,10 +422,8 @@ def _cleanup_loop():
         except Exception as e:
             log.warning(f"cleanup: {e}")
 
-
 threading.Thread(target=_cleanup_loop, daemon=True,
                  name="CacheCleanup").start()
-
 
 # ============================================================
 # CARTEIRA
@@ -487,7 +448,6 @@ def nova_carteira():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app.route("/api/saldo/<address>", methods=["GET"])
 def saldo(address):
     try:
@@ -503,7 +463,6 @@ def saldo(address):
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app.route("/api/portfolio/<address>", methods=["GET"])
 def portfolio(address):
     try:
@@ -515,7 +474,6 @@ def portfolio(address):
         return jsonify({"portfolio": {"BRN": cached / 10**8, "KYC": 0}})
     except Exception as e:
         return jsonify({"portfolio": {}, "error": str(e)}), 500
-
 
 # ============================================================
 # Tx status
@@ -549,7 +507,6 @@ def tx_status(txid_str):
         })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
-
 
 @app.route("/api/verificar-recebimento/<address>/<txid_str>", methods=["GET"])
 def verificar_recebimento(address, txid_str):
@@ -597,7 +554,6 @@ def verificar_recebimento(address, txid_str):
         })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
-
 
 # ============================================================
 # Histórico por endereço
@@ -692,7 +648,6 @@ def minhas_txs(address):
         log.exception("minhas_txs falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 # ============================================================
 # MEMPOOL
 # ============================================================
@@ -720,7 +675,6 @@ def get_mempool():
         })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
-
 
 # ============================================================
 # PEERS DESCOBERTOS
@@ -766,7 +720,6 @@ def peers_discovered():
     except Exception as e:
         log.exception("peers_discovered falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
-
 
 # ============================================================
 # Transfer
@@ -903,7 +856,6 @@ def transfer():
         log.exception("transfer falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 # ============================================================
 # MINERAÇÃO LOCAL (não-pool)
 # ============================================================
@@ -960,7 +912,6 @@ def mine():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
 def miner_start():
@@ -997,7 +948,6 @@ def miner_start():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/miner/stop", methods=["POST"])
 @require_rate_limit("miner_stop")
 def miner_stop():
@@ -1013,18 +963,15 @@ def miner_stop():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/miner/on", methods=["POST"])
 @app.route("/api/start-mining", methods=["POST"])
 def miner_start_alias():
     return miner_start()
 
-
 @app.route("/api/miner/off", methods=["POST"])
 @app.route("/api/stop-mining", methods=["POST"])
 def miner_stop_alias():
     return miner_stop()
-
 
 @app.route("/api/miner/status", methods=["GET"])
 def miner_status():
@@ -1050,7 +997,6 @@ def miner_status():
         })
     except Exception as e:
         return jsonify({"running": False, "error": str(e)}), 200
-
 
 # ============================================================
 # Faucet
@@ -1113,17 +1059,12 @@ def faucet():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 # ============================================================
-# [NEW v9.9] POOL DE MINERAÇÃO
+# POOL DE MINERAÇÃO
 # ============================================================
 @app.route("/api/pool/register", methods=["POST"])
 @require_rate_limit("status")
 def pool_register():
-    """
-    Registo de um minerador no pool.
-    Body: {miner_id?, address, pubkey}
-    """
     pool = _get_pool_manager()
     if pool is None:
         return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
@@ -1149,14 +1090,9 @@ def pool_register():
         log.exception("pool_register falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/pool/work", methods=["POST"])
 @require_rate_limit("status")
 def pool_work():
-    """
-    Devolve o job atual para o minerador.
-    Body: {miner_id}
-    """
     pool = _get_pool_manager()
     if pool is None:
         return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
@@ -1170,14 +1106,9 @@ def pool_work():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/pool/submit", methods=["POST"])
 @require_rate_limit("status")
 def pool_submit():
-    """
-    Submete um share.
-    Body: {miner_id, nonce, hash?}
-    """
     pool = _get_pool_manager()
     if pool is None:
         return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
@@ -1213,14 +1144,9 @@ def pool_submit():
         log.exception("pool_submit falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/pool/heartbeat", methods=["POST"])
 @require_rate_limit("status")
 def pool_heartbeat():
-    """
-    Heartbeat do minerador.
-    Body: {miner_id, hashrate?, hashes_total?}
-    """
     pool = _get_pool_manager()
     if pool is None:
         return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
@@ -1236,14 +1162,9 @@ def pool_heartbeat():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/pool/disconnect", methods=["POST"])
 @require_rate_limit("status")
 def pool_disconnect():
-    """
-    Remove um minerador do pool.
-    Body: {miner_id}
-    """
     pool = _get_pool_manager()
     if pool is None:
         return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
@@ -1257,11 +1178,9 @@ def pool_disconnect():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/pool/stats", methods=["GET"])
 @require_rate_limit("status")
 def pool_stats():
-    """Estatísticas globais do pool."""
     pool = _get_pool_manager()
     if pool is None:
         return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
@@ -1270,11 +1189,9 @@ def pool_stats():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/pool/miners", methods=["GET"])
 @require_rate_limit("status")
 def pool_miners():
-    """Lista de mineradores do pool."""
     pool = _get_pool_manager()
     if pool is None:
         return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
@@ -1283,11 +1200,9 @@ def pool_miners():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/pool/miner/<miner_id>", methods=["GET"])
 @require_rate_limit("status")
 def pool_miner_status(miner_id):
-    """Status de um minerador específico."""
     pool = _get_pool_manager()
     if pool is None:
         return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
@@ -1297,6 +1212,41 @@ def pool_miner_status(miner_id):
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
+# ============================================================
+# [NOVO FIX v9.9.1] EXPLORADOR DE BLOCOS (Correção HTTP 404)
+# ============================================================
+@app.route("/api/blocks", methods=["GET"])
+def api_get_blocks():
+    """Lista blocos paginados para a carteira."""
+    try:
+        start = int(request.args.get("start", 0))
+        limit = int(request.args.get("limit", 15))
+        # Limita o máximo para evitar abuso
+        limit = min(max(limit, 1), 50)
+        
+        chain = _get_chain()
+        blocks = chain.db.get_blocks_range(start, start + limit)
+        
+        return jsonify({
+            "blocks": blocks,
+            "start": start,
+            "count": len(blocks)
+        })
+    except Exception as e:
+        log.error(f"Erro em /api/blocks: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/block/<int:height>", methods=["GET"])
+def api_get_block(height):
+    """Retorna um bloco específico pela altura."""
+    try:
+        chain = _get_chain()
+        block = chain.db.get_block(height)
+        if block:
+            return jsonify(block)
+        return jsonify({"error": "Bloco não encontrado"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ============================================================
 # Chain info
@@ -1315,7 +1265,6 @@ def chain_info():
             })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route("/api/status", methods=["GET"])
 def status():
@@ -1339,7 +1288,6 @@ def status():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app.route("/api/fee-estimate", methods=["GET"])
 def fee_estimate():
     try:
@@ -1352,7 +1300,6 @@ def fee_estimate():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app.route("/api/work", methods=["GET"])
 def work():
     try:
@@ -1362,7 +1309,6 @@ def work():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app.route("/api/nonce/<pubkey>", methods=["GET"])
 def get_nonce(pubkey):
     try:
@@ -1370,7 +1316,6 @@ def get_nonce(pubkey):
                         "next_nonce": _get_chain().db.get_nonce_for_pubkey(pubkey)})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 # ============================================================
 # HD wallet
@@ -1394,7 +1339,6 @@ def hd_create():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/hd/derive", methods=["POST"])
 @require_rate_limit("hd_derive")
 def hd_derive():
@@ -1416,7 +1360,6 @@ def hd_derive():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 # ============================================================
 # Peers
 # ============================================================
@@ -1429,7 +1372,6 @@ def peers_score():
                         "banned": chain.db.listar_peers_maus(score_min=-100)})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 # ============================================================
 # Sync info
@@ -1505,7 +1447,6 @@ def sync_info():
 
     return jsonify(result), 200
 
-
 # ============================================================
 # Sync Status detalhado
 # ============================================================
@@ -1580,7 +1521,6 @@ def sync_status_v7():
         "last_error": data.get("last_error", ""),
     }), 200
 
-
 # ============================================================
 # Contracts
 # ============================================================
@@ -1621,7 +1561,6 @@ def contract_deploy():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/contract/call", methods=["POST"])
 @require_rate_limit("contract_call")
 def contract_call():
@@ -1650,7 +1589,6 @@ def contract_call():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/contract/<contract_id>", methods=["GET"])
 def contract_info(contract_id):
     try:
@@ -1667,7 +1605,6 @@ def contract_info(contract_id):
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
-
 @app.route("/api/contracts", methods=["GET"])
 def contracts_list():
     try:
@@ -1680,7 +1617,6 @@ def contracts_list():
         })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
-
 
 # ============================================================
 # L2
@@ -1699,7 +1635,6 @@ def l2_quote():
         return jsonify(q)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/api/l2/create", methods=["POST"])
 @require_rate_limit("l2_create")
@@ -1728,7 +1663,6 @@ def l2_create():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-
 @app.route("/api/l2/order/<escrow_id>", methods=["GET"])
 def l2_order(escrow_id):
     l2 = _get_l2()
@@ -1749,7 +1683,6 @@ def l2_order(escrow_id):
         return jsonify(order)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/api/l2/list", methods=["GET"])
 def l2_list():
@@ -1776,7 +1709,6 @@ def l2_list():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.route("/api/l2/stats", methods=["GET"])
 def l2_stats():
     try:
@@ -1795,7 +1727,6 @@ def l2_stats():
         return jsonify(s)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/api/l2/cancel/<escrow_id>", methods=["POST"])
 @require_rate_limit("l2_cancel")
@@ -1821,7 +1752,6 @@ def l2_cancel(escrow_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 # ============================================================
 # Health / index
 # ============================================================
@@ -1837,23 +1767,21 @@ def health():
             "p2p_injected": _P2P_MANAGER is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "mode": "modo2_aberto",
-            "version": "9.9",
+            "version": "9.9.1",
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.9",
+        "version": "9.9.1",
         "mode": "modo2_aberto",
         "l2_enabled": L2_ENABLED,
         "pool_enabled": _POOL_MANAGER is not None,
         "admin_protected": bool(ADMIN_TOKEN),
     })
-
 
 @atexit.register
 def _shutdown():
@@ -1863,10 +1791,9 @@ def _shutdown():
     except Exception:
         pass
 
-
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9 (Modo 2 + P2P + Pool + transfer Decimal)")
+    print(f"BRN Server v9.9.1 (Modo 2 + P2P + Pool + transfer Decimal + Blocks API)")
     print(f"  → http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
@@ -1875,6 +1802,7 @@ if __name__ == "__main__":
     print(f"  /api/mempool: ATIVO")
     print(f"  /api/peers/discovered: ATIVO")
     print(f"  /api/pool/*:  ATIVO (se PoolManager injetado)")
+    print(f"  /api/blocks:  ATIVO (Fix HTTP 404)")
     print(f"  CORS: {CORS_ORIGINS or '(desabilitado)'}")
 
     reg = auto_registrar_carteira_atual()

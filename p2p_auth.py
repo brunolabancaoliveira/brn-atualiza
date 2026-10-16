@@ -1,28 +1,15 @@
-"""p2p_auth.py — Autenticação Ed25519 para o P2P BRN (v3)
+"""p2p_auth.py — Autenticação Ed25519 para o P2P BRN (v4)
 ================================================================
-Fornece:
-    auth_enabled()            → bool
-    auth_required()           → bool
-    build_auth(msg=...)       → dict (assina o hash do payload)
-    verify_auth(auth, msg=)   → (bool, str)
-    set_node_id_priv(priv)    → registra chave privada
-    reload_config()           → relê env sem reiniciar
-
-Modos (env BRN_P2P_AUTH):
-    "off" | "optional" | "required"
-
-Garantias:
-    - Assinatura Ed25519 sobre canonical JSON (sort_keys, no-space)
-    - Anti-replay via nonce cache (janela configurável)
-    - Anti-DoS: bloqueia pubkey após N falhas
-    - Nonce só consumido DEPOIS da assinatura válida
-    - Limites de tamanho em todos os campos
-
-Env:
-    BRN_P2P_AUTH, BRN_P2P_AUTH_WINDOW, BRN_P2P_NONCE_CACHE,
-    BRN_P2P_FAIL_THRESHOLD, BRN_P2P_FAIL_BLOCK_S
-
-Compatível com p2p_unified.py v6.6.3.
+v4:
+  [FIX] CRÍTICO: verify_auth() não estoura mais TypeError quando
+        o JSON tem campos null. Qualquer peer malicioso podia
+        derrubar o nó enviando {"nonce": null, ...}.
+        Agora normalizamos TODOS os campos para string ANTES de
+        qualquer operação, com isinstance() em vez de .get(default).
+v3:
+  [KEEP] Anti-replay via nonce cache (janela configurável)
+  [KEEP] Anti-DoS: bloqueia pubkey após N falhas
+  [KEEP] Nonce só consumido DEPOIS da assinatura válida
 ================================================================
 """
 from __future__ import annotations
@@ -43,7 +30,7 @@ log = logging.getLogger("p2p_auth")
 
 
 # ============================================================
-# CONFIG (lazy — reload_config() relê env)
+# CONFIG
 # ============================================================
 _CONFIG: dict = {}
 
@@ -59,7 +46,6 @@ def reload_config() -> dict:
         if window < 5 or window > 3600:
             raise ValueError
     except (ValueError, TypeError):
-        log.warning("BRN_P2P_AUTH_WINDOW inválido — usando 30")
         window = 30
 
     try:
@@ -67,7 +53,6 @@ def reload_config() -> dict:
         if cache_size < 100:
             raise ValueError
     except (ValueError, TypeError):
-        log.warning("BRN_P2P_NONCE_CACHE inválido — usando 10000")
         cache_size = 10000
 
     try:
@@ -106,7 +91,7 @@ MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
 
 
 # ============================================================
-# IMPORTS Ed25519 (com fallback crypto → cryptography)
+# Ed25519 (com fallback)
 # ============================================================
 _Ed25519PublicKey = None
 _CRYPTO_SOURCE = ""
@@ -127,7 +112,7 @@ except Exception:
 
 
 # ============================================================
-# ESTADO GLOBAL
+# ESTADO
 # ============================================================
 _node_id_priv = None
 _node_id_pub_hex = ""
@@ -141,7 +126,7 @@ _fail_lock = threading.RLock()
 
 
 # ============================================================
-# CONFIG PÚBLICA
+# API
 # ============================================================
 def auth_enabled() -> bool:
     return _CONFIG.get("mode") in ("optional", "required")
@@ -152,7 +137,6 @@ def auth_required() -> bool:
 
 
 def set_node_id_priv(priv) -> None:
-    """Registra a chave privada Ed25519 do nó."""
     global _node_id_priv, _node_id_pub_hex
     with _node_lock:
         _node_id_priv = priv
@@ -184,7 +168,6 @@ def _canonical_json(obj) -> bytes:
 
 
 def _msg_hash(msg) -> str:
-    """sha256 canônico do payload (sem campo _auth)."""
     if msg is None:
         return "0" * 64
     if not isinstance(msg, dict):
@@ -227,7 +210,7 @@ def _verify_sig(pub_hex: str, sig_hex: str, data: bytes) -> bool:
 
 
 # ============================================================
-# ANTI-DOS — bloqueio por pubkey
+# ANTI-DOS
 # ============================================================
 def _is_blocked(pub_hex: str) -> bool:
     if not pub_hex:
@@ -268,7 +251,7 @@ def _clear_failures(pub_hex: str) -> None:
 
 
 # ============================================================
-# CACHE DE NONCES (anti-replay)
+# NONCE CACHE
 # ============================================================
 def _nonce_seen(nonce: str, ts: int) -> bool:
     if not nonce:
@@ -310,11 +293,6 @@ def _nonce_mark(nonce: str, ts: int) -> None:
 # BUILD AUTH
 # ============================================================
 def build_auth(msg=None) -> dict:
-    """
-    Constrói bloco de autenticação:
-        {"pub": hex, "ts": int, "nonce": hex, "msg_hash": hex, "sig": hex}
-    Assina: DOMAIN || pub || '|' || ts || '|' || nonce || '|' || msg_hash
-    """
     priv = _node_id_priv
     if priv is None:
         return {}
@@ -347,24 +325,38 @@ def build_auth(msg=None) -> dict:
 
 
 # ============================================================
-# VERIFY AUTH
+# [FIX v4] VERIFY AUTH — normaliza TODOS os campos para string
 # ============================================================
+def _as_str(v) -> str:
+    """Converte qualquer valor JSON para string segura.
+    None, int, dict, list → string vazia.
+    Só aceita str (e rejeita str com len absurdo)."""
+    if isinstance(v, str):
+        return v
+    return ""
+
+
 def verify_auth(auth: dict, msg=None) -> tuple:
     """
     Verifica bloco de autenticação.
     Retorna (True, "") se OK, senão (False, motivo).
+
+    [FIX v4] Normaliza TODOS os campos para string ANTES de
+    qualquer operação. Antes, se um peer enviasse {"nonce": null},
+    o .get() retornava None e len(None) estourava TypeError,
+    permitindo DoS trivial.
     """
     if not auth or not isinstance(auth, dict):
         return False, "auth vazio ou invalido"
 
-    pub       = auth.get("pub", "")
-    sig       = auth.get("sig", "")
-    nonce     = auth.get("nonce", "")
-    msg_hash  = auth.get("msg_hash", "")
+    # -------- normalização segura --------
+    pub       = _as_str(auth.get("pub"))
+    sig       = _as_str(auth.get("sig"))
+    nonce     = _as_str(auth.get("nonce"))
+    msg_hash  = _as_str(auth.get("msg_hash"))
     ts_raw    = auth.get("ts", 0)
 
-    if not isinstance(pub, str) or not isinstance(sig, str):
-        return False, "pub/sig devem ser strings"
+    # -------- limites de tamanho --------
     if len(pub) > MAX_PUB_LEN:
         return False, f"pub grande demais ({len(pub)})"
     if len(sig) > MAX_SIG_LEN:
@@ -376,11 +368,13 @@ def verify_auth(auth: dict, msg=None) -> tuple:
     if not pub or not sig:
         return False, "auth incompleto"
 
+    # -------- ts --------
     try:
         ts = int(ts_raw)
     except (ValueError, TypeError):
         return False, "ts invalido"
 
+    # -------- bloqueio por pubkey --------
     if _is_blocked(pub):
         return False, "pubkey temporariamente bloqueada"
 
@@ -390,6 +384,7 @@ def verify_auth(auth: dict, msg=None) -> tuple:
     if delta > window:
         return False, f"ts fora da janela (delta={delta}s > {window}s)"
 
+    # -------- payload binding --------
     if msg is not None:
         try:
             expected_hash = _msg_hash(msg)
@@ -402,15 +397,16 @@ def verify_auth(auth: dict, msg=None) -> tuple:
             _record_failure(pub)
             return False, "msg_hash nao corresponde ao payload"
 
+    # -------- assinatura --------
     to_verify = b"".join([
         _DOMAIN,
         pub.encode("ascii", "ignore"),
         b"|",
         str(ts).encode("ascii"),
         b"|",
-        (nonce or "").encode("ascii", "ignore"),
+        nonce.encode("ascii", "ignore"),
         b"|",
-        (msg_hash or "").encode("ascii", "ignore"),
+        msg_hash.encode("ascii", "ignore"),
     ])
 
     if not _verify_sig(pub, sig, to_verify):
@@ -419,6 +415,7 @@ def verify_auth(auth: dict, msg=None) -> tuple:
 
     _clear_failures(pub)
 
+    # -------- anti-replay --------
     if not nonce:
         return False, "nonce ausente"
     if _nonce_seen(nonce, ts):
@@ -429,7 +426,7 @@ def verify_auth(auth: dict, msg=None) -> tuple:
 
 
 # ============================================================
-# STATUS / INFO
+# STATUS
 # ============================================================
 def status() -> dict:
     with _nonce_lock:
@@ -535,6 +532,25 @@ def _cmd_test() -> int:
     print(f"verify_auth payload trocado: ok={ok3} err={err3!r}")
     if ok3:
         print("ERRO: payload trocado aceito", file=sys.stderr)
+        return 1
+
+    # ---- NOVO TESTE: campos null não derrubam ----
+    evil = {"pub": None, "sig": None, "nonce": None,
+            "msg_hash": None, "ts": None}
+    ok4, err4 = verify_auth(evil)
+    print(f"verify_auth null fields: ok={ok4} err={err4!r}")
+    if ok4:
+        print("ERRO: null aceito", file=sys.stderr)
+        return 1
+    if not isinstance(err4, str):
+        print("ERRO: err não é string", file=sys.stderr)
+        return 1
+
+    evil2 = {"pub": 123, "sig": 456, "nonce": [], "msg_hash": {}, "ts": "abc"}
+    ok5, err5 = verify_auth(evil2)
+    print(f"verify_auth wrong types: ok={ok5} err={err5!r}")
+    if ok5:
+        print("ERRO: wrong types aceito", file=sys.stderr)
         return 1
 
     print("\nTudo OK.")

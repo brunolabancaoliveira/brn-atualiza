@@ -1725,32 +1725,39 @@ class P2PManager:
         except Exception:
             return False
 
+        # ============================================================
+    # v6.6.5: _on_peer_bad / _on_peer_good corrigidos
+    # ------------------------------------------------------------
+    # Antes: passava peer_id (pubkey hex) como chave do UPDATE,
+    #        mas a coluna 'address' é "ip:porta". Sem match, o
+    #        score nunca subia/descia.
+    # Agora: usa peer_ip (que é o que o DB indexa).
+    # ============================================================
     def _on_peer_bad(self, peer_ip: str, peer_id: Optional[str] = None) -> None:
         try:
-            target = peer_id or peer_ip
-            novo = self.bc.db.add_peer_score(target, PEER_SCORE_PENALTY_BAD)
+            # Score por IP (chave real da tabela peers)
+            novo = self.bc.db.add_peer_score(peer_ip, PEER_SCORE_PENALTY_BAD)
             if novo <= PEER_SCORE_BAN_THRESHOLD:
-                log.warning(f"BAN: {target}")
+                log.warning(f"BAN: {peer_ip} (score={novo})")
+                # Remove pelo pubkey se disponível, senão pelo endereço
                 if peer_id:
                     try:
                         self.bc.db.remover_peer_por_pubkey(peer_id)
                     except Exception:
                         pass
-                else:
-                    try:
-                        self.bc.db.remover_peer_por_endereco(peer_ip)
-                    except Exception:
-                        pass
+                try:
+                    self.bc.db.remover_peer_por_endereco(peer_ip)
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def _on_peer_good(self, peer_ip: str, peer_id: Optional[str] = None) -> None:
         try:
-            target = peer_id or peer_ip
-            self.bc.db.add_peer_score(target, PEER_SCORE_REWARD_GOOD)
+            # Score por IP (chave real da tabela peers)
+            self.bc.db.add_peer_score(peer_ip, PEER_SCORE_REWARD_GOOD)
         except Exception:
             pass
-
 
 if __name__ == "__main__":
     print("Rode via main.py")
