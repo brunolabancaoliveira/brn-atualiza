@@ -1,18 +1,29 @@
-"""main.py — Entrypoint unificado do nó BRN (v12.8)
+"""main.py — Entrypoint unificado do nó BRN (v12.7)
 ================================================================
-v12.8:
-  [NEW] Integra brn_peer_discovery.py: descobre peers via
-        `tailscale status` no boot e atualiza bootstrap_peers.json
-        automaticamente. Fallback em camadas.
 v12.7:
-  [FIX] CRÍTICO: _setup_sync agora lê bootstrap_peers.json e
-        BRN_BOOTSTRAP_PEERS diretamente como fallback, evitando
-        o race condition onde o P2P ainda não tinha populado
-        p2p.peers no momento do boot.
+  [NEW] Pool de Mineração (mining_pool.PoolManager)
+        — Injetado no server.py via set_pool_manager()
+        — Callback on_block_mined → broadcast P2P
 v12.6:
-  [FIX] CRÍTICO: injeta P2PManager no server.py (set_p2p_manager)
+  [FIX] Injeta P2PManager no server.py (set_p2p_manager)
 v12.5:
-  [NEW] Sync manager (ChainSyncManager) + rendezvous + relay
+  [NEW] Sync manager + rendezvous + relay
+================================================================
+Amarra tudo:
+  1. Config (brn_config.Config) + env
+  2. Senha do nó
+  3. Identidade Ed25519 (node_identity.enc)
+  4. Blockchain (blockchain.py v9.1.8)
+  5. P2P (p2p_unified.P2PManager)
+  6. Sync (sync_manager.ChainSyncManager)
+  7. Rendezvous (rendezvous_discovery.RendezvousDiscovery)
+  8. Relay (p2p_relay.RelayManager)
+  9. L2 (btc_watcher.BTCWatcher)
+ 10. Pool de Mineração (mining_pool.PoolManager)
+ 11. HTTP server (server.py v9.9)
+ 12. Explorer (explorer.py)
+ 13. Miner local (miner_loop.get_miner)
+ 14. Loop principal até Ctrl+C
 ================================================================
 """
 from __future__ import annotations
@@ -30,13 +41,12 @@ from pathlib import Path
 
 
 # ============================================================
-# BASE_DIR — antes de qualquer import do projeto
+# BASE_DIR
 # ============================================================
 BASE_DIR = Path(__file__).resolve().parent
 
 
 def _bootstrap_env() -> None:
-    """Lê brn_network.env relativo ao MÓDULO (não ao CWD)."""
     env_file = BASE_DIR / "brn_network.env"
     if not env_file.exists():
         return
@@ -55,7 +65,7 @@ def _bootstrap_env() -> None:
 
 
 # ============================================================
-# DEFAULTS HARDCODED (menor prioridade)
+# DEFAULTS HARDCODED
 # ============================================================
 _HARDCODED_DEFAULTS = {
     "BRN_NODE_PASSWORD":       "senha-no-temp-123",
@@ -89,6 +99,9 @@ _HARDCODED_DEFAULTS = {
     "TS_API_KEY":              "",
     "TS_TAILNET":              "",
     "TS_HOSTNAME_PREFIX":      "brn-node",
+
+    # Pool
+    "BRN_POOL_ENABLED":        "1",
 }
 
 
@@ -113,13 +126,6 @@ if _applied:
 from brn_config import Config
 from brn_logger import setup_logger, get_logger
 from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
-
-# ⭐ [v12.8] Descoberta automática de peers via Tailscale
-try:
-    from brn_peer_discovery import refresh_peers_from_tailscale
-    _PEER_DISCOVERY_OK = True
-except ImportError:
-    _PEER_DISCOVERY_OK = False
 
 _shutdown = threading.Event()
 
@@ -192,7 +198,7 @@ def _check_required_modules() -> list:
 
 
 # ============================================================
-# L2 — fallback que NUNCA quebra o nó
+# L2 — fallback
 # ============================================================
 L2_ENABLED = False
 btc_config = None
@@ -215,6 +221,26 @@ def _l2_disponivel() -> bool:
             and btc_config is not None
             and BTCWatcher is not None
             and L2Manager is not None)
+
+
+# ============================================================
+# POOL — import com fallback
+# ============================================================
+POOL_ENABLED = os.environ.get("BRN_POOL_ENABLED", "1") == "1"
+PoolManager = None
+
+if POOL_ENABLED:
+    try:
+        from mining_pool import PoolManager
+        print("[Pool] Módulo de pool carregado OK")
+    except Exception as _e:
+        print("[AVISO] mining_pool indisponível: " + str(_e))
+        print("[AVISO] Pool DESATIVADO — mineração local continua.")
+        PoolManager = None
+
+
+def _pool_disponivel() -> bool:
+    return POOL_ENABLED and PoolManager is not None
 
 
 # ============================================================
@@ -274,40 +300,6 @@ def _setup_tailscale_auto(log) -> bool:
 
 
 # ============================================================
-# ⭐ [v12.8] PEER DISCOVERY VIA TAILSCALE
-# ============================================================
-def _discover_peers_tailscale(log) -> list:
-    """
-    Descobre peers via `tailscale status` e atualiza bootstrap_peers.json.
-
-    Retorna lista de strings "ip:porta" ou [] se falhar.
-    """
-    if not _PEER_DISCOVERY_OK:
-        log.info("Discovery: brn_peer_discovery.py não disponível")
-        return []
-
-    try:
-        log.info("Descobrindo peers via Tailscale...")
-        peers = refresh_peers_from_tailscale(prefer_os="linux")
-
-        if not peers:
-            log.warning("Discovery: nenhum peer Tailscale encontrado")
-            return []
-
-        log.info("Discovery: %d peer(s) detectados:", len(peers))
-        for p in peers:
-            log.info("  - " + str(p))
-
-        # Atualiza env para o _setup_sync usar depois
-        os.environ["BRN_BOOTSTRAP_PEERS"] = ",".join(peers)
-
-        return peers
-    except Exception as e:
-        log.warning("Discovery falhou: " + str(e))
-        return []
-
-
-# ============================================================
 # ARGS
 # ============================================================
 def parse_args():
@@ -334,7 +326,8 @@ def parse_args():
     p.add_argument("--skip-verify", action="store_true")
     p.add_argument("--no-tailscale", action="store_true")
     p.add_argument("--no-sync", action="store_true")
-    p.add_argument("--no-discovery", action="store_true")   # ⭐ v12.8
+    p.add_argument("--no-pool", action="store_true")
+    p.add_argument("--pool-stats", action="store_true")
     return p.parse_args()
 
 
@@ -506,6 +499,7 @@ def do_status(cfg):
     print(" Rendezvous  : " + (rdv if rdv else "(não configurado)"))
     print(" Tailscale   : " + (ts if ts else "(desabilitado)"))
     print(" Auto-mine   : " + ("SIM" if AUTO_MINE else "não"))
+    print(" Pool        : " + ("SIM" if _pool_disponivel() else "não"))
     print()
 
     missing = _check_required_modules()
@@ -558,9 +552,6 @@ def do_status(cfg):
             print(" MongoDB     : off (" + (err if err else "não configurado") + ")")
     except Exception:
         print(" MongoDB     : pymongo indisponível")
-
-    # ⭐ Status do peer discovery
-    print(" PeerDiscov. : " + ("ativo" if _PEER_DISCOVERY_OK else "indisponível"))
 
     print("=" * 64)
 
@@ -675,7 +666,7 @@ def run_explorer():
 # ============================================================
 # STATUS LOOP
 # ============================================================
-def run_status_loop(chain, p2p, l2_manager=None, sync=None):
+def run_status_loop(chain, p2p, l2_manager=None, sync=None, pool=None):
     log = get_logger("status")
     if p2p is None:
         log.warning("P2P desabilitado — status loop sem peers")
@@ -731,6 +722,17 @@ def run_status_loop(chain, p2p, l2_manager=None, sync=None):
                     msg += (" L2[OPEN=" + str(s.get("open", 0))
                             + " DETECTED=" + str(s.get("btc_detected", 0))
                             + " RELEASED=" + str(s.get("released", 0)) + "]")
+                except Exception:
+                    pass
+
+            if pool is not None:
+                try:
+                    ps = pool.stats()
+                    msg += (" Pool[miners=" + str(ps.get("miners_active", 0))
+                            + " hash=" + str(round(ps.get("hashrate_total", 0), 1))
+                            + " H/s"
+                            + " shares=" + str(ps.get("shares_period", 0))
+                            + " blocks=" + str(ps.get("blocks_found", 0)) + "]")
                 except Exception:
                     pass
 
@@ -833,7 +835,6 @@ def _setup_relay(p2p, node_id_priv, enabled):
 # SYNC SETUP
 # ============================================================
 def _list_p2p_peers(p2p):
-    """Normaliza a lista de peers do p2p_unified para (ip, port, id, h, w)."""
     out = []
 
     def _pick(v, *names):
@@ -898,10 +899,6 @@ def _list_p2p_peers(p2p):
 
 
 def _setup_sync(chain, p2p, log):
-    """
-    v12.7 — Corrigido para ler bootstrap_peers.json e BRN_BOOTSTRAP_PEERS
-    diretamente, evitando o race condition.
-    """
     if p2p is None:
         log.info("Sync: P2P desligado — sem sync")
         return None
@@ -918,9 +915,6 @@ def _setup_sync(chain, p2p, log):
         log.warning("ChainSyncManager falhou: " + str(e))
         return None
 
-    # ============================================================
-    # 1) Peers do P2P
-    # ============================================================
     n_inicial = 0
     for ip, port, node_id, height, work in _list_p2p_peers(p2p):
         try:
@@ -929,65 +923,8 @@ def _setup_sync(chain, p2p, log):
             n_inicial += 1
         except Exception as e:
             log.debug("sync.register_peer falhou: " + str(e))
-    log.info("Sync: " + str(n_inicial) + " peer(s) obtidos do P2P")
+    log.info("Sync: " + str(n_inicial) + " peer(s) registrados inicialmente")
 
-    # ============================================================
-    # 2) LÊ bootstrap_peers.json
-    # ============================================================
-    n_bootstrap = 0
-    try:
-        bp_file = BASE_DIR / "bootstrap_peers.json"
-        if bp_file.exists():
-            with open(bp_file, "r", encoding="utf-8") as f:
-                bp_list = json.load(f)
-            if isinstance(bp_list, list):
-                for entry in bp_list:
-                    entry = str(entry).strip()
-                    if ":" not in entry:
-                        continue
-                    ip, port_s = entry.rsplit(":", 1)
-                    try:
-                        port_i = int(port_s)
-                    except ValueError:
-                        continue
-                    if entry not in sync.peers:
-                        sync.register_peer(entry, ip, port_i, 0, 0)
-                        n_bootstrap += 1
-    except Exception as e:
-        log.warning("Falha lendo bootstrap_peers.json: " + str(e))
-    if n_bootstrap:
-        log.info("Sync: +" + str(n_bootstrap) + " peer(s) do bootstrap_peers.json")
-
-    # ============================================================
-    # 3) LÊ BRN_BOOTSTRAP_PEERS do env
-    # ============================================================
-    n_env = 0
-    try:
-        env_bp = os.environ.get("BRN_BOOTSTRAP_PEERS", "").strip()
-        if env_bp:
-            for entry in env_bp.split(","):
-                entry = entry.strip()
-                if ":" not in entry:
-                    continue
-                ip, port_s = entry.rsplit(":", 1)
-                try:
-                    port_i = int(port_s)
-                except ValueError:
-                    continue
-                if entry not in sync.peers:
-                    sync.register_peer(entry, ip, port_i, 0, 0)
-                    n_env += 1
-    except Exception as e:
-        log.warning("Falha lendo BRN_BOOTSTRAP_PEERS: " + str(e))
-    if n_env:
-        log.info("Sync: +" + str(n_env) + " peer(s) do BRN_BOOTSTRAP_PEERS")
-
-    total = len(sync.peers)
-    log.info("Sync: total peer(s) registrados: " + str(total))
-
-    # ============================================================
-    # 4) Hook de peer novo
-    # ============================================================
     def _on_peer_found(node_id, ip, port, height=0, work=0):
         try:
             sync.register_peer(node_id or f"{ip}:{port}",
@@ -1004,9 +941,6 @@ def _setup_sync(chain, p2p, log):
             except Exception:
                 pass
 
-    # ============================================================
-    # 5) Inicia
-    # ============================================================
     try:
         sync.set_sync_mode("full")
         sync.start_sync_loop()
@@ -1017,6 +951,48 @@ def _setup_sync(chain, p2p, log):
         return sync
 
     return sync
+
+
+# ============================================================
+# POOL SETUP
+# ============================================================
+def _setup_pool(chain, p2p, log, disabled: bool):
+    """
+    Cria o PoolManager e liga o callback de broadcast de bloco.
+    Retorna a instância ou None.
+    """
+    if disabled:
+        log.info("Pool: desativado por --no-pool")
+        return None
+    if not _pool_disponivel():
+        log.info("Pool: módulo mining_pool indisponível")
+        return None
+
+    try:
+        pool = PoolManager(chain)
+    except Exception as e:
+        log.warning("PoolManager falhou: " + str(e))
+        return None
+
+    # Callback: quando o pool encontra um bloco, propaga via P2P
+    if p2p is not None:
+        def _on_pool_block(block):
+            try:
+                p2p.broadcast_block(block)
+                log.info("pool: bloco #" + str(block.get("height"))
+                         + " propagado via P2P")
+            except Exception as e:
+                log.debug("pool: broadcast_block falhou: " + str(e))
+
+        try:
+            pool.on_block_mined = _on_pool_block
+        except Exception:
+            pass
+
+    log.info("Pool: pronto (share_diff_offset="
+             + str(getattr(__import__("mining_pool"), "SHARE_DIFF_OFFSET", "?"))
+             + ")")
+    return pool
 
 
 # ============================================================
@@ -1094,9 +1070,11 @@ def main():
         l2_mode = "off"
     else:
         l2_mode = "INDISPONÍVEL"
+    pool_mode = "off" if args.no_pool else ("ON" if _pool_disponivel() else "off")
     log.info(" Config: " + cfg.source
              + " | Modo: " + ("ORIGEM" if is_origin else "CLIENTE")
-             + " | L2: " + l2_mode)
+             + " | L2: " + l2_mode
+             + " | Pool: " + pool_mode)
     log.info(" HTTPS: " + ("ON" if os.environ.get("BRN_HTTPS") == "1" else "off")
              + " | Rendezvous: " + (os.environ.get("BRN_RENDEZVOUS_URL", "—") or "—")
              + " | Auto-mine: " + ("ON" if AUTO_MINE else "off"))
@@ -1127,6 +1105,21 @@ def main():
         except Exception as e:
             print("Erro: " + str(e))
         return 0
+    if args.pool_stats:
+        if not _pool_disponivel():
+            print("Pool não disponível")
+            return 0
+        try:
+            from db import ChainDB
+            from blockchain import Blockchain
+            bc = Blockchain(cfg["db_path"], auto_genesis=False)
+            pool = PoolManager(bc)
+            print(json.dumps(pool.stats(), indent=2, ensure_ascii=False))
+            pool.stop()
+            bc.db.close()
+        except Exception as e:
+            print("Erro: " + str(e))
+        return 0
 
     # ---- módulos obrigatórios ----
     missing = _check_required_modules()
@@ -1134,21 +1127,11 @@ def main():
         log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
         return 1
 
-    # ============================================================
-    # ---- Tailscale + Peer Discovery ----
-    # ============================================================
+    # ---- Tailscale ----
     if not args.no_tailscale:
         _setup_tailscale_auto(log)
-
-        # ⭐ v12.8: descobre peers automaticamente via Tailscale
-        if not args.no_discovery:
-            _discover_peers_tailscale(log)
-        else:
-            log.info("Discovery: pulado por --no-discovery")
     else:
         log.info("Tailscale: pulado por --no-tailscale")
-        if not args.no_discovery:
-            _discover_peers_tailscale(log)
 
     # ---- identidade ----
     node_password = _resolve_password(args)
@@ -1288,6 +1271,11 @@ def main():
     elif args.l2:
         log.warning("--l2 solicitado, mas L2 não disponível. Ignorando.")
 
+    # ---- [NEW v12.7] Pool de mineração ----
+    pool = _setup_pool(chain, p2p, log, disabled=args.no_pool)
+    if pool is not None:
+        _register_service("pool", pool)
+
     # ---- Injeta P2PManager no server.py ----
     if p2p is not None:
         try:
@@ -1303,6 +1291,21 @@ def main():
     else:
         log.warning("Sem P2PManager — tx nao serao propagadas")
 
+    # ---- [NEW v12.7] Injeta PoolManager no server.py ----
+    if pool is not None:
+        try:
+            import server as _srv
+            if hasattr(_srv, "set_pool_manager"):
+                _srv.set_pool_manager(pool)
+                log.info("PoolManager injetado no server.py")
+            else:
+                log.warning("server.py sem set_pool_manager — "
+                            "endpoints /api/pool/* indisponiveis")
+        except Exception as e:
+            log.warning("Falha injetando Pool no server: " + str(e))
+    else:
+        log.info("Pool desativado — endpoints /api/pool/* indisponiveis")
+
     # ---- HTTP ----
     http_app = _init_http_server(chain, log)
     if http_app is not None:
@@ -1317,7 +1320,7 @@ def main():
     threading.Thread(target=_thread_wrap("Explorer", run_explorer),
                      daemon=True, name="Explorer").start()
 
-    # ---- Miner ----
+    # ---- Miner local (modo clássico --mine) ----
     if args.mine or AUTO_MINE:
         try:
             from miner_loop import get_miner
@@ -1353,15 +1356,15 @@ def main():
             else:
                 miner.start(mw.address, pub)
                 _register_service("miner", miner)
-                log.info("Miner iniciado com " + mw.address)
+                log.info("Miner local iniciado com " + mw.address)
         except Exception as e:
-            log.warning("Miner falhou: " + str(e))
+            log.warning("Miner local falhou: " + str(e))
 
     # ---- Status loop ----
     threading.Thread(
         target=_thread_wrap(
             "StatusLoop",
-            lambda: run_status_loop(chain, p2p, l2_manager, sync),
+            lambda: run_status_loop(chain, p2p, l2_manager, sync, pool),
         ),
         daemon=True, name="StatusLoop",
     ).start()
@@ -1380,6 +1383,7 @@ def main():
         "mode":       "origin" if is_origin else "client",
         "l2":         bool(args.l2 and l2_ativo),
         "mine":       bool(args.mine or AUTO_MINE),
+        "pool":       bool(pool),
         "https":      os.environ.get("BRN_HTTPS") == "1",
         "height":     chain.db.height(),
         "node_id":    node_id_pub[:16],
@@ -1388,7 +1392,6 @@ def main():
         "sync":       bool(sync),
         "p2p":        bool(p2p),
         "tailscale":  bool(os.environ.get("TS_TAILNET", "").strip()),
-        "discovery":  _PEER_DISCOVERY_OK,
     })
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
