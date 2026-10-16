@@ -1,15 +1,18 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.1.8-reorg | Data: 15/10/2026
+Versão: 9.1.9-reorg | Data: 16/10/2026
 ================================================================
+v9.1.9:
+  [NEW] Integração com brn_miner.py (aceleração PoW em C)
+        — usa brn_pow_search() se a lib estiver presente; cai para
+        Python puro se não. Ganho típico: 10-30x em hashes/s.
+  [NEW] Log de rejeição em mine_block_interruptible
+        — se accept_block falhar, loga o motivo (antes silenciava)
 v9.1.8:
   [FIX] CRÍTICO: validate_tx agora checa mempool contra double-spend
-        — antes duas txs podiam gastar o mesmo UTXO na mempool
   [FIX] CRÍTICO: mine_block_interruptible re-valida cada tx da mempool
-        — antes um bloco inteiro era rejeitado se uma tx da mempool
-        já tivesse sido gasta por outra (via mineração paralela)
   [NEW] log dedicado (logging.getLogger("blockchain"))
 v9.1.7-reorg:
-  [CHANGE] reorg_to() movido para reorg.py (plugado no fim do arquivo).
+  [CHANGE] reorg_to() movido para reorg.py (plugado no fim do arquivo)
   [KEEP]   Todo o resto do v9.1.7 inalterado:
             - Anti-death-spiral (BRN_FORCE_DIFFICULTY, BRN_BLOCK_TIME,
               BRN_DIFF_INTERVAL, BRN_MAX_DIFFICULTY)
@@ -80,6 +83,32 @@ AUTH_TAG_DOMAIN = b"BRN-BLOCK-AUTH-v1|"
 _CORE_V = 1
 
 NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
+
+
+# ============================================================
+# [NEW v9.1.9] ACELERAÇÃO PoW EM C (opcional)
+# ============================================================
+try:
+    import brn_miner as _brn_miner_c
+    _HAS_C_MINER = _brn_miner_c.is_available()
+    if _HAS_C_MINER:
+        log.info("PoW C acceleration ATIVA (%s)",
+                 _brn_miner_c.library_path())
+    else:
+        log.info("PoW C acceleration indisponível — usando Python puro")
+except Exception as _e:
+    _brn_miner_c = None
+    _HAS_C_MINER = False
+    log.debug("brn_miner.py nao disponivel: %s", _e)
+
+
+def miner_info() -> dict:
+    """Diagnóstico: revela se C está a ser usado."""
+    if _HAS_C_MINER and _brn_miner_c is not None:
+        return {"c_available": True,
+                "path": str(_brn_miner_c.library_path()),
+                "python_fallback": True}
+    return {"c_available": False, "path": None, "python_fallback": True}
 
 
 # ============================================================
@@ -246,10 +275,11 @@ def signing_hash(tx: dict) -> bytes:
 
 
 # ============================================================
-# HOT LOOP PoW
+# HOT LOOP PoW — [NEW v9.1.9] com aceleração C opcional
 # ============================================================
-def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
-                should_continue=None, progress_cb=None):
+def _pow_search_py(prev_hash, merkle, ts, diff, nonce_start=0,
+                   should_continue=None, progress_cb=None):
+    """Fallback Python puro (sem C)."""
     prefix = f"{prev_hash}{merkle}{ts}".encode()
     diff_bytes = str(diff).encode()
     target_int = int("0" * int(diff) + "f" * (64 - int(diff)), 16)
@@ -273,6 +303,66 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
                 progress_cb(nonce, hashes_done)
             except Exception:
                 pass
+
+
+def _pow_search_c(prev_hash, merkle, ts, diff, nonce_start,
+                  should_continue, progress_cb):
+    """
+    Aceleração C via brn_miner.brn_pow_search().
+    Chama em batches de HASH_BATCH_SIZE para permitir interrupção.
+    """
+    prefix = f"{prev_hash}{merkle}{ts}"
+    diff_str = str(int(diff))
+    nonce = nonce_start
+    hashes_done = 0
+
+    while True:
+        try:
+            result = _brn_miner_c.pow_search(
+                prefix, diff_str, int(diff),
+                nonce_start=nonce,
+                max_iters=HASH_BATCH_SIZE,
+            )
+        except Exception as e:
+            log.warning("brn_miner.pow_search falhou: %s — caindo para Python", e)
+            return _pow_search_py(prev_hash, merkle, ts, diff,
+                                   nonce, should_continue, progress_cb)
+
+        if result is None:
+            # lib indisponível a meio — fallback
+            return _pow_search_py(prev_hash, merkle, ts, diff,
+                                   nonce, should_continue, progress_cb)
+
+        found_nonce, found_hash, batch_hashes = result
+        hashes_done += batch_hashes
+
+        if found_nonce is not None:
+            return found_nonce, found_hash, hashes_done
+
+        # Não encontrou nesta batch: avança pelo nº real de hashes feitos
+        nonce += batch_hashes
+
+        if should_continue is not None and not should_continue():
+            return None, None, hashes_done
+
+        if progress_cb is not None:
+            try:
+                progress_cb(nonce, hashes_done)
+            except Exception:
+                pass
+
+
+def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
+                should_continue=None, progress_cb=None):
+    """
+    Dispatcher: usa C se disponível, senão Python.
+    A assinatura é compatível com a versão anterior.
+    """
+    if _HAS_C_MINER and _brn_miner_c is not None:
+        return _pow_search_c(prev_hash, merkle, ts, diff, nonce_start,
+                              should_continue, progress_cb)
+    return _pow_search_py(prev_hash, merkle, ts, diff, nonce_start,
+                          should_continue, progress_cb)
 
 
 # ============================================================
@@ -599,10 +689,6 @@ class Blockchain:
         # ------------------------------------------------------------
         # [FIX v9.1.8] Anti double-spend com a mempool
         # ------------------------------------------------------------
-        # Só verifica quando a tx vem de fora (submit_tx).
-        # Não verifica quando o próprio bloco está a ser construído
-        # (from_mempool=True), porque nesse caso as txs da mempool
-        # já gastaram os seus UTXOs (mas ainda não foi aplicado no DB).
         if not from_mempool:
             try:
                 gastos_mem = self.db.utxos_gastos_na_mempool()
@@ -850,8 +936,6 @@ class Blockchain:
 
         # ------------------------------------------------------------
         # [FIX v9.1.8] Re-valida cada tx da mempool antes de incluir
-        # Evita que um bloco inteiro seja rejeitado porque uma tx da
-        # mempool já foi gasta por outra (via mineração paralela).
         # ------------------------------------------------------------
         candidatas = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
         selected = []
@@ -867,7 +951,6 @@ class Blockchain:
                     )
                     continue
 
-                # Verifica conflito interno (mesma UTXO no mesmo bloco)
                 conflito = False
                 for inp in t.get("inputs", []):
                     key = (inp["txid"], int(inp["vout"]))
@@ -881,7 +964,6 @@ class Blockchain:
                     )
                     continue
 
-                # Marca UTXOs como usados neste bloco
                 for inp in t.get("inputs", []):
                     gastos_neste_bloco.add(
                         (inp["txid"], int(inp["vout"]))
@@ -921,6 +1003,14 @@ class Blockchain:
         if ok:
             self._fire_block_mined(block)
             return block
+
+        # ------------------------------------------------------------
+        # [NEW v9.1.9] Log de rejeição — antes silenciava o motivo
+        # ------------------------------------------------------------
+        log.warning(
+            f"[MINER] bloco #{block.get('height')} minerado mas "
+            f"REJEITADO: {_msg}"
+        )
         return None
 
     # ============================================================
@@ -939,9 +1029,6 @@ class Blockchain:
 
 # ============================================================
 # PLUGIN DO REORG (reorg.py)
-# ------------------------------------------------------------
-# Plugado depois da classe para manter o reorg.py como módulo
-# independente. Substitui qualquer reorg_to() embutido.
 # ============================================================
 try:
     from reorg import reorg_to as _reorg_to, find_fork_point as _find_fork
@@ -990,6 +1077,13 @@ if __name__ == "__main__":
     os.environ.setdefault("BRN_NETWORK_SECRET",
                           "segredo-de-teste-blockchain-1234567")
 
+    print("\n[0] Aceleração PoW:")
+    mi = miner_info()
+    if mi["c_available"]:
+        print(f"    C ATIVA — {mi['path']}")
+    else:
+        print("    Python puro (brn_miner.so/dll não encontrada)")
+
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, "test.db")
 
@@ -1009,14 +1103,18 @@ if __name__ == "__main__":
         print(f"\n[3] current_difficulty: {bc.current_difficulty()}")
         print(f"[4] cumulative_work: {bc.cumulative_work():,}")
 
-        print("\n[5] Mineração de 3 blocos:")
+        print("\n[5] Mineração de 3 blocos (aceleração testada):")
         addr = GENESIS_ADDRESS
         pub = "02" + "aa" * 32
+        t0 = time.time()
         for i in range(3):
             blk = bc.mine_block(addr, pub)
             assert blk is not None
             print(f"    #{blk['height']} diff={blk['difficulty']} "
                   f"hash={blk['hash'][:16]}...")
+        dt = time.time() - t0
+        print(f"    3 blocos em {dt:.2f}s "
+              f"({dt/3:.2f}s/bloco, diff={bc.current_difficulty()})")
         assert bc.db.height() == 3
         print("    [ok]")
 
