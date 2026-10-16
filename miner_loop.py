@@ -1,14 +1,21 @@
 """
-miner_loop.py — Loop de mineracao do BRN (v6.5)
+miner_loop.py — Loop de mineracao do BRN (v6.7)
 ================================================================
+v6.7:
+  [FIX] _loop() agora LIMPA chain._fork_signal imediatamente ao
+        detectá-lo, em vez de esperar 60s.
+        Isto é essencial para o miner Solo: quando um bloco novo
+        chega via P2P (accept_block → _fork_signal.set()), o miner
+        aborta a tentativa atual em <500ms e recomeça no novo topo.
+        Antes, ficava até 60s bloqueado a olhar para o sinal.
+  [NEW] Log "[SOLO] ... novo bloco/reorg detectado" em vez de
+        "[FORK] abortando" (mais preciso).
+v6.6:
+  [NEW] Hashrate em tempo real (janela movel 10s)
 v6.5:
-  [FIX] Removido callback DUPLICADO de on_block_mined. Agora o
-        miner_loop NÃO chama mais chain.on_block_mined(), porque
-        o blockchain.py v9.1.8 já chama internamente via
-        _fire_block_mined(). Antes, cada bloco era propagado 2x
-        via P2P (desperdício + race nos peers).
+  [FIX] Removido callback DUPLICADO de on_block_mined
 v6.4:
-  [FIX] status() expõe fork_aborts
+  [FIX] status() expoe fork_aborts
 v6.3:
   [NEW] _should_continue() verifica chain._fork_signal
 ================================================================
@@ -37,6 +44,8 @@ BASE_DIR                 = Path(__file__).resolve().parent
 CURRENT_WALLET_ENC_FILE  = str(BASE_DIR / "current_wallet.enc")
 CURRENT_WALLET_FILE      = str(BASE_DIR / "current_wallet.json")
 
+# Janela movel para hashrate (segundos)
+HASHRATE_WINDOW    = float(os.environ.get("BRN_HASHRATE_WINDOW", "10"))
 FORK_POLL_INTERVAL = float(os.environ.get("BRN_FORK_POLL_INTERVAL", "0.5"))
 
 _MINER_INSTANCE = None
@@ -105,6 +114,45 @@ def _pubkey_no_db(bc, addr):
     return ""
 
 
+# ============================================================
+# HASHRATE METER (janela movel)
+# ============================================================
+class HashrateMeter:
+    """
+    Mede hashrate com janela movel.
+    Uso:
+        meter = HashrateMeter(window=10.0)
+        meter.add(total_hashes)   # total acumulado
+        rate = meter.rate()       # H/s
+    """
+    def __init__(self, window: float = 10.0):
+        self.window = float(window)
+        self._samples = []          # [(ts, total_hashes)]
+        self._lock = threading.RLock()
+
+    def add(self, total_hashes: int):
+        now = time.time()
+        with self._lock:
+            self._samples.append((now, int(total_hashes)))
+            cutoff = now - self.window
+            self._samples = [(t, h) for (t, h) in self._samples if t >= cutoff]
+
+    def rate(self) -> float:
+        with self._lock:
+            if len(self._samples) < 2:
+                return 0.0
+            t0, h0 = self._samples[0]
+            t1, h1 = self._samples[-1]
+            dt = t1 - t0
+            if dt <= 0:
+                return 0.0
+            return max(0.0, (h1 - h0) / dt)
+
+    def reset(self):
+        with self._lock:
+            self._samples.clear()
+
+
 class Miner:
     def __init__(self, chain):
         self.chain = chain
@@ -119,6 +167,15 @@ class Miner:
         self.started_at = 0.0
         self.fork_aborts = 0
         self.last_fork_at = 0.0
+
+        # hashrate
+        self.hashrate_meter = HashrateMeter(window=HASHRATE_WINDOW)
+        self.hashes_total = 0                 # acumulado da sessao
+        self._hashes_this_attempt = 0         # da tentativa atual
+        self._last_attempt_hashes = 0
+        self._attempt_t0 = 0.0
+        self.last_hashrate = 0.0
+        self._block_times = []                # tempos dos ultimos blocos
 
     # ============================================================
     # CONTROLE
@@ -144,6 +201,16 @@ class Miner:
         self.started_at = time.time()
         self.fork_aborts = 0
         self.last_fork_at = 0.0
+
+        # reset hashrate
+        self.hashes_total = 0
+        self._hashes_this_attempt = 0
+        self._last_attempt_hashes = 0
+        self._attempt_t0 = 0.0
+        self.last_hashrate = 0.0
+        self._block_times = []
+        self.hashrate_meter.reset()
+
         self._stop_evt.clear()
         self.running = True
 
@@ -162,6 +229,32 @@ class Miner:
         return True, "parado"
 
     # ============================================================
+    # HASH RATE
+    # ============================================================
+    def _on_progress(self, nonce: int, hashes_done: int):
+        """
+        Callback chamado pelo blockchain.py a cada HASH_BATCH_SIZE.
+        `hashes_done` = hashes feitos na tentativa atual.
+        """
+        now = time.time()
+        if self._attempt_t0 == 0.0:
+            self._attempt_t0 = now
+
+        self._hashes_this_attempt = hashes_done
+
+        delta = hashes_done - self._last_attempt_hashes
+        if delta > 0:
+            self.hashes_total += delta
+            self._last_attempt_hashes = hashes_done
+            self.hashrate_meter.add(self.hashes_total)
+            self.last_hashrate = self.hashrate_meter.rate()
+
+    def _reset_attempt(self):
+        self._attempt_t0 = 0.0
+        self._hashes_this_attempt = 0
+        self._last_attempt_hashes = 0
+
+    # ============================================================
     # STATUS
     # ============================================================
     def status(self):
@@ -174,6 +267,12 @@ class Miner:
         fork_sig = getattr(self.chain, "_fork_signal", None)
         forking = bool(fork_sig and fork_sig.is_set())
 
+        hashrate = self.last_hashrate
+
+        avg_s_per_block = 0.0
+        if self._block_times:
+            avg_s_per_block = sum(self._block_times) / len(self._block_times)
+
         return {
             "running": self.running,
             "address": self.address,
@@ -185,6 +284,13 @@ class Miner:
             "count": self.blocks_mined,
             "last_height": self.last_height,
             "uptime": uptime,
+            # --- hashrate ---
+            "hashrate": round(hashrate, 2),
+            "hashrate_khs": round(hashrate / 1000.0, 3),
+            "hashes_total": int(self.hashes_total),
+            "hashes_this_attempt": int(self._hashes_this_attempt),
+            "avg_s_per_block": round(avg_s_per_block, 2),
+            # --- fork ---
             "fork_aborts": self.fork_aborts,
             "last_fork_ago_s": (int(time.time() - self.last_fork_at)
                                 if self.last_fork_at else None),
@@ -202,8 +308,8 @@ class Miner:
         if fork_sig is not None and fork_sig.is_set():
             self.fork_aborts += 1
             self.last_fork_at = time.time()
-            _log(f"[FORK] abortando bloco atual — reorg em andamento "
-                 f"(aborts={self.fork_aborts})")
+            _log(f"[SOLO] abortando bloco atual — novo bloco/reorg "
+                 f"detetado (aborts={self.fork_aborts})")
             return False
 
         return True
@@ -225,49 +331,62 @@ class Miner:
                     self.running = False
                     return
 
-                # v6.3: aguarda reorg terminar se fork signal ligado
+                # ------------------------------------------------------------
+                # [FIX v6.7] Se o fork_signal está ligado, LIMPA-O
+                # imediatamente e recomeça. NÃO espera 60s.
+                #
+                # Porquê: o blockchain.accept_block() agora ativa
+                # _fork_signal a CADA bloco aceite (v9.1.10). Isso
+                # significa que o sinal aparece sempre que um bloco
+                # novo chega via P2P. Se o miner esperasse 60s a
+                # "aguardar reorg", atrasaria a mineração do próximo
+                # bloco sem motivo. O correto é: o sinal já cumpriu a
+                # sua função (fazer o PoW abortar). Limpa e recomeça.
+                # ------------------------------------------------------------
                 fork_sig = getattr(self.chain, "_fork_signal", None)
                 if fork_sig is not None and fork_sig.is_set():
-                    _log("[FORK] aguardando reorg terminar...")
-                    waited = 0.0
-                    while (fork_sig.is_set() and waited < 60.0
-                           and not self._stop_evt.is_set()):
-                        if self._stop_evt.wait(FORK_POLL_INTERVAL):
-                            break
-                        waited += FORK_POLL_INTERVAL
-                    if self._stop_evt.is_set():
-                        break
-                    if fork_sig.is_set():
-                        _log("[FORK] timeout de 60s aguardando reorg — "
-                             "retomando mineração mesmo assim")
-                    else:
-                        _log("[FORK] reorg concluído — retomando mineração")
+                    _log("[SOLO] novo topo detectado — limpando sinal "
+                         "e recomeçando no bloco seguinte...")
+                    try:
+                        fork_sig.clear()
+                    except Exception:
+                        pass
+                    # Reavalia altura e recomeça
                     continue
+
+                # Nova tentativa
+                self._reset_attempt()
+                attempt_t0 = time.time()
 
                 block = self.chain.mine_block_interruptible(
                     self.address,
                     self.pubkey,
                     should_continue=self._should_continue,
+                    progress_cb=self._on_progress,
                 )
 
                 if block is None:
                     if self._stop_evt.is_set():
                         break
+                    # Foi abortado (por stop ou por fork signal).
+                    # Volta ao topo: se foi fork, o sinal será limpo lá.
                     continue
 
                 self.blocks_mined += 1
                 h = block.get("height")
                 self.last_height = h
-                _log(f"OK Bloco #{h} minerado (total={self.blocks_mined})")
 
-                # ------------------------------------------------------------
-                # [FIX v6.5] NÃO chamar on_block_mined aqui.
-                # O blockchain.py v9.1.8 já chama internamente via
-                # _fire_block_mined() dentro de mine_block_interruptible().
-                # Chamar de novo aqui = propagação 2x via P2P.
-                # O main.py v12.8 liga chain.on_block_mined = p2p.broadcast_block,
-                # então o broadcast acontece automaticamente.
-                # ------------------------------------------------------------
+                dt = time.time() - attempt_t0
+                self._block_times.append(dt)
+                if len(self._block_times) > 20:
+                    self._block_times = self._block_times[-20:]
+
+                _log(f"OK Bloco #{h} minerado em {dt:.2f}s "
+                     f"(total={self.blocks_mined}, "
+                     f"hashrate={self.last_hashrate/1000:.1f} kH/s)")
+
+                # NOTA: NÃO chamar chain.on_block_mined aqui.
+                # O blockchain.py v9.1.8+ já propaga via _fire_block_mined().
 
             except ValueError as e:
                 self.last_error = str(e)
