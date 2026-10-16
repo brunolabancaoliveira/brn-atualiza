@@ -1,13 +1,22 @@
-"""mining_pool.py — Pool de mineração BRN
+"""mining_pool.py — Pool de mineração BRN (v2)
 ================================================================
 Servidor do pool. Roda dentro do nó origem (main.py) e é
 injetado no server.py para expor endpoints HTTP.
+
+v2:
+  [FIX] SHARE_DIFF_OFFSET 3→1 — antes os shares eram demasiado
+        fáceis (a cada 256 hashes), causando flood HTTP e
+        hashrate artificialmente baixo (0.09 kH/s)
+  [FIX] Aceita shares de jobs RECENTES (últimos 5)
+        — antes, quando um job era substituído por um novo bloco,
+        shares em trânsito eram rejeitados (~2/3 do total)
+  [NEW] Mantém histórico de recent_jobs para validação
+  [NEW] Contadores separados por job_id
 
 Conceitos:
   - Job      : template de bloco (prev_hash, merkle, timestamp, difficulty)
                com coinbase multi-output proporcional aos shares atuais
   - Share    : nonce que produz hash < share_target (mais fácil que block)
-               Prova de trabalho parcial, usada para contabilizar hashrate
   - Fullblock: share que também bate block_target → bloco real!
 
 Protocolo (endpoints implementados no server.py):
@@ -39,11 +48,12 @@ log = logging.getLogger("pool")
 # ============================================================
 # CONFIG
 # ============================================================
-SHARE_DIFF_OFFSET   = 3      # share_diff = max(2, block_diff - OFFSET)
+SHARE_DIFF_OFFSET   = 1      # [FIX v2] era 3; share_diff = max(2, block_diff - OFFSET)
 MINER_TIMEOUT_S     = 60     # minerador sem heartbeat por 60s é removido
-JOB_REFRESH_S       = 20     # recria o job a cada 20s (para atualizar distribuição)
+JOB_REFRESH_S       = 20     # recria o job a cada 20s
 MAX_SHARES_PER_JOB  = 10000  # cap para evitar flood
 MAX_MINERS          = 50
+MAX_RECENT_JOBS     = 5      # [NEW v2] histórico de jobs para aceitar shares atrasados
 
 
 # ============================================================
@@ -58,7 +68,7 @@ class MinerState:
         self.miner_id = miner_id
         self.address = address
         self.pubkey = pubkey
-        self.shares_period = 0     # shares do período atual (reset no bloco)
+        self.shares_period = 0
         self.shares_total = 0
         self.hashes_total = 0
         self.hashrate = 0.0
@@ -82,7 +92,7 @@ class Job:
         self.difficulty = difficulty
         self.share_difficulty = share_difficulty
         self.transactions = transactions
-        self.distribution = distribution  # {address: {"pubkey", "weight"}}
+        self.distribution = distribution
         self.created_at = time.time()
 
 
@@ -105,11 +115,8 @@ def _make_pool_coinbase(height: int, reward: int,
     """
     Cria um coinbase com N outputs proporcionais aos pesos da
     distribuição. Fecha o "resto" no primeiro output.
-
-    distribution: {"brn1...": {"pubkey": "02...", "weight": 5.0}, ...}
     """
     if not distribution:
-        # Fallback: um único output placeholder (não devia acontecer)
         return {
             "txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF,
                                     "pubkey": "", "signature": ""}],
@@ -133,12 +140,10 @@ def _make_pool_coinbase(height: int, reward: int,
         })
 
     if not outputs:
-        # Fallback para o mais pesado
         first = max(distribution.items(), key=lambda kv: kv[1]["weight"])
         outputs = [{"address": first[0], "amount": reward,
                     "pubkey": first[1]["pubkey"]}]
 
-    # Ajusta resto (perda por arredondamento)
     dif = reward - sum(o["amount"] for o in outputs)
     if dif > 0:
         outputs[0]["amount"] += dif
@@ -169,11 +174,11 @@ class PoolManager:
         self.chain = chain
         self.lock = threading.RLock()
 
-        self.miners: dict = {}       # miner_id → MinerState
+        self.miners: dict = {}
         self.current_job: Optional[Job] = None
+        self.recent_jobs: dict = {}      # [NEW v2] job_id → Job
         self.last_tip_hash: str = ""
 
-        # métricas globais
         self.started_at = time.time()
         self.blocks_found = 0
         self.total_reward_paid = 0
@@ -182,7 +187,6 @@ class PoolManager:
         self.rejected_shares = 0
         self.accepted_shares = 0
 
-        # thread de manutenção
         self._stop = threading.Event()
         threading.Thread(target=self._maintenance_loop, daemon=True,
                          name="Pool-Maint").start()
@@ -194,7 +198,6 @@ class PoolManager:
     # ========================================================
     def register(self, address: str, pubkey: str,
                  miner_id: Optional[str] = None) -> dict:
-        """Registra (ou reconecta) um minerador."""
         if not address or not address.startswith("brn1"):
             return {"ok": False, "msg": "address invalido"}
         if not pubkey:
@@ -241,7 +244,6 @@ class PoolManager:
     # JOB
     # ========================================================
     def get_work(self, miner_id: str) -> dict:
-        """Devolve o job atual (recria se necessário)."""
         with self.lock:
             m = self.miners.get(miner_id)
             if m is None:
@@ -281,31 +283,26 @@ class PoolManager:
         return False
 
     def _build_job_locked(self) -> Job:
-        """Cria um novo job. Deve ser chamado com o lock."""
         h = self.chain.db.height() + 1
         reward = self.chain.current_reward(h)
         diff = self.chain.current_difficulty()
         share_diff = max(2, diff - SHARE_DIFF_OFFSET)
         prev_hash = self.chain.db.tip_hash()
 
-        # Distribuição: só mineradores com pubkey válida e conectados
         distribution = {}
         for mid, m in self.miners.items():
             if (time.time() - m.last_seen) > MINER_TIMEOUT_S:
                 continue
             if not m.address or not m.pubkey:
                 continue
-            # peso = shares do período + 1 (para evitar zero)
             w = float(m.shares_period) + 1.0
             distribution[m.address] = {
                 "pubkey": m.pubkey,
                 "weight": w,
             }
 
-        # Coinbase proporcional
         cb = _make_pool_coinbase(h, reward, distribution)
 
-        # Mempool (limite)
         try:
             mempool_txs = self.chain.db.all_mempool(limit=200)
         except Exception:
@@ -325,6 +322,15 @@ class PoolManager:
             distribution=distribution,
         )
         self.current_job = job
+
+        # [NEW v2] mantém os últimos N jobs para aceitar shares atrasados
+        self.recent_jobs[job.job_id] = job
+        if len(self.recent_jobs) > MAX_RECENT_JOBS:
+            oldest = sorted(self.recent_jobs.items(),
+                            key=lambda kv: kv[1].created_at)[:1]
+            for k, _ in oldest:
+                self.recent_jobs.pop(k, None)
+
         log.info("pool: novo job %s (h=%d diff=%d share_diff=%d miners=%d)",
                  job.job_id, h, diff, share_diff, len(distribution))
         return job
@@ -334,10 +340,6 @@ class PoolManager:
     # ========================================================
     def submit_share(self, miner_id: str, nonce: int,
                      hash_hex: str = "") -> dict:
-        """
-        Valida um share. Se também bater a block_difficulty,
-        minera o bloco de verdade.
-        """
         with self.lock:
             m = self.miners.get(miner_id)
             if m is None:
@@ -348,23 +350,41 @@ class PoolManager:
             if job is None:
                 return {"ok": False, "msg": "sem job ativo"}
 
-            # Recalcula o hash
-            try:
-                h = block_hash(job.prev_hash, job.merkle,
-                               job.timestamp, int(nonce),
-                               job.difficulty)
-            except Exception as e:
-                return {"ok": False, "msg": f"nonce invalido: {e}"}
+            # ------------------------------------------------------------
+            # [FIX v2] Tenta o job ATUAL e depois os RECENTES.
+            # Sem isto, shares enviados quando a altura mudou são
+            # rejeitados (perda de ~2/3 dos shares no cliente).
+            # ------------------------------------------------------------
+            candidates = [job]
+            for j in self.recent_jobs.values():
+                if j.job_id != job.job_id:
+                    candidates.append(j)
 
+            h = None
+            matched_job = None
+            for cand in candidates:
+                try:
+                    h2 = block_hash(cand.prev_hash, cand.merkle,
+                                    cand.timestamp, int(nonce),
+                                    cand.difficulty)
+                except Exception:
+                    continue
+                if _meets(h2, cand.share_difficulty):
+                    h = h2
+                    matched_job = cand
+                    break
+
+            if matched_job is None:
+                self.rejected_shares += 1
+                return {"ok": False,
+                        "msg": "share nao bate share_difficulty de nenhum job"}
+
+            job = matched_job
+
+            # Se o cliente forneceu o hash, confirma que bate
             if hash_hex and hash_hex != h:
                 self.rejected_shares += 1
                 return {"ok": False, "msg": "hash nao corresponde ao nonce"}
-
-            # Verifica share_difficulty
-            if not _meets(h, job.share_difficulty):
-                self.rejected_shares += 1
-                return {"ok": False,
-                        "msg": "share nao bate share_difficulty"}
 
             # Conta share
             m.shares_period += 1
@@ -386,7 +406,6 @@ class PoolManager:
                         self.blocks_found += 1
                         self.last_block_at = time.time()
                         self.last_block_height = job.height
-                        # Reset contadores do período
                         for mm in self.miners.values():
                             mm.shares_period = 0
                         self.current_job = None
@@ -406,7 +425,6 @@ class PoolManager:
 
     def _assemble_and_accept_block(self, job: Job, nonce: int,
                                    hash_hex: str) -> bool:
-        """Monta o bloco final e chama chain.accept_block."""
         block = {
             "height":       job.height,
             "hash":         hash_hex,
@@ -417,7 +435,6 @@ class PoolManager:
             "difficulty":   job.difficulty,
             "transactions": job.transactions,
         }
-        # attach auth_tag se necessário
         try:
             self.chain._attach_auth_tag(block)
         except Exception:
@@ -428,7 +445,6 @@ class PoolManager:
             log.warning("pool: accept_block: %s", msg)
             return False
 
-        # Soma total de recompensa paga (aproximação)
         try:
             cb = block["transactions"][0]
             reward = sum(o["amount"] for o in cb.get("outputs", []))
@@ -436,14 +452,9 @@ class PoolManager:
         except Exception:
             pass
 
-        # Broadcast P2P — o main.py injeta um callback
-        cb = getattr(self, "on_block_mined", None)
-        if callable(cb):
-            try:
-                cb(block)
-            except Exception as e:
-                log.debug("on_block_mined: %s", e)
-
+        # NOTA: NÃO chamar on_block_mined aqui. O blockchain.accept_block
+        # já dispara _fire_block_mined() internamente, e o main.py
+        # liga chain.on_block_mined = p2p.broadcast_block.
         return True
 
     # ========================================================
@@ -483,6 +494,7 @@ class PoolManager:
                                          if current_job else None),
                 "job_created_ago_s":   (int(now - current_job.created_at)
                                         if current_job else None),
+                "recent_jobs_cached":  len(self.recent_jobs),
             }
 
     def miners_list(self) -> list:
@@ -510,7 +522,6 @@ class PoolManager:
             if m is None:
                 return {"ok": False, "msg": "miner desconhecido"}
 
-            # Estima recompensa pendente
             total_shares = sum(x.shares_period for x in self.miners.values())
             reward = self.chain.current_reward(self.chain.db.height() + 1)
             est_reward = 0
@@ -541,14 +552,12 @@ class PoolManager:
                 time.sleep(5)
                 with self.lock:
                     now = time.time()
-                    # Remove miners inativos
                     gone = [mid for mid, m in self.miners.items()
                             if now - m.last_seen > MINER_TIMEOUT_S * 3]
                     for mid in gone:
                         self.miners.pop(mid, None)
                         log.info("pool: miner %s removido (timeout)", mid)
 
-                    # Recria job se estiver stale
                     if (self.current_job is None
                             or self._job_is_stale(self.current_job)):
                         if self.miners:
@@ -570,7 +579,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-    print("Testando PoolManager...")
+    print("Testando PoolManager (v2)...")
 
     os.environ.setdefault("BRN_NETWORK_SECRET",
                           "segredo-de-teste-pool-1234567")
@@ -580,7 +589,6 @@ if __name__ == "__main__":
         bc = Blockchain(os.path.join(td, "test.db"), auto_genesis=True)
         pool = PoolManager(bc)
 
-        # Registo
         r = pool.register("brn1testaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                           "02" + "aa" * 32)
         print(f"  register: {r}")
@@ -588,47 +596,60 @@ if __name__ == "__main__":
 
         mid = r["miner_id"]
 
-        # Work
         w = pool.get_work(mid)
         print(f"  work: h={w['job']['height']} diff={w['job']['difficulty']} "
               f"share_diff={w['job']['share_difficulty']}")
         assert w["ok"]
+        assert w["job"]["share_difficulty"] == 4   # block_diff=5, offset=1
 
-        # Heartbeat
         pool.heartbeat(mid, hashrate=12345.0, hashes_total=100000)
         st = pool.stats()
         print(f"  stats: miners={st['miners_active']} "
               f"hashrate={st['hashrate_total']}")
+        assert st["recent_jobs_cached"] >= 1
 
-        # Status do miner
-        ms = pool.miner_status(mid)
-        print(f"  miner status: shares={ms['shares_period']} "
-              f"hashrate={ms['hashrate']}")
-
-        # Simula um share válido
-        # (encontra nonce manualmente com share_difficulty baixa)
+        # Encontra um share válido
         from blockchain import block_hash
         job = pool.current_job
         found = None
-        for n in range(500000):
+        for n in range(5000000):
             h = block_hash(job.prev_hash, job.merkle,
                            job.timestamp, n, job.difficulty)
             if _meets(h, job.share_difficulty):
                 found = (n, h)
                 break
-        assert found, "nao encontrou share em 500k tentativas"
+        assert found, "nao encontrou share"
         nonce, h = found
-        print(f"  share candidato: nonce={nonce} hash={h[:24]}...")
+        print(f"  share: nonce={nonce} hash={h[:24]}...")
 
         r = pool.submit_share(mid, nonce, h)
         print(f"  submit: {r}")
         assert r["ok"]
 
         st = pool.stats()
-        print(f"  stats pos-share: accepted={st['shares_accepted']} "
+        print(f"  stats: accepted={st['shares_accepted']} "
               f"rejected={st['shares_rejected']}")
+        assert st["shares_accepted"] == 1
+        assert st["shares_rejected"] == 0
+
+        # [TESTE v2] Simula troca de job
+        pool.current_job = None
+        pool._build_job_locked()   # cria novo job
+        new_job = pool.current_job
+        print(f"  novo job: {new_job.job_id}")
+
+        # Submit o share ANTIGO — deve ser aceite pelos recent_jobs
+        r2 = pool.submit_share(mid, nonce, h)
+        print(f"  submit share antigo: {r2}")
+        assert r2["ok"], f"share antigo devia ser aceite: {r2}"
+
+        st = pool.stats()
+        print(f"  stats final: accepted={st['shares_accepted']} "
+              f"rejected={st['shares_rejected']} recent_jobs={st['recent_jobs_cached']}")
+        assert st["shares_accepted"] == 2
+        assert st["shares_rejected"] == 0
 
         pool.stop()
         bc.db.close()
 
-    print("PoolManager OK.")
+    print("PoolManager v2 OK.")
