@@ -1,9 +1,11 @@
-"""main.py — Entrypoint unificado do nó BRN (v12.7)
+"""main.py — Entrypoint unificado do nó BRN (v12.8)
 ================================================================
+v12.8:
+  [FIX] Ligar chain.on_block_mined = p2p.broadcast_block
+        — blocos minerados localmente (via miner_loop) agora são
+        propagados via P2P. Antes ficavam só no nó local.
 v12.7:
   [NEW] Pool de Mineração (mining_pool.PoolManager)
-        — Injetado no server.py via set_pool_manager()
-        — Callback on_block_mined → broadcast P2P
 v12.6:
   [FIX] Injeta P2PManager no server.py (set_p2p_manager)
 v12.5:
@@ -957,10 +959,7 @@ def _setup_sync(chain, p2p, log):
 # POOL SETUP
 # ============================================================
 def _setup_pool(chain, p2p, log, disabled: bool):
-    """
-    Cria o PoolManager e liga o callback de broadcast de bloco.
-    Retorna a instância ou None.
-    """
+    """Cria o PoolManager e liga o callback de broadcast de bloco."""
     if disabled:
         log.info("Pool: desativado por --no-pool")
         return None
@@ -993,6 +992,43 @@ def _setup_pool(chain, p2p, log, disabled: bool):
              + str(getattr(__import__("mining_pool"), "SHARE_DIFF_OFFSET", "?"))
              + ")")
     return pool
+
+
+# ============================================================
+# [NEW v12.8] LIGA CALLBACK DE BROADCAST LOCAL
+# ============================================================
+def _setup_local_miner_broadcast(chain, p2p, log):
+    """
+    Liga `chain.on_block_mined = p2p.broadcast_block` para que blocos
+    minerados localmente (via miner_loop) sejam propagados via P2P.
+
+    ANTES (bug): miner_loop procurava `chain._on_block_mined` (com
+    underscore) que não existia, e o blockchain.py dispara via
+    `chain.on_block_mined` (sem underscore) — mas ninguém ligava.
+    Resultado: blocos minerados localmente ficavam só no nó local.
+
+    DEPOIS: main.py liga o callback. Todos os blocos minerados
+    (via miner_loop OU via pool) propagam via P2P.
+    """
+    if p2p is None:
+        log.info("chain.on_block_mined: P2P desligado — broadcast local inativo")
+        return False
+
+    try:
+        def _on_local_block(block):
+            try:
+                p2p.broadcast_block(block)
+                log.info("miner local: bloco #" + str(block.get("height"))
+                         + " propagado via P2P")
+            except Exception as e:
+                log.debug("broadcast_block falhou: " + str(e))
+
+        chain.on_block_mined = _on_local_block
+        log.info("chain.on_block_mined ligado ao P2P (broadcast local ativo)")
+        return True
+    except Exception as e:
+        log.warning("Falha ligando on_block_mined: " + str(e))
+        return False
 
 
 # ============================================================
@@ -1276,6 +1312,11 @@ def main():
     if pool is not None:
         _register_service("pool", pool)
 
+    # ---- [NEW v12.8] Liga callback de broadcast local ----
+    # IMPORTANTE: chamado ANTES de arrancar o miner local, para que
+    # o primeiro bloco minerado já seja propagado via P2P.
+    _setup_local_miner_broadcast(chain, p2p, log)
+
     # ---- Injeta P2PManager no server.py ----
     if p2p is not None:
         try:
@@ -1291,7 +1332,7 @@ def main():
     else:
         log.warning("Sem P2PManager — tx nao serao propagadas")
 
-    # ---- [NEW v12.7] Injeta PoolManager no server.py ----
+    # ---- Injeta PoolManager no server.py ----
     if pool is not None:
         try:
             import server as _srv
