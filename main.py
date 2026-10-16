@@ -1,31 +1,16 @@
-"""main.py — Entrypoint unificado do nó BRN (v12.8)
+"""main.py — Entrypoint unificado do nó BRN (v12.9)
 ================================================================
+v12.9:
+  [FIX] Não arranca miner_loop local quando o pool está ativo
+        — antes ambos competiam e causavam forks garantidos
 v12.8:
   [FIX] Ligar chain.on_block_mined = p2p.broadcast_block
-        — blocos minerados localmente (via miner_loop) agora são
-        propagados via P2P. Antes ficavam só no nó local.
 v12.7:
   [NEW] Pool de Mineração (mining_pool.PoolManager)
 v12.6:
   [FIX] Injeta P2PManager no server.py (set_p2p_manager)
 v12.5:
   [NEW] Sync manager + rendezvous + relay
-================================================================
-Amarra tudo:
-  1. Config (brn_config.Config) + env
-  2. Senha do nó
-  3. Identidade Ed25519 (node_identity.enc)
-  4. Blockchain (blockchain.py v9.1.8)
-  5. P2P (p2p_unified.P2PManager)
-  6. Sync (sync_manager.ChainSyncManager)
-  7. Rendezvous (rendezvous_discovery.RendezvousDiscovery)
-  8. Relay (p2p_relay.RelayManager)
-  9. L2 (btc_watcher.BTCWatcher)
- 10. Pool de Mineração (mining_pool.PoolManager)
- 11. HTTP server (server.py v9.9)
- 12. Explorer (explorer.py)
- 13. Miner local (miner_loop.get_miner)
- 14. Loop principal até Ctrl+C
 ================================================================
 """
 from __future__ import annotations
@@ -102,7 +87,6 @@ _HARDCODED_DEFAULTS = {
     "TS_TAILNET":              "",
     "TS_HOSTNAME_PREFIX":      "brn-node",
 
-    # Pool
     "BRN_POOL_ENABLED":        "1",
 }
 
@@ -200,7 +184,7 @@ def _check_required_modules() -> list:
 
 
 # ============================================================
-# L2 — fallback
+# L2
 # ============================================================
 L2_ENABLED = False
 btc_config = None
@@ -959,7 +943,6 @@ def _setup_sync(chain, p2p, log):
 # POOL SETUP
 # ============================================================
 def _setup_pool(chain, p2p, log, disabled: bool):
-    """Cria o PoolManager e liga o callback de broadcast de bloco."""
     if disabled:
         log.info("Pool: desativado por --no-pool")
         return None
@@ -973,7 +956,6 @@ def _setup_pool(chain, p2p, log, disabled: bool):
         log.warning("PoolManager falhou: " + str(e))
         return None
 
-    # Callback: quando o pool encontra um bloco, propaga via P2P
     if p2p is not None:
         def _on_pool_block(block):
             try:
@@ -988,28 +970,19 @@ def _setup_pool(chain, p2p, log, disabled: bool):
         except Exception:
             pass
 
-    log.info("Pool: pronto (share_diff_offset="
-             + str(getattr(__import__("mining_pool"), "SHARE_DIFF_OFFSET", "?"))
-             + ")")
+    try:
+        import mining_pool as _mp
+        offset = getattr(_mp, "SHARE_DIFF_OFFSET", "?")
+    except Exception:
+        offset = "?"
+    log.info("Pool: pronto (share_diff_offset=" + str(offset) + ")")
     return pool
 
 
 # ============================================================
-# [NEW v12.8] LIGA CALLBACK DE BROADCAST LOCAL
+# LIGA CALLBACK DE BROADCAST LOCAL
 # ============================================================
 def _setup_local_miner_broadcast(chain, p2p, log):
-    """
-    Liga `chain.on_block_mined = p2p.broadcast_block` para que blocos
-    minerados localmente (via miner_loop) sejam propagados via P2P.
-
-    ANTES (bug): miner_loop procurava `chain._on_block_mined` (com
-    underscore) que não existia, e o blockchain.py dispara via
-    `chain.on_block_mined` (sem underscore) — mas ninguém ligava.
-    Resultado: blocos minerados localmente ficavam só no nó local.
-
-    DEPOIS: main.py liga o callback. Todos os blocos minerados
-    (via miner_loop OU via pool) propagam via P2P.
-    """
     if p2p is None:
         log.info("chain.on_block_mined: P2P desligado — broadcast local inativo")
         return False
@@ -1146,7 +1119,6 @@ def main():
             print("Pool não disponível")
             return 0
         try:
-            from db import ChainDB
             from blockchain import Blockchain
             bc = Blockchain(cfg["db_path"], auto_genesis=False)
             pool = PoolManager(bc)
@@ -1257,7 +1229,6 @@ def main():
 
     # ---- Rendezvous ----
     rdv = None
-    rdv_url = os.environ.get("BRN_RENDEZVOUS_URL", "").strip()
     if p2p is not None:
         try:
             from rendezvous_discovery import RendezvousDiscovery
@@ -1307,17 +1278,15 @@ def main():
     elif args.l2:
         log.warning("--l2 solicitado, mas L2 não disponível. Ignorando.")
 
-    # ---- [NEW v12.7] Pool de mineração ----
+    # ---- Pool de mineração ----
     pool = _setup_pool(chain, p2p, log, disabled=args.no_pool)
     if pool is not None:
         _register_service("pool", pool)
 
-    # ---- [NEW v12.8] Liga callback de broadcast local ----
-    # IMPORTANTE: chamado ANTES de arrancar o miner local, para que
-    # o primeiro bloco minerado já seja propagado via P2P.
+    # ---- Callback de broadcast para miner local ----
     _setup_local_miner_broadcast(chain, p2p, log)
 
-    # ---- Injeta P2PManager no server.py ----
+    # ---- Injeta P2P no server.py ----
     if p2p is not None:
         try:
             import server as _srv
@@ -1332,7 +1301,7 @@ def main():
     else:
         log.warning("Sem P2PManager — tx nao serao propagadas")
 
-    # ---- Injeta PoolManager no server.py ----
+    # ---- Injeta Pool no server.py ----
     if pool is not None:
         try:
             import server as _srv
@@ -1361,8 +1330,16 @@ def main():
     threading.Thread(target=_thread_wrap("Explorer", run_explorer),
                      daemon=True, name="Explorer").start()
 
-    # ---- Miner local (modo clássico --mine) ----
-    if args.mine or AUTO_MINE:
+    # ============================================================
+    # [FIX v12.9] Miner local — NÃO arrancar se pool estiver ativo
+    # ============================================================
+    quer_miner_local = bool(args.mine or AUTO_MINE)
+    if quer_miner_local and pool is not None:
+        log.warning("Miner local IGNORADO: pool está ativo "
+                    "(evita forks). Use /api/pool/* ou desative o pool.")
+        quer_miner_local = False
+
+    if quer_miner_local:
         try:
             from miner_loop import get_miner
             from wallet import Wallet
@@ -1423,7 +1400,7 @@ def main():
     _audit("node_start", {
         "mode":       "origin" if is_origin else "client",
         "l2":         bool(args.l2 and l2_ativo),
-        "mine":       bool(args.mine or AUTO_MINE),
+        "mine":       bool(quer_miner_local),
         "pool":       bool(pool),
         "https":      os.environ.get("BRN_HTTPS") == "1",
         "height":     chain.db.height(),
