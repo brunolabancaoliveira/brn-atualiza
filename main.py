@@ -1,5 +1,9 @@
-"""main.py — Entrypoint unificado do nó BRN (v12.7)
+"""main.py — Entrypoint unificado do nó BRN (v12.8)
 ================================================================
+v12.8:
+  [NEW] Integra brn_peer_discovery.py: descobre peers via
+        `tailscale status` no boot e atualiza bootstrap_peers.json
+        automaticamente. Fallback em camadas.
 v12.7:
   [FIX] CRÍTICO: _setup_sync agora lê bootstrap_peers.json e
         BRN_BOOTSTRAP_PEERS diretamente como fallback, evitando
@@ -7,8 +11,6 @@ v12.7:
         p2p.peers no momento do boot.
 v12.6:
   [FIX] CRÍTICO: injeta P2PManager no server.py (set_p2p_manager)
-        para propagação de tx/blocks via P2P
-        — antes o server.py usava chain._on_tx_submitted que nunca existiu
 v12.5:
   [NEW] Sync manager (ChainSyncManager) + rendezvous + relay
 ================================================================
@@ -111,6 +113,13 @@ if _applied:
 from brn_config import Config
 from brn_logger import setup_logger, get_logger
 from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
+
+# ⭐ [v12.8] Descoberta automática de peers via Tailscale
+try:
+    from brn_peer_discovery import refresh_peers_from_tailscale
+    _PEER_DISCOVERY_OK = True
+except ImportError:
+    _PEER_DISCOVERY_OK = False
 
 _shutdown = threading.Event()
 
@@ -265,6 +274,40 @@ def _setup_tailscale_auto(log) -> bool:
 
 
 # ============================================================
+# ⭐ [v12.8] PEER DISCOVERY VIA TAILSCALE
+# ============================================================
+def _discover_peers_tailscale(log) -> list:
+    """
+    Descobre peers via `tailscale status` e atualiza bootstrap_peers.json.
+
+    Retorna lista de strings "ip:porta" ou [] se falhar.
+    """
+    if not _PEER_DISCOVERY_OK:
+        log.info("Discovery: brn_peer_discovery.py não disponível")
+        return []
+
+    try:
+        log.info("Descobrindo peers via Tailscale...")
+        peers = refresh_peers_from_tailscale(prefer_os="linux")
+
+        if not peers:
+            log.warning("Discovery: nenhum peer Tailscale encontrado")
+            return []
+
+        log.info("Discovery: %d peer(s) detectados:", len(peers))
+        for p in peers:
+            log.info("  - " + str(p))
+
+        # Atualiza env para o _setup_sync usar depois
+        os.environ["BRN_BOOTSTRAP_PEERS"] = ",".join(peers)
+
+        return peers
+    except Exception as e:
+        log.warning("Discovery falhou: " + str(e))
+        return []
+
+
+# ============================================================
 # ARGS
 # ============================================================
 def parse_args():
@@ -291,6 +334,7 @@ def parse_args():
     p.add_argument("--skip-verify", action="store_true")
     p.add_argument("--no-tailscale", action="store_true")
     p.add_argument("--no-sync", action="store_true")
+    p.add_argument("--no-discovery", action="store_true")   # ⭐ v12.8
     return p.parse_args()
 
 
@@ -514,6 +558,9 @@ def do_status(cfg):
             print(" MongoDB     : off (" + (err if err else "não configurado") + ")")
     except Exception:
         print(" MongoDB     : pymongo indisponível")
+
+    # ⭐ Status do peer discovery
+    print(" PeerDiscov. : " + ("ativo" if _PEER_DISCOVERY_OK else "indisponível"))
 
     print("=" * 64)
 
@@ -853,8 +900,7 @@ def _list_p2p_peers(p2p):
 def _setup_sync(chain, p2p, log):
     """
     v12.7 — Corrigido para ler bootstrap_peers.json e BRN_BOOTSTRAP_PEERS
-    diretamente, evitando o race condition onde o P2P ainda não tinha
-    populado p2p.peers no momento do boot.
+    diretamente, evitando o race condition.
     """
     if p2p is None:
         log.info("Sync: P2P desligado — sem sync")
@@ -873,7 +919,7 @@ def _setup_sync(chain, p2p, log):
         return None
 
     # ============================================================
-    # 1) Peers do P2P (pode estar vazio no boot)
+    # 1) Peers do P2P
     # ============================================================
     n_inicial = 0
     for ip, port, node_id, height, work in _list_p2p_peers(p2p):
@@ -886,7 +932,7 @@ def _setup_sync(chain, p2p, log):
     log.info("Sync: " + str(n_inicial) + " peer(s) obtidos do P2P")
 
     # ============================================================
-    # 2) LÊ bootstrap_peers.json DIRETAMENTE (fallback)
+    # 2) LÊ bootstrap_peers.json
     # ============================================================
     n_bootstrap = 0
     try:
@@ -904,7 +950,6 @@ def _setup_sync(chain, p2p, log):
                         port_i = int(port_s)
                     except ValueError:
                         continue
-                    # Registra se ainda não tiver
                     if entry not in sync.peers:
                         sync.register_peer(entry, ip, port_i, 0, 0)
                         n_bootstrap += 1
@@ -914,7 +959,7 @@ def _setup_sync(chain, p2p, log):
         log.info("Sync: +" + str(n_bootstrap) + " peer(s) do bootstrap_peers.json")
 
     # ============================================================
-    # 3) LÊ BRN_BOOTSTRAP_PEERS do env (segundo fallback)
+    # 3) LÊ BRN_BOOTSTRAP_PEERS do env
     # ============================================================
     n_env = 0
     try:
@@ -941,7 +986,7 @@ def _setup_sync(chain, p2p, log):
     log.info("Sync: total peer(s) registrados: " + str(total))
 
     # ============================================================
-    # 4) Hook de peer novo (quando o P2P descobrir)
+    # 4) Hook de peer novo
     # ============================================================
     def _on_peer_found(node_id, ip, port, height=0, work=0):
         try:
@@ -960,7 +1005,7 @@ def _setup_sync(chain, p2p, log):
                 pass
 
     # ============================================================
-    # 5) Inicia o loop
+    # 5) Inicia
     # ============================================================
     try:
         sync.set_sync_mode("full")
@@ -1089,11 +1134,21 @@ def main():
         log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
         return 1
 
-    # ---- Tailscale ----
+    # ============================================================
+    # ---- Tailscale + Peer Discovery ----
+    # ============================================================
     if not args.no_tailscale:
         _setup_tailscale_auto(log)
+
+        # ⭐ v12.8: descobre peers automaticamente via Tailscale
+        if not args.no_discovery:
+            _discover_peers_tailscale(log)
+        else:
+            log.info("Discovery: pulado por --no-discovery")
     else:
         log.info("Tailscale: pulado por --no-tailscale")
+        if not args.no_discovery:
+            _discover_peers_tailscale(log)
 
     # ---- identidade ----
     node_password = _resolve_password(args)
@@ -1233,7 +1288,7 @@ def main():
     elif args.l2:
         log.warning("--l2 solicitado, mas L2 não disponível. Ignorando.")
 
-    # ---- [NEW v12.6] Injeta P2PManager no server.py ----
+    # ---- Injeta P2PManager no server.py ----
     if p2p is not None:
         try:
             import server as _srv
@@ -1333,6 +1388,7 @@ def main():
         "sync":       bool(sync),
         "p2p":        bool(p2p),
         "tailscale":  bool(os.environ.get("TS_TAILNET", "").strip()),
+        "discovery":  _PEER_DISCOVERY_OK,
     })
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
