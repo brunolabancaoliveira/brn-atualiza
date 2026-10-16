@@ -1,13 +1,18 @@
-"""miner_pool_client.py — Cliente do pool de mineração BRN
+"""miner_pool_client.py — Cliente do pool de mineração BRN (v2)
 ================================================================
 Roda em cada PC que quer minerar no pool. Faz:
   1. register  → POST /api/pool/register
-  2. Poll work → POST /api/pool/work a cada 10s (ou quando tip muda)
-  3. Mina localmente buscando nonce com hash < share_target
+  2. Poll work → POST /api/pool/work
+  3. Mina localmente usando brn_miner (C) se disponível
   4. Submit    → POST /api/pool/submit
-  5. Heartbeat → POST /api/pool/heartbeat a cada 5s (hashrate)
+  5. Heartbeat → POST /api/pool/heartbeat
 
-Thread-safe. Pode ser start/stop via API.
+v2:
+  [FIX] Usa brn_miner.pow_search() em C quando disponível
+        — antes usava hashlib.sha256 (Python puro), 1.5x mais lento
+  [FIX] hashrate calculado corretamente (acumula total de hashes,
+        não apenas da última batch)
+  [NEW] Fallback automático para Python se lib C ausente
 ================================================================
 """
 from __future__ import annotations
@@ -33,8 +38,24 @@ log = logging.getLogger("pool-client")
 POOL_URL           = os.environ.get("BRN_POOL_URL", "http://127.0.0.1:5000")
 HEARTBEAT_S        = 5.0
 WORK_REFRESH_S     = 15.0
-HASH_BATCH         = 20000     # hashes entre checagens de stop/time
+HASH_BATCH         = 50000     # hashes entre checagens de stop
 HTTP_TIMEOUT_S     = 10.0
+
+
+# ============================================================
+# TENTA CARREGAR A LIB C
+# ============================================================
+try:
+    import brn_miner as _brn_miner_c
+    _HAS_C = _brn_miner_c.is_available()
+    if _HAS_C:
+        log.info("pool-client: C acceleration ATIVA")
+    else:
+        log.info("pool-client: C acceleration indisponível, usando Python")
+except Exception as e:
+    _brn_miner_c = None
+    _HAS_C = False
+    log.info(f"pool-client: brn_miner indisponivel ({e})")
 
 
 # ============================================================
@@ -47,7 +68,7 @@ def _http_post(path: str, body: dict, timeout: float = HTTP_TIMEOUT_S) -> dict:
         req = urllib.request.Request(
             url, data=data,
             headers={"Content-Type": "application/json",
-                     "User-Agent": "brn-pool-client/1"},
+                     "User-Agent": "brn-pool-client/2"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -67,13 +88,13 @@ def _http_post(path: str, body: dict, timeout: float = HTTP_TIMEOUT_S) -> dict:
 class HashrateMeter:
     def __init__(self, window=10.0):
         self.window = window
-        self._samples = []  # [(ts, hashes_acumuladas)]
+        self._samples = []
         self._lock = threading.Lock()
 
-    def add(self, hashes: int):
+    def add(self, total_hashes: int):
         now = time.time()
         with self._lock:
-            self._samples.append((now, hashes))
+            self._samples.append((now, int(total_hashes)))
             cutoff = now - self.window
             self._samples = [(t, h) for (t, h) in self._samples if t >= cutoff]
 
@@ -86,28 +107,49 @@ class HashrateMeter:
             dt = t1 - t0
             if dt <= 0:
                 return 0.0
-            return (h1 - h0) / dt
+            return max(0.0, (h1 - h0) / dt)
 
     def total(self) -> int:
         with self._lock:
-            return sum(h for _, h in self._samples)
+            return self._samples[-1][1] if self._samples else 0
 
 
 # ============================================================
-# POW SEARCH
+# POW SEARCH (usa C se disponível, senão Python)
 # ============================================================
 def _target_from_difficulty(diff: int) -> int:
     return int("0" * int(diff) + "f" * (64 - int(diff)), 16)
 
 
 def _mine_batch(prev_hash: str, merkle: str, ts: int, diff: int,
-                nonce_start: int, batch: int,
-                share_target: int) -> tuple:
+                nonce_start: int, batch: int, share_target: int) -> tuple:
     """
     Minera `batch` nonces a partir de nonce_start.
     Retorna (nonce_encontrado, hash_hex, hashes_feitos, nonce_final).
-    nonce_encontrado = None se nada encontrado.
     """
+    # ---------- C ----------
+    if _HAS_C and _brn_miner_c is not None:
+        prefix = prev_hash + merkle + str(ts)
+        diff_str = str(int(diff))
+        try:
+            result = _brn_miner_c.pow_search(
+                prefix, diff_str, int(diff),
+                nonce_start=nonce_start,
+                max_iters=batch,
+            )
+        except Exception as e:
+            log.warning("brn_miner.pow_search falhou: %s — usando Python", e)
+            result = None
+
+        if result is not None:
+            found_nonce, found_hash, hashes = result
+            if found_nonce is not None:
+                return found_nonce, found_hash, hashes, found_nonce + 1
+            else:
+                # esgotou batch sem encontrar
+                return None, None, hashes, nonce_start + hashes
+
+    # ---------- Python (fallback) ----------
     prefix = (prev_hash + merkle + str(ts)).encode()
     diff_bytes = str(diff).encode()
     sha = hashlib.sha256
@@ -138,7 +180,6 @@ class PoolClient(threading.Thread):
         self._running = False
         self._lock = threading.RLock()
 
-        # métricas
         self.hashrate_meter = HashrateMeter(window=10.0)
         self.hashes_total = 0
         self.shares_submitted = 0
@@ -150,7 +191,6 @@ class PoolClient(threading.Thread):
         self.last_error = ""
         self.started_at = 0.0
 
-        # job atual
         self._job = None
         self._job_lock = threading.RLock()
 
@@ -161,7 +201,6 @@ class PoolClient(threading.Thread):
         if self._running:
             return False, "ja rodando"
 
-        # Registo
         r = _http_post("/api/pool/register", {
             "miner_id": self.miner_id,
             "address":  self.address,
@@ -170,19 +209,17 @@ class PoolClient(threading.Thread):
         if not r.get("ok"):
             return False, r.get("msg", "register falhou")
 
-        # O servidor pode devolver um miner_id diferente
         self.miner_id = r.get("miner_id", self.miner_id)
 
         self._stop.clear()
         self._running = True
         self.started_at = time.time()
 
-        # Threads auxiliares
         threading.Thread(target=self._loop_heartbeat, daemon=True,
                          name="Pool-HB").start()
         threading.Thread(target=self._loop_work, daemon=True,
                          name="Pool-Work").start()
-        self.start()  # main thread: mineração
+        self.start()
 
         log.info("pool client: iniciado (miner_id=%s)", self.miner_id)
         return True, "iniciado"
@@ -192,7 +229,6 @@ class PoolClient(threading.Thread):
             return False, "nao estava rodando"
         self._stop.set()
         self._running = False
-        # Avisa o servidor
         try:
             _http_post("/api/pool/disconnect", {"miner_id": self.miner_id})
         except Exception:
@@ -210,11 +246,10 @@ class PoolClient(threading.Thread):
         while not self._stop.wait(HEARTBEAT_S):
             try:
                 h = self.hashrate_meter.rate()
-                total = self.hashes_total
                 _http_post("/api/pool/heartbeat", {
                     "miner_id":     self.miner_id,
                     "hashrate":     h,
-                    "hashes_total": total,
+                    "hashes_total": self.hashes_total,
                 }, timeout=5.0)
             except Exception as e:
                 log.debug("heartbeat: %s", e)
@@ -233,7 +268,6 @@ class PoolClient(threading.Thread):
             return
         job = r.get("job") or {}
         with self._job_lock:
-            # Só troca se for um job novo
             if not self._job or self._job.get("job_id") != job.get("job_id"):
                 self._job = job
                 log.info("pool client: novo job %s h=%s diff=%s share_diff=%s",
@@ -244,7 +278,7 @@ class PoolClient(threading.Thread):
     # MINERAÇÃO (main thread)
     # ----------------------------------------------------
     def run(self):
-        # Garante um job antes de começar
+        # garante um job antes de começar
         for _ in range(10):
             if self._stop.is_set():
                 break
@@ -268,7 +302,6 @@ class PoolClient(threading.Thread):
                 time.sleep(1.0)
                 continue
 
-            # Detecta troca de job → reinicia nonce
             if job.get("job_id") != last_job_id:
                 last_job_id = job.get("job_id")
                 nonce = 0
@@ -293,13 +326,13 @@ class PoolClient(threading.Thread):
                 time.sleep(1.0)
                 continue
 
+            # [FIX v2] acumula hashes CORRETAMENTE (soma real)
             self.hashes_total += hashes
             self.hashrate_meter.add(self.hashes_total)
 
             if found_nonce is None:
                 continue
 
-            # Share encontrado!
             self.shares_submitted += 1
             self.last_share_at = time.time()
             log.info("pool client: share nonce=%s hash=%s",
@@ -323,7 +356,6 @@ class PoolClient(threading.Thread):
                     self.last_block_at = time.time()
                     log.warning("pool client: FULL BLOCK #%s encontrado!",
                                 r.get("height"))
-                    # Força novo work
                     try:
                         self._fetch_work()
                     except Exception:
@@ -361,23 +393,23 @@ class PoolClient(threading.Thread):
                                        if self._job else None),
                 "job_height":         (self._job.get("height")
                                        if self._job else None),
+                "job_difficulty":     (self._job.get("difficulty")
+                                       if self._job else None),
+                "job_share_diff":     (self._job.get("share_difficulty")
+                                       if self._job else None),
                 "pool_url":           self.pool_url,
+                "c_acceleration":     _HAS_C,
             }
 
 
 # ============================================================
-# SINGLETON (opcional, usado pelo app_wallet_v3)
+# SINGLETON (usado pelo app_wallet_v3)
 # ============================================================
 _INSTANCE = None
 _INSTANCE_LOCK = threading.RLock()
 
 
 def get_pool_client(address: str = None, pubkey: str = None) -> PoolClient:
-    """
-    Retorna (ou cria) o singleton do pool client.
-    Se address/pubkey forem passados e diferentes dos atuais,
-    cria uma nova instância.
-    """
     global _INSTANCE
     with _INSTANCE_LOCK:
         if _INSTANCE is None:
@@ -385,7 +417,6 @@ def get_pool_client(address: str = None, pubkey: str = None) -> PoolClient:
                 return None
             _INSTANCE = PoolClient(address, pubkey)
         elif address and _INSTANCE.address != address:
-            # Troca de carteira
             if _INSTANCE.is_running():
                 _INSTANCE.stop_mining()
             _INSTANCE = PoolClient(address, pubkey)
@@ -403,7 +434,7 @@ def stop_pool_client() -> bool:
 
 
 # ============================================================
-# AUTO-TESTE (dry-run)
+# AUTO-TESTE
 # ============================================================
 if __name__ == "__main__":
     import sys
@@ -414,9 +445,6 @@ if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Uso:")
         print("  python miner_pool_client.py <endereco_brn1...> <pubkey_hex>")
-        print()
-        print("Exemplo:")
-        print("  python miner_pool_client.py brn123... 02def41a...")
         sys.exit(1)
 
     addr = sys.argv[1]
@@ -424,6 +452,7 @@ if __name__ == "__main__":
     pool_url = os.environ.get("BRN_POOL_URL", "http://127.0.0.1:5000")
 
     print(f"Conectando ao pool {pool_url} como {addr[:16]}...")
+    print(f"C acceleration: {'ATIVA' if _HAS_C else 'Python puro'}")
     c = PoolClient(addr, pub, pool_url=pool_url)
 
     ok, msg = c.start_mining()
@@ -436,7 +465,7 @@ if __name__ == "__main__":
         for i in range(6):
             time.sleep(5)
             st = c.status()
-            print(f"  [{i*5+5}s] hashrate={st['hashrate_khs']:.2f} kH/s "
+            print(f"  [{i*5+5:>3}s] hashrate={st['hashrate_khs']:>8.2f} kH/s "
                   f"shares={st['shares_accepted']}/{st['shares_submitted']} "
                   f"blocks={st['blocks_found']}")
     except KeyboardInterrupt:
