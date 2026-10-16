@@ -1,21 +1,24 @@
-﻿"""
-server.py — Backend HTTP do nó BRN (v9.7)
+"""
+server.py — Backend HTTP do nó BRN (v9.9)
 ================================================================
+v9.9:
+  [NEW] Endpoints do Pool de Mineração:
+        POST /api/pool/register
+        POST /api/pool/work
+        POST /api/pool/submit
+        POST /api/pool/heartbeat
+        POST /api/pool/disconnect
+        GET  /api/pool/stats
+        GET  /api/pool/miners
+        GET  /api/pool/miner/<miner_id>
+  [NEW] set_pool_manager() / _get_pool_manager()
+v9.8:
+  [NEW] /api/peers/discovered
 v9.7:
-  [FIX] CRÍTICO: /api/transfer propaga tx via P2P (set_p2p_manager)
-        — antes usava chain._on_tx_submitted que nunca existiu
-  [FIX] FEE agora vem de blockchain.MIN_RELAY_FEE (não hardcoded)
-  [NEW] set_p2p_manager() / _get_p2p_manager() — injetado pelo main.py
-  [NEW] /api/mempool — lista resumida da mempool
+  [FIX] /api/transfer propaga tx via P2P
+  [NEW] /api/mempool
 v9.6:
-  [FIX] /api/transfer: conversão BRN→sats agora usa Decimal (não float)
-  [FIX] /api/transfer: validação de saldo inclui a fee de 1000 sats
-  [NEW] /api/transfer aceita vírgula decimal (0,29 → 0.29)
-  [NEW] /api/transfer devolve amount_sats e amount_brn
-v9.5:
-  [NEW] set_sync_manager() + /api/sync/status
-v9.4:
-  [CHANGE] /api/mine, /api/miner/* — públicos
+  [FIX] /api/transfer usa Decimal
 ================================================================
 """
 from __future__ import annotations
@@ -126,14 +129,13 @@ CHAIN = _LazyChain()
 
 
 # ============================================================
-# [NEW v9.7] P2P MANAGER INJETÁVEL (para propagar tx via P2P)
+# P2P MANAGER INJETÁVEL
 # ============================================================
 _P2P_MANAGER = None
 _P2P_LOCK = threading.Lock()
 
 
 def set_p2p_manager(p2p) -> None:
-    """Chamado pelo main.py após criar o P2PManager."""
     global _P2P_MANAGER
     with _P2P_LOCK:
         _P2P_MANAGER = p2p
@@ -145,6 +147,28 @@ def set_p2p_manager(p2p) -> None:
 
 def _get_p2p_manager():
     return _P2P_MANAGER
+
+
+# ============================================================
+# [NEW v9.9] POOL MANAGER INJETÁVEL
+# ============================================================
+_POOL_MANAGER = None
+_POOL_LOCK = threading.Lock()
+
+
+def set_pool_manager(pool) -> None:
+    """Chamado pelo main.py após criar o PoolManager."""
+    global _POOL_MANAGER
+    with _POOL_LOCK:
+        _POOL_MANAGER = pool
+    if pool is not None:
+        log.info("server: PoolManager injetado")
+    else:
+        log.info("server: PoolManager removido")
+
+
+def _get_pool_manager():
+    return _POOL_MANAGER
 
 
 # ============================================================
@@ -670,12 +694,11 @@ def minhas_txs(address):
 
 
 # ============================================================
-# MEMPOOL  [NEW v9.7]
+# MEMPOOL
 # ============================================================
 @app.route("/api/mempool", methods=["GET"])
 @require_rate_limit("status")
 def get_mempool():
-    """Lista resumida da mempool (não expõe assinaturas)."""
     try:
         chain = _get_chain()
         txs = chain.db.all_mempool(limit=200)
@@ -700,7 +723,53 @@ def get_mempool():
 
 
 # ============================================================
-# Transfer  [FIX v9.6 + v9.7]
+# PEERS DESCOBERTOS
+# ============================================================
+@app.route("/api/peers/discovered", methods=["GET"])
+@require_rate_limit("status")
+def peers_discovered():
+    try:
+        chain = _get_chain()
+        rows = chain.db.listar_peers(apenas_ativos=False)
+
+        out = []
+        seen_ips = set()
+
+        for p in rows:
+            addr = (p.get("address") or "").strip()
+            if not addr:
+                continue
+
+            ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
+            ip = ip.strip("[]")
+
+            if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+                continue
+
+            if ip in seen_ips:
+                continue
+            seen_ips.add(ip)
+
+            out.append({
+                "ip":        ip,
+                "address":   addr,
+                "node_id":   (p.get("node_id") or "")[:16],
+                "height":    int(p.get("height", 0) or 0),
+                "last_seen": int(p.get("last_seen", 0) or 0),
+                "score":     int(p.get("score", 0) or 0),
+                "version":   p.get("version", "?"),
+            })
+
+        out.sort(key=lambda x: x["last_seen"], reverse=True)
+
+        return jsonify({"ok": True, "count": len(out), "peers": out})
+    except Exception as e:
+        log.exception("peers_discovered falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# Transfer
 # ============================================================
 @app.route("/api/transfer", methods=["POST"])
 @app.route("/api/send", methods=["POST"])
@@ -731,9 +800,6 @@ def transfer():
         if sender == to:
             return jsonify({"ok": False, "msg": "Nao pode enviar para si."}), 400
 
-        # ------------------------------------------------------------
-        # Conversão EXATA com Decimal
-        # ------------------------------------------------------------
         if amount_raw is None or str(amount_raw).strip() == "":
             return jsonify({"ok": False, "msg": "Valor vazio."}), 400
 
@@ -806,9 +872,6 @@ def transfer():
             audit_log("transfer_rejected", {"reason": msg})
             return jsonify({"ok": False, "msg": msg}), 400
 
-        # ------------------------------------------------------------
-        # [FIX v9.7] Propaga via P2P (usa P2PManager injetado pelo main)
-        # ------------------------------------------------------------
         p2p = _get_p2p_manager()
         if p2p is not None:
             try:
@@ -842,7 +905,7 @@ def transfer():
 
 
 # ============================================================
-# MINERAÇÃO
+# MINERAÇÃO LOCAL (não-pool)
 # ============================================================
 @app.route("/api/mine", methods=["POST"])
 @require_rate_limit("mine")
@@ -880,7 +943,6 @@ def mine():
             "hash":   block["hash"][:16],
         })
 
-        # Propaga bloco via P2P
         p2p = _get_p2p_manager()
         if p2p is not None:
             try:
@@ -1053,6 +1115,190 @@ def faucet():
 
 
 # ============================================================
+# [NEW v9.9] POOL DE MINERAÇÃO
+# ============================================================
+@app.route("/api/pool/register", methods=["POST"])
+@require_rate_limit("status")
+def pool_register():
+    """
+    Registo de um minerador no pool.
+    Body: {miner_id?, address, pubkey}
+    """
+    pool = _get_pool_manager()
+    if pool is None:
+        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+    try:
+        data = request.get_json(force=True) or {}
+        address = (data.get("address") or "").strip()
+        pubkey  = (data.get("pubkey") or "").strip()
+        miner_id = (data.get("miner_id") or "").strip() or None
+
+        if not address.startswith("brn1"):
+            return jsonify({"ok": False, "msg": "address invalido"}), 400
+        if not pubkey:
+            return jsonify({"ok": False, "msg": "pubkey obrigatoria"}), 400
+
+        r = pool.register(address, pubkey, miner_id=miner_id)
+        audit_log("pool_register", {
+            "addr":     hash_short(address, 16),
+            "miner_id": (miner_id or "")[:12],
+            "ok":       bool(r.get("ok")),
+        })
+        return jsonify(r), (200 if r.get("ok") else 400)
+    except Exception as e:
+        log.exception("pool_register falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/work", methods=["POST"])
+@require_rate_limit("status")
+def pool_work():
+    """
+    Devolve o job atual para o minerador.
+    Body: {miner_id}
+    """
+    pool = _get_pool_manager()
+    if pool is None:
+        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+    try:
+        data = request.get_json(force=True) or {}
+        miner_id = (data.get("miner_id") or "").strip()
+        if not miner_id:
+            return jsonify({"ok": False, "msg": "miner_id obrigatorio"}), 400
+        r = pool.get_work(miner_id)
+        return jsonify(r), (200 if r.get("ok") else 404)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/submit", methods=["POST"])
+@require_rate_limit("status")
+def pool_submit():
+    """
+    Submete um share.
+    Body: {miner_id, nonce, hash?}
+    """
+    pool = _get_pool_manager()
+    if pool is None:
+        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+    try:
+        data = request.get_json(force=True) or {}
+        miner_id = (data.get("miner_id") or "").strip()
+        nonce = data.get("nonce")
+        hash_hex = (data.get("hash") or "").strip()
+
+        if not miner_id:
+            return jsonify({"ok": False, "msg": "miner_id obrigatorio"}), 400
+        if nonce is None:
+            return jsonify({"ok": False, "msg": "nonce obrigatorio"}), 400
+        try:
+            nonce = int(nonce)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "msg": "nonce invalido"}), 400
+
+        r = pool.submit_share(miner_id, nonce, hash_hex)
+        if r.get("ok"):
+            audit_log("pool_share_ok", {
+                "miner_id": miner_id[:12],
+                "block":    bool(r.get("block_found")),
+                "height":   r.get("height"),
+            })
+        else:
+            audit_log("pool_share_rejected", {
+                "miner_id": miner_id[:12],
+                "reason":   r.get("msg", ""),
+            })
+        return jsonify(r), (200 if r.get("ok") else 400)
+    except Exception as e:
+        log.exception("pool_submit falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/heartbeat", methods=["POST"])
+@require_rate_limit("status")
+def pool_heartbeat():
+    """
+    Heartbeat do minerador.
+    Body: {miner_id, hashrate?, hashes_total?}
+    """
+    pool = _get_pool_manager()
+    if pool is None:
+        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+    try:
+        data = request.get_json(force=True) or {}
+        miner_id = (data.get("miner_id") or "").strip()
+        hashrate = float(data.get("hashrate", 0) or 0)
+        hashes_total = int(data.get("hashes_total", 0) or 0)
+        if not miner_id:
+            return jsonify({"ok": False, "msg": "miner_id obrigatorio"}), 400
+        r = pool.heartbeat(miner_id, hashrate, hashes_total)
+        return jsonify(r), (200 if r.get("ok") else 404)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/disconnect", methods=["POST"])
+@require_rate_limit("status")
+def pool_disconnect():
+    """
+    Remove um minerador do pool.
+    Body: {miner_id}
+    """
+    pool = _get_pool_manager()
+    if pool is None:
+        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+    try:
+        data = request.get_json(force=True) or {}
+        miner_id = (data.get("miner_id") or "").strip()
+        if not miner_id:
+            return jsonify({"ok": False, "msg": "miner_id obrigatorio"}), 400
+        r = pool.disconnect(miner_id)
+        return jsonify(r)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/stats", methods=["GET"])
+@require_rate_limit("status")
+def pool_stats():
+    """Estatísticas globais do pool."""
+    pool = _get_pool_manager()
+    if pool is None:
+        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+    try:
+        return jsonify(pool.stats())
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/miners", methods=["GET"])
+@require_rate_limit("status")
+def pool_miners():
+    """Lista de mineradores do pool."""
+    pool = _get_pool_manager()
+    if pool is None:
+        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+    try:
+        return jsonify({"ok": True, "miners": pool.miners_list()})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/miner/<miner_id>", methods=["GET"])
+@require_rate_limit("status")
+def pool_miner_status(miner_id):
+    """Status de um minerador específico."""
+    pool = _get_pool_manager()
+    if pool is None:
+        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+    try:
+        r = pool.miner_status(miner_id)
+        return jsonify(r), (200 if r.get("ok") else 404)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
 # Chain info
 # ============================================================
 @app.route("/api/chain-info", methods=["GET"])
@@ -1088,6 +1334,7 @@ def status():
                 "contracts": (chain.db.contract_count()
                               if hasattr(chain.db, "contract_count") else 0),
                 "l2_enabled": L2_ENABLED,
+                "pool_enabled": _POOL_MANAGER is not None,
             })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1588,8 +1835,9 @@ def health():
             "chain_injected": _CHAIN is not None,
             "sync_injected": _SYNC_MANAGER is not None,
             "p2p_injected": _P2P_MANAGER is not None,
+            "pool_injected": _POOL_MANAGER is not None,
             "mode": "modo2_aberto",
-            "version": "9.7",
+            "version": "9.9",
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1599,9 +1847,10 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.7",
+        "version": "9.9",
         "mode": "modo2_aberto",
         "l2_enabled": L2_ENABLED,
+        "pool_enabled": _POOL_MANAGER is not None,
         "admin_protected": bool(ADMIN_TOKEN),
     })
 
@@ -1617,13 +1866,15 @@ def _shutdown():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.7 (Modo 2 + P2P propagation + transfer Decimal)")
+    print(f"BRN Server v9.9 (Modo 2 + P2P + Pool + transfer Decimal)")
     print(f"  → http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
     print(f"  /api/mine:    PÚBLICO (sem token)")
     print(f"  /api/faucet:  {'PROTEGIDO' if ADMIN_TOKEN else 'PÚBLICO'}")
     print(f"  /api/mempool: ATIVO")
+    print(f"  /api/peers/discovered: ATIVO")
+    print(f"  /api/pool/*:  ATIVO (se PoolManager injetado)")
     print(f"  CORS: {CORS_ORIGINS or '(desabilitado)'}")
 
     reg = auto_registrar_carteira_atual()
