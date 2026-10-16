@@ -1,52 +1,16 @@
-"""main.py — Entrypoint unificado do nó BRN (v12.6)
+"""main.py — Entrypoint unificado do nó BRN (v12.7)
 ================================================================
+v12.7:
+  [FIX] CRÍTICO: _setup_sync agora lê bootstrap_peers.json e
+        BRN_BOOTSTRAP_PEERS diretamente como fallback, evitando
+        o race condition onde o P2P ainda não tinha populado
+        p2p.peers no momento do boot.
 v12.6:
   [FIX] CRÍTICO: injeta P2PManager no server.py (set_p2p_manager)
         para propagação de tx/blocks via P2P
         — antes o server.py usava chain._on_tx_submitted que nunca existiu
 v12.5:
   [NEW] Sync manager (ChainSyncManager) + rendezvous + relay
-================================================================
-Amarra tudo:
-  1. Config (brn_config.Config) + env
-  2. Senha do nó
-  3. Identidade Ed25519 (node_identity.enc)
-  4. Blockchain (blockchain.py v9.1.8)
-  5. P2P (p2p_unified.P2PManager)
-  6. Sync (sync_manager.ChainSyncManager)
-  7. Rendezvous (rendezvous_discovery.RendezvousDiscovery)
-  8. Relay (p2p_relay.RelayManager)
-  9. L2 (btc_watcher.BTCWatcher)
- 10. HTTP server (server.py v9.7)
- 11. Explorer (explorer.py)
- 12. Miner (miner_loop.get_miner)
- 13. Loop principal até Ctrl+C
-
-Argumentos:
-    --status               Mostra diagnóstico
-    --headless             Sem GUI
-    --read-only            Nó não assina blocos
-    --version              Mostra versão
-    --check-update         Consulta GitHub
-    --config PATH          Config.json (default config.json)
-    --log-level LEVEL      INFO/DEBUG/WARNING
-    --log-file PATH
-    --password-file PATH   Arquivo com senha (uma linha)
-    --rotate-node-id       Nova identidade Ed25519
-    --client-mode          Não cria genesis local
-    --discover             Diagnóstico de descoberta
-    --l2                   Habilita BTC watcher
-    --l2-stats             Mostra stats do L2 e sai
-    --mine                 Inicia miner
-    --no-p2p               Desabilita P2P
-    --no-sync              Não sincroniza
-    --no-tailscale         Pula Tailscale
-    --relay / --no-relay   Força relay on/off
-    --verify-only          Só verifica cadeia
-    --skip-verify          Pula verificação no boot
-
-Prioridade de env:
-    Shell / .bat  >  brn_network.env  >  _HARDCODED_DEFAULTS
 ================================================================
 """
 from __future__ import annotations
@@ -887,6 +851,11 @@ def _list_p2p_peers(p2p):
 
 
 def _setup_sync(chain, p2p, log):
+    """
+    v12.7 — Corrigido para ler bootstrap_peers.json e BRN_BOOTSTRAP_PEERS
+    diretamente, evitando o race condition onde o P2P ainda não tinha
+    populado p2p.peers no momento do boot.
+    """
     if p2p is None:
         log.info("Sync: P2P desligado — sem sync")
         return None
@@ -903,6 +872,9 @@ def _setup_sync(chain, p2p, log):
         log.warning("ChainSyncManager falhou: " + str(e))
         return None
 
+    # ============================================================
+    # 1) Peers do P2P (pode estar vazio no boot)
+    # ============================================================
     n_inicial = 0
     for ip, port, node_id, height, work in _list_p2p_peers(p2p):
         try:
@@ -911,8 +883,66 @@ def _setup_sync(chain, p2p, log):
             n_inicial += 1
         except Exception as e:
             log.debug("sync.register_peer falhou: " + str(e))
-    log.info("Sync: " + str(n_inicial) + " peer(s) registrados inicialmente")
+    log.info("Sync: " + str(n_inicial) + " peer(s) obtidos do P2P")
 
+    # ============================================================
+    # 2) LÊ bootstrap_peers.json DIRETAMENTE (fallback)
+    # ============================================================
+    n_bootstrap = 0
+    try:
+        bp_file = BASE_DIR / "bootstrap_peers.json"
+        if bp_file.exists():
+            with open(bp_file, "r", encoding="utf-8") as f:
+                bp_list = json.load(f)
+            if isinstance(bp_list, list):
+                for entry in bp_list:
+                    entry = str(entry).strip()
+                    if ":" not in entry:
+                        continue
+                    ip, port_s = entry.rsplit(":", 1)
+                    try:
+                        port_i = int(port_s)
+                    except ValueError:
+                        continue
+                    # Registra se ainda não tiver
+                    if entry not in sync.peers:
+                        sync.register_peer(entry, ip, port_i, 0, 0)
+                        n_bootstrap += 1
+    except Exception as e:
+        log.warning("Falha lendo bootstrap_peers.json: " + str(e))
+    if n_bootstrap:
+        log.info("Sync: +" + str(n_bootstrap) + " peer(s) do bootstrap_peers.json")
+
+    # ============================================================
+    # 3) LÊ BRN_BOOTSTRAP_PEERS do env (segundo fallback)
+    # ============================================================
+    n_env = 0
+    try:
+        env_bp = os.environ.get("BRN_BOOTSTRAP_PEERS", "").strip()
+        if env_bp:
+            for entry in env_bp.split(","):
+                entry = entry.strip()
+                if ":" not in entry:
+                    continue
+                ip, port_s = entry.rsplit(":", 1)
+                try:
+                    port_i = int(port_s)
+                except ValueError:
+                    continue
+                if entry not in sync.peers:
+                    sync.register_peer(entry, ip, port_i, 0, 0)
+                    n_env += 1
+    except Exception as e:
+        log.warning("Falha lendo BRN_BOOTSTRAP_PEERS: " + str(e))
+    if n_env:
+        log.info("Sync: +" + str(n_env) + " peer(s) do BRN_BOOTSTRAP_PEERS")
+
+    total = len(sync.peers)
+    log.info("Sync: total peer(s) registrados: " + str(total))
+
+    # ============================================================
+    # 4) Hook de peer novo (quando o P2P descobrir)
+    # ============================================================
     def _on_peer_found(node_id, ip, port, height=0, work=0):
         try:
             sync.register_peer(node_id or f"{ip}:{port}",
@@ -929,6 +959,9 @@ def _setup_sync(chain, p2p, log):
             except Exception:
                 pass
 
+    # ============================================================
+    # 5) Inicia o loop
+    # ============================================================
     try:
         sync.set_sync_mode("full")
         sync.start_sync_loop()
@@ -1201,9 +1234,6 @@ def main():
         log.warning("--l2 solicitado, mas L2 não disponível. Ignorando.")
 
     # ---- [NEW v12.6] Injeta P2PManager no server.py ----
-    # Propaga transações e blocos via P2P.
-    # ANTES: server.py usava chain._on_tx_submitted (nunca existiu) →
-    #        transações ficavam presas na mempool local.
     if p2p is not None:
         try:
             import server as _srv
