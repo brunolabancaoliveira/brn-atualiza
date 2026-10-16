@@ -1,12 +1,16 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.1.9-reorg | Data: 16/10/2026
+Versão: 9.1.10-reorg | Data: 16/10/2026
 ================================================================
+v9.1.10:
+  [FIX] accept_block() agora ativa chain._fork_signal a cada bloco
+        aceite. Isto faz o miner Solo (miner_loop.py v6.6) abortar
+        o trabalho atual e recomeçar no novo topo, evitando forks
+        quando outro nó propaga um bloco novo.
 v9.1.9:
   [NEW] Integração com brn_miner.py (aceleração PoW em C)
         — usa brn_pow_search() se a lib estiver presente; cai para
-        Python puro se não. Ganho típico: 10-30x em hashes/s.
+        Python puro se não. Ganho típico: 5-15x em hashes/s.
   [NEW] Log de rejeição em mine_block_interruptible
-        — se accept_block falhar, loga o motivo (antes silenciava)
 v9.1.8:
   [FIX] CRÍTICO: validate_tx agora checa mempool contra double-spend
   [FIX] CRÍTICO: mine_block_interruptible re-valida cada tx da mempool
@@ -54,7 +58,7 @@ HALVING_INTERVAL = 210_000
 # ============================================================
 BLOCK_TIME = int(os.environ.get("BRN_BLOCK_TIME", "30"))
 DIFFICULTY_INTERVAL = int(os.environ.get("BRN_DIFF_INTERVAL", "50"))
-MAX_DIFFICULTY = int(os.environ.get("BRN_MAX_DIFFICULTY", "7"))
+MAX_DIFFICULTY = int(os.environ.get("BRN_MAX_DIFFICULTY", "8"))
 INITIAL_DIFFICULTY = int(os.environ.get("BRN_MIN_DIFFICULTY", "5"))
 FORCE_DIFFICULTY = os.environ.get("BRN_FORCE_DIFFICULTY", "").strip()
 
@@ -86,7 +90,7 @@ NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
 
 
 # ============================================================
-# [NEW v9.1.9] ACELERAÇÃO PoW EM C (opcional)
+# ACELERAÇÃO PoW EM C (opcional)
 # ============================================================
 try:
     import brn_miner as _brn_miner_c
@@ -275,7 +279,7 @@ def signing_hash(tx: dict) -> bytes:
 
 
 # ============================================================
-# HOT LOOP PoW — [NEW v9.1.9] com aceleração C opcional
+# HOT LOOP PoW — com aceleração C opcional
 # ============================================================
 def _pow_search_py(prev_hash, merkle, ts, diff, nonce_start=0,
                    should_continue=None, progress_cb=None):
@@ -329,7 +333,6 @@ def _pow_search_c(prev_hash, merkle, ts, diff, nonce_start,
                                    nonce, should_continue, progress_cb)
 
         if result is None:
-            # lib indisponível a meio — fallback
             return _pow_search_py(prev_hash, merkle, ts, diff,
                                    nonce, should_continue, progress_cb)
 
@@ -339,7 +342,6 @@ def _pow_search_c(prev_hash, merkle, ts, diff, nonce_start,
         if found_nonce is not None:
             return found_nonce, found_hash, hashes_done
 
-        # Não encontrou nesta batch: avança pelo nº real de hashes feitos
         nonce += batch_hashes
 
         if should_continue is not None and not should_continue():
@@ -356,7 +358,6 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
                 should_continue=None, progress_cb=None):
     """
     Dispatcher: usa C se disponível, senão Python.
-    A assinatura é compatível com a versão anterior.
     """
     if _HAS_C_MINER and _brn_miner_c is not None:
         return _pow_search_c(prev_hash, merkle, ts, diff, nonce_start,
@@ -686,9 +687,7 @@ class Blockchain:
             if not ok_ctr:
                 return False, f"contrato: {msg_ctr}"
 
-        # ------------------------------------------------------------
-        # [FIX v9.1.8] Anti double-spend com a mempool
-        # ------------------------------------------------------------
+        # Anti double-spend com a mempool
         if not from_mempool:
             try:
                 gastos_mem = self.db.utxos_gastos_na_mempool()
@@ -869,7 +868,7 @@ class Blockchain:
         return True, "ok"
 
     # ============================================================
-    # ACEITAÇÃO DE BLOCO
+    # ACEITAÇÃO DE BLOCO  [FIX v9.1.10]
     # ============================================================
     def accept_block(self, block: dict) -> tuple:
         prev = self.db.get_block_by_hash(block["prev_hash"])
@@ -893,6 +892,19 @@ class Blockchain:
                         self._apply_contract_tx(t)
                     except Exception as e:
                         print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
+
+        # ------------------------------------------------------------
+        # [FIX v9.1.10] Sinaliza o miner para abortar o trabalho atual.
+        # Quando este bloco é aceite (via P2P, sync ou mineração local),
+        # o topo mudou. Se o miner Solo estiver a trabalhar num bloco
+        # antigo, deve abortar e recomeçar no novo topo. Evita forks.
+        # ------------------------------------------------------------
+        sig = getattr(self, "_fork_signal", None)
+        if sig is not None:
+            try:
+                sig.set()
+            except Exception:
+                pass
 
         return True, block["hash"]
 
@@ -934,9 +946,6 @@ class Blockchain:
 
         cb = make_coinbase(miner_address, miner_pubkey, height, reward)
 
-        # ------------------------------------------------------------
-        # [FIX v9.1.8] Re-valida cada tx da mempool antes de incluir
-        # ------------------------------------------------------------
         candidatas = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
         selected = []
         gastos_neste_bloco = set()
@@ -1004,9 +1013,6 @@ class Blockchain:
             self._fire_block_mined(block)
             return block
 
-        # ------------------------------------------------------------
-        # [NEW v9.1.9] Log de rejeição — antes silenciava o motivo
-        # ------------------------------------------------------------
         log.warning(
             f"[MINER] bloco #{block.get('height')} minerado mas "
             f"REJEITADO: {_msg}"
@@ -1103,7 +1109,7 @@ if __name__ == "__main__":
         print(f"\n[3] current_difficulty: {bc.current_difficulty()}")
         print(f"[4] cumulative_work: {bc.cumulative_work():,}")
 
-        print("\n[5] Mineração de 3 blocos (aceleração testada):")
+        print("\n[5] Mineração de 3 blocos:")
         addr = GENESIS_ADDRESS
         pub = "02" + "aa" * 32
         t0 = time.time()
@@ -1113,8 +1119,7 @@ if __name__ == "__main__":
             print(f"    #{blk['height']} diff={blk['difficulty']} "
                   f"hash={blk['hash'][:16]}...")
         dt = time.time() - t0
-        print(f"    3 blocos em {dt:.2f}s "
-              f"({dt/3:.2f}s/bloco, diff={bc.current_difficulty()})")
+        print(f"    3 blocos em {dt:.2f}s")
         assert bc.db.height() == 3
         print("    [ok]")
 
