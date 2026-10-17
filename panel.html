@@ -233,6 +233,10 @@
       <span class="k">Abortos por fork:</span>
       <span class="v" id="minerForkAborts">—</span>
     </div>
+    <div class="row">
+      <span class="k">Status de Rede:</span>
+      <span class="v" id="minerBootstrapStatus">—</span>
+    </div>
   </div>
 
   <div class="section">
@@ -282,9 +286,6 @@
 // ============================================================
 // CONFIGURAÇÃO
 // ============================================================
-// API = "" significa "mesma origem".
-// Todas as chamadas vão para :8080 (explorer), que faz proxy
-// para :5000 (server.py). Zero problema de CORS.
 const API = "";
 
 let autoTimer = null;
@@ -453,39 +454,44 @@ async function loadMiner() {
     document.getElementById("minerError").textContent = m.last_error || "—";
     document.getElementById("minerForkAborts").textContent =
       m.fork_aborts ?? 0;
+      
+    document.getElementById("minerBootstrapStatus").innerHTML = m.rede_descentralizada 
+        ? '<span class="tag ok">Descentralizada</span>' 
+        : '<span class="tag warn">Bootstrap: ' + (m.bootstrap_status || 'Aguardando Fila') + '</span>';
+        
   } catch (e) {
     console.error("miner:", e);
   }
 }
 
 // ============================================================
-// PEERS
+// PEERS (CORRIGIDO)
 // ============================================================
 async function loadPeers() {
   try {
     const data = await fetchJSON("/api/peers-score-proxy");
-    if (data.error) return;
+    // O endpoint retorna success: true, então verificamos se a propriedade peers existe
+    if (!data || !data.peers) return;
 
     const tbody = document.getElementById("peersTable");
     const peers = data.peers || [];
 
     if (peers.length === 0) {
-      tbody.innerHTML =
-        '<tr><td colspan="5" style="color:#8b949e">Nenhum peer conectado</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#8b949e">Nenhum peer conectado</td></tr>';
       return;
     }
 
     tbody.innerHTML = "";
     const now = Date.now() / 1000;
+    
     for (const p of peers) {
       const tr = document.createElement("tr");
       const addr = p.address || "—";
       const nodeId = (p.node_id || "").slice(0, 16) || "—";
       const height = p.height || 0;
       const score = p.score ?? 0;
-      const lastSeen = p.last_seen
-        ? formatAgo(Math.floor(now - p.last_seen))
-        : "—";
+      const lastSeen = p.last_seen ? formatAgo(Math.floor(now - p.last_seen)) : "—";
+      
       tr.innerHTML = `
         <td><code>${addr}</code></td>
         <td><code>${nodeId}…</code></td>
@@ -496,7 +502,7 @@ async function loadPeers() {
       tbody.appendChild(tr);
     }
   } catch (e) {
-    console.error("peers:", e);
+    console.error("Erro ao carregar peers:", e);
   }
 }
 

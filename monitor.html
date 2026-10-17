@@ -290,18 +290,12 @@
 // ============================================================
 const STORAGE_KEY = "brn_monitor_nodes_v2";
 
-// Nós fixos (fallback). Sempre aparecem, independentemente
-// do que for descoberto.
 const DEFAULT_NODES = [
   { name: "Ubuntu",  host: "100.111.253.8", port: 8080, role: "miner"  },
   { name: "Windows", host: "100.84.11.48",  port: 8080, role: "client" },
 ];
 
-// Endpoint local (mesma origem da página) — proxy do explorer
-// para /api/peers/discovered do server.py
 const DISCOVERY_ENDPOINT = "/api/peers-discovered-proxy";
-
-// Intervalo entre auto-descobertas (ms)
 const DISCOVERY_INTERVAL_MS = 30000;
 
 let nodes = [];
@@ -368,29 +362,44 @@ async function fetchDiscoveredPeers() {
     if (!data || !data.ok || !Array.isArray(data.peers)) return [];
     return data.peers;
   } catch (e) {
-    // silencioso — o endpoint pode não existir em versões antigas
     return [];
   }
 }
 
 function mergeDiscoveredPeers(discovered) {
   let added = 0;
+  let updated = 0;
   const existingIps = new Set(nodes.map(n => n.host));
 
   for (const p of discovered) {
     const ip = (p.ip || "").trim();
     if (!ip) continue;
-    if (existingIps.has(ip)) continue;
 
     // Filtra loopback e IPs inválidos
     if (ip.startsWith("127.") || ip === "0.0.0.0" || ip === "::1") continue;
 
+    if (existingIps.has(ip)) {
+      // Se o IP já existe (ex: está no DEFAULT_NODES), atualiza para a categoria AUTO
+      const existingNode = nodes.find(n => n.host === ip);
+      if (existingNode) {
+        existingNode.role = "auto";
+        existingNode.auto = true;
+        existingNode.manual = false;
+        existingNode.node_id = p.node_id || existingNode.node_id || "";
+        existingNode.last_seen = p.last_seen || existingNode.last_seen || 0;
+        updated++;
+      }
+      continue;
+    }
+
+    // Se é novo, adiciona à lista
     nodes.push({
       name:       (p.node_id ? "peer-" + p.node_id.slice(0, 8) : ip),
       host:       ip,
       port:       8080,
       role:       "auto",
       auto:       true,
+      manual:     false,
       node_id:    p.node_id || "",
       last_seen:  p.last_seen || 0,
     });
@@ -398,9 +407,9 @@ function mergeDiscoveredPeers(discovered) {
     added++;
   }
 
-  if (added > 0) {
+  if (added > 0 || updated > 0) {
     saveNodes();
-    console.log("[monitor] " + added + " peer(s) adicionados automaticamente");
+    console.log(`[monitor] P2P: ${added} adicionado(s), ${updated} atualizado(s) para AUTO`);
   }
   return added;
 }
