@@ -1,10 +1,9 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.2-Bootstrap)
+server.py — Backend HTTP do nó BRN (v9.9.3-Bootstrap)
 ================================================================
-v9.9.2:
-  [FIX] miner/status retorna bootstrap_status e rede_descentralizada
-v9.9.1:
-  [FIX] Adicionado /api/blocks e /api/block/<height>
+v9.9.3:
+  [FIX] miner/start agora chama chain.adicionar_na_fila()
+  [FIX] miner/status e status retornam o tamanho real da fila
 ================================================================
 """
 from __future__ import annotations
@@ -309,7 +308,7 @@ def transfer():
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
 # ============================================================
-# BLOCOS E EXPLORER (Fix 404)
+# BLOCOS E EXPLORER
 # ============================================================
 @app.route("/api/blocks", methods=["GET"])
 def api_get_blocks():
@@ -332,8 +331,9 @@ def api_get_block(height):
 def api_latest_blocks():
     try: return jsonify(_get_chain().db.latest_blocks(10))
     except Exception as e: return jsonify({"error": str(e)}), 500
+
 # ============================================================
-# MINERAÇÃO (LOCAL E BOOTSTRAP)
+# MINERAÇÃO (LOCAL E BOOTSTRAP) - CORRIGIDO
 # ============================================================
 @app.route("/api/miner/start", methods=["POST"])
 def miner_start():
@@ -347,11 +347,22 @@ def miner_start():
         if not pubkey:
             return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
 
+        chain = _get_chain()
+        
+        # [NOVO] Adiciona à fila de espera do Bootstrap antes de iniciar
+        chain.adicionar_na_fila(addr, pubkey)
+
         from miner_loop import get_miner
-        m = get_miner(_get_chain())
+        m = get_miner(chain)
         ok, msg = m.start(addr, pubkey)
         if not ok: return jsonify({"ok": False, "msg": msg, **m.status()}), 400
-        return jsonify({"ok": True, "msg": "Minerador iniciado.", **m.status()})
+        
+        # Retorna o status atualizado com os dados da fila
+        st = m.status()
+        st["rede_descentralizada"] = chain.rede_descentralizada
+        st["fila_tamanho"] = len(chain.fila_mineracao)
+        
+        return jsonify({"ok": True, "msg": "Minerador iniciado.", **st})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
 @app.route("/api/miner/stop", methods=["POST"])
@@ -367,7 +378,8 @@ def miner_stop():
 def miner_status():
     try:
         from miner_loop import get_miner
-        m = get_miner(_get_chain())
+        chain = _get_chain()
+        m = get_miner(chain)
         st = m.status()
         return jsonify({
             "running": st.get("running", False),
@@ -381,13 +393,14 @@ def miner_status():
             "hashrate": st.get("hashrate", 0.0),
             "hashes_done": st.get("hashes_done", 0),
             "eta_seconds": st.get("eta_seconds"),
-            "height": _get_chain().db.height(),
-            "difficulty": _get_chain().current_difficulty(),
+            "height": chain.db.height(),
+            "difficulty": chain.current_difficulty(),
             "last_error": st.get("last_error", ""),
             "fork_aborts": st.get("fork_aborts", 0),
-            # [NOVO] Campos de Bootstrap
-            "bootstrap_status": st.get("bootstrap_status", ""),
-            "rede_descentralizada": st.get("rede_descentralizada", False),
+            # [CORRIGIDO] Puxa os dados direto da blockchain
+            "bootstrap_status": "Ativa" if not chain.rede_descentralizada else "Concluído",
+            "rede_descentralizada": chain.rede_descentralizada,
+            "fila_tamanho": len(chain.fila_mineracao),
         })
     except Exception as e:
         return jsonify({"running": False, "error": str(e)}), 200
@@ -459,6 +472,7 @@ def status():
                 "utxos": chain.db.count_utxos(), "mempool": len(chain.db.all_mempool(limit=10000)),
                 "peers": chain.db.contar_peers(apenas_ativos=True), "reward": chain.current_reward(chain.db.height() + 1),
                 "difficulty": chain.current_difficulty(), "l2_enabled": L2_ENABLED, "pool_enabled": _POOL_MANAGER is not None,
+                "fila_tamanho": len(chain.fila_mineracao), "rede_descentralizada": chain.rede_descentralizada,
             })
     except Exception as e: return jsonify({"success": False, "error": str(e)}), 500
 
@@ -509,12 +523,12 @@ def peers_score():
 @app.route("/health", methods=["GET"])
 def health():
     try:
-        return jsonify({"ok": True, "height": _get_chain().db.height(), "chain_injected": _CHAIN is not None, "p2p_injected": _P2P_MANAGER is not None, "pool_injected": _POOL_MANAGER is not None, "version": "9.9.2"})
+        return jsonify({"ok": True, "height": _get_chain().db.height(), "chain_injected": _CHAIN is not None, "p2p_injected": _P2P_MANAGER is not None, "pool_injected": _POOL_MANAGER is not None, "version": "9.9.3"})
     except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"name": "BRN Node API", "version": "9.9.2"})
+    return jsonify({"name": "BRN Node API", "version": "9.9.3"})
 
 @atexit.register
 def _shutdown():
@@ -523,5 +537,5 @@ def _shutdown():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.2 (Bootstrap Ready)")
+    print(f"BRN Server v9.9.3 (Bootstrap Queue Fixed)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
