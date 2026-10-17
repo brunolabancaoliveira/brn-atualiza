@@ -1,316 +1,621 @@
-"""
-miner_loop.py — Loop de mineracao do BRN (v6.7 - Bootstrap Final)
-================================================================
-v6.7:
-  [FIX] _enviar_para_fila agora le a resposta do servidor.
-        Se o servidor disser "decentralized=True", o cliente
-        muda o estado local e comeca a minerar imediatamente.
-================================================================
-"""
-import os
-import json
-import time
-import threading
-import traceback
-from pathlib import Path
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>BRN Node — Painel de Controle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0d1117; color: #e6edf3; padding: 20px;
+    font-size: 14px; line-height: 1.5;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 16px; border-bottom: 1px solid #30363d; margin-bottom: 20px;
+    flex-wrap: wrap; gap: 10px;
+  }
+  h1 { font-size: 1.4rem; }
+  h1 span { color: #58a6ff; }
+  .conn {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 0.85rem; color: #8b949e;
+  }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #8b949e; animation: pulse 2s infinite;
+  }
+  .dot.online  { background: #3fb950; animation: pulse 2s infinite; }
+  .dot.offline { background: #f85149; animation: none; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.3 } }
+  .btn {
+    background: #21262d; border: 1px solid #30363d; color: #e6edf3;
+    padding: 6px 14px; border-radius: 6px; cursor: pointer;
+    font-size: 0.85rem; font-family: inherit;
+    transition: all 0.15s;
+  }
+  .btn:hover { background: #30363d; }
+  .btn.primary { background: #238636; border-color: #2ea043; }
+  .btn.primary:hover { background: #2ea043; }
+  .btn.danger { background: #da3633; border-color: #f85149; }
+  .btn.danger:hover { background: #f85149; }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px; margin-bottom: 20px;
+  }
+  .card {
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 8px; padding: 14px 16px;
+  }
+  .card .label {
+    font-size: 0.72rem; color: #8b949e;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .card .value {
+    font-size: 1.6rem; font-weight: 600; color: #58a6ff;
+    margin-top: 4px; font-variant-numeric: tabular-nums;
+  }
+  .card .value.green { color: #3fb950; }
+  .card .value.red   { color: #f85149; }
+  .card .value.gray  { color: #8b949e; }
+  .card .sub { font-size: 0.75rem; color: #8b949e; margin-top: 2px;
+               word-break: break-all; }
+  .section {
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 8px; padding: 16px 20px; margin-bottom: 16px;
+  }
+  .section h2 {
+    font-size: 1rem; margin-bottom: 12px; color: #e6edf3;
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 10px;
+  }
+  .section h2 .actions { display: flex; gap: 8px; }
+  .progress-wrap {
+    background: #21262d; border-radius: 6px; height: 24px;
+    overflow: hidden; position: relative; margin: 8px 0;
+  }
+  .progress-fill {
+    height: 100%; background: linear-gradient(90deg, #238636, #2ea043);
+    transition: width 0.4s ease; border-radius: 6px;
+  }
+  .progress-text {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.8rem; font-weight: 600; color: #fff;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+  }
+  .progress-fill.forking {
+    background: linear-gradient(90deg, #da3633, #f85149);
+    animation: pulse-fork 1s infinite;
+  }
+  @keyframes pulse-fork { 0%,100% { opacity: 1 } 50% { opacity: 0.6 } }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #21262d; }
+  th {
+    color: #8b949e; font-weight: 500; font-size: 0.72rem;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  tr:hover { background: #1c2128; }
+  code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.78rem; background: #0d1117;
+    padding: 2px 6px; border-radius: 4px; color: #79c0ff;
+  }
+  .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.72rem; font-weight: 600;
+  }
+  .tag.ok    { background: rgba(63,185,80,0.15); color: #3fb950; }
+  .tag.warn  { background: rgba(210,153,34,0.15); color: #d29922; }
+  .tag.err   { background: rgba(248,81,73,0.15); color: #f85149; }
+  .tag.info  { background: rgba(88,166,255,0.15); color: #58a6ff; }
+  .row { display: flex; gap: 20px; margin-bottom: 8px; flex-wrap: wrap; }
+  .row .k { color: #8b949e; min-width: 120px; }
+  .row .v { color: #e6edf3; font-variant-numeric: tabular-nums;
+             word-break: break-all; }
+  .footer {
+    text-align: center; margin-top: 32px; padding-top: 16px;
+    border-top: 1px solid #30363d; color: #8b949e; font-size: 0.8rem;
+  }
+  .footer a { color: #58a6ff; text-decoration: none; }
+  .alert {
+    padding: 10px 14px; border-radius: 6px; margin-bottom: 12px;
+    font-size: 0.85rem;
+  }
+  .alert.err { background: rgba(248,81,73,0.1);
+               border: 1px solid rgba(248,81,73,0.4); color: #f85149; }
+  .alert.warn { background: rgba(210,153,34,0.1);
+                border: 1px solid rgba(210,153,34,0.4); color: #d29922; }
+  @media (max-width: 600px) {
+    .card .value { font-size: 1.3rem; }
+    .row { flex-direction: column; gap: 4px; }
+    h1 { font-size: 1.1rem; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
 
-try:
-    from brn_logger import get_logger
-    def _log(msg):
-        get_logger("miner").info(msg)
-except Exception:
-    def _log(msg):
-        print(f"[Miner] {msg}", flush=True)
+  <header>
+    <h1>🔷 <span>BRN</span> Node — Painel de Controle</h1>
+    <div class="conn">
+      <span class="dot" id="connDot"></span>
+      <span id="connText">Conectando...</span>
+      <button class="btn" onclick="loadAll()">🔄 Atualizar</button>
+      <label style="display:flex;align-items:center;gap:5px;cursor:pointer;">
+        <input type="checkbox" id="autoRefresh" checked> Auto
+      </label>
+    </div>
+  </header>
 
-print(f"[Miner] Modulo carregado: {os.path.abspath(__file__)}", flush=True)
+  <div id="alerts"></div>
 
-MINER_INTERVAL      = int(os.environ.get("BRN_MINER_INTERVAL", "30"))
-MINER_AUTO          = os.environ.get("BRN_MINER_AUTO", "1") == "1"
-IS_ORIGIN           = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
+  <div class="grid">
+    <div class="card">
+      <div class="label">Altura</div>
+      <div class="value" id="cHeight">—</div>
+      <div class="sub" id="cTipHash">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Peers</div>
+      <div class="value" id="cPeers">—</div>
+      <div class="sub" id="cPeersActive">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Mempool</div>
+      <div class="value" id="cMempool">—</div>
+      <div class="sub">transações pendentes</div>
+    </div>
+    <div class="card">
+      <div class="label">Dificuldade</div>
+      <div class="value" id="cDifficulty">—</div>
+      <div class="sub">atual</div>
+    </div>
+    <div class="card">
+      <div class="label">UTXOs</div>
+      <div class="value" id="cUtxos">—</div>
+      <div class="sub">saídas não gastas</div>
+    </div>
+    <div class="card">
+      <div class="label">Recompensa</div>
+      <div class="value" id="cReward">—</div>
+      <div class="sub">por bloco</div>
+    </div>
+  </div>
 
-BASE_DIR                 = Path(__file__).resolve().parent
-CURRENT_WALLET_ENC_FILE  = str(BASE_DIR / "current_wallet.enc")
-CURRENT_WALLET_FILE      = str(BASE_DIR / "current_wallet.json")
+  <div class="section">
+    <h2>Sincronização</h2>
+    <div class="progress-wrap">
+      <div class="progress-fill" id="syncBar" style="width: 0%"></div>
+      <div class="progress-text" id="syncText">0%</div>
+    </div>
+    <div class="row">
+      <span class="k">Local:</span>
+      <span class="v" id="syncLocal">—</span>
+      <span class="k">Alvo:</span>
+      <span class="v" id="syncTarget">—</span>
+      <span class="k">Peer ativo:</span>
+      <span class="v" id="syncPeer">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Status:</span>
+      <span class="v" id="syncStatus"><span class="tag info">—</span></span>
+      <span class="k">Reorgs:</span>
+      <span class="v" id="syncReorgs">—</span>
+    </div>
+  </div>
 
-FORK_POLL_INTERVAL = float(os.environ.get("BRN_FORK_POLL_INTERVAL", "0.5"))
+  <div class="section">
+    <h2>
+      Minerador
+      <div class="actions">
+        <button class="btn primary" onclick="startMiner()">▶ Iniciar</button>
+        <button class="btn danger" onclick="stopMiner()">■ Parar</button>
+      </div>
+    </h2>
+    <div class="row">
+      <span class="k">Estado:</span>
+      <span class="v" id="minerStatus">—</span>
+      <span class="k">Endereço:</span>
+      <span class="v" id="minerAddress">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Blocos minerados:</span>
+      <span class="v" id="minerBlocks">—</span>
+      <span class="k">Uptime:</span>
+      <span class="v" id="minerUptime">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Último erro:</span>
+      <span class="v" id="minerError">—</span>
+      <span class="k">Abortos por fork:</span>
+      <span class="v" id="minerForkAborts">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Status de Rede:</span>
+      <span class="v" id="minerBootstrapStatus">—</span>
+    </div>
+  </div>
 
-_MINER_INSTANCE = None
-_MINER_LOCK = threading.Lock()
+  <div class="section">
+    <h2>Peers conectados</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Endereço</th>
+          <th>Node ID</th>
+          <th>Altura</th>
+          <th>Score</th>
+          <th>Última vez</th>
+        </tr>
+      </thead>
+      <tbody id="peersTable">
+        <tr><td colspan="5" style="color:#8b949e">—</td></tr>
+      </tbody>
+    </table>
+  </div>
 
+  <div class="section">
+    <h2>Últimos blocos</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Hash</th>
+          <th>Timestamp</th>
+          <th>Dificuldade</th>
+          <th>Transações</th>
+        </tr>
+      </thead>
+      <tbody id="blocksTable">
+        <tr><td colspan="5" style="color:#8b949e">—</td></tr>
+      </tbody>
+    </table>
+  </div>
 
-def get_miner(chain):
-    global _MINER_INSTANCE
-    with _MINER_LOCK:
-        if _MINER_INSTANCE is None:
-            _MINER_INSTANCE = Miner(chain)
-        else:
-            _MINER_INSTANCE.chain = chain
-        return _MINER_INSTANCE
+  <div class="footer">
+    BRN Node Panel · <a href="http://127.0.0.1:8080/">Explorer</a> ·
+    <a href="http://127.0.0.1:5000/">API</a>
+  </div>
 
+</div>
 
-def _senha_sessao() -> str:
-    return (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
-            or os.environ.get("BRN_NODE_PASSWORD", "").strip())
+<script>
+// ============================================================
+// CONFIGURAÇÃO
+// ============================================================
+const API = "";
 
+let autoTimer = null;
+let lastStatusOk = false;
 
-def _ler_carteira_aberta():
-    senha = _senha_sessao()
-    if senha:
-        try:
-            from secure_store import load_current_wallet
-            r = load_current_wallet(senha)
-            if r and r.get("ok"):
-                addr = (r.get("address") or "").strip()
-                pub  = (r.get("pub_hex") or r.get("public_key") or r.get("pubkey") or "").strip()
-                if addr.startswith("brn1"):
-                    return {"address": addr, "pubkey": pub}
-        except Exception as e:
-            _log(f"_ler_carteira_aberta(.enc) falhou: {e}")
+// ============================================================
+// FETCH
+// ============================================================
+async function fetchJSON(path, options = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 200000);
+  try {
+    const r = await fetch(API + path, { ...options, signal: ctrl.signal });
+    clearTimeout(t);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  } catch (e) {
+    clearTimeout(t);
+    throw e;
+  }
+}
 
-    try:
-        p = Path(CURRENT_WALLET_FILE)
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
-                d = json.load(f)
-            addr = (d.get("address") or "").strip()
-            pub  = (d.get("pub_hex") or d.get("pubkey") or d.get("public_key") or "").strip()
-            if addr.startswith("brn1"):
-                return {"address": addr, "pubkey": pub}
-    except Exception:
-        pass
+function setConn(online, msg) {
+  const dot = document.getElementById("connDot");
+  const txt = document.getElementById("connText");
+  if (online) {
+    dot.classList.remove("offline");
+    dot.classList.add("online");
+    txt.textContent = "Online";
+    txt.style.color = "#3fb950";
+  } else {
+    dot.classList.remove("online");
+    dot.classList.add("offline");
+    txt.textContent = msg || "Offline";
+    txt.style.color = "#f85149";
+  }
+}
 
-    return {}
+function showAlert(type, msg) {
+  const el = document.getElementById("alerts");
+  if (!msg) { el.innerHTML = ""; return; }
+  el.innerHTML = `<div class="alert ${type}">${msg}</div>`;
+}
 
+function shortHash(h) {
+  if (!h) return "—";
+  return h.slice(0, 20) + "…";
+}
+function formatUptime(s) {
+  if (!s) return "—";
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+function formatAgo(s) {
+  if (s == null) return "—";
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  return `${Math.floor(s / 3600)}h`;
+}
+function formatNum(n) {
+  if (n == null) return "—";
+  return Number(n).toLocaleString("pt-BR");
+}
 
-def _pubkey_no_db(bc, addr):
-    try:
-        utxos = bc.db.get_utxos(addr)
-        for u in utxos:
-            pk = (u.get("pubkey") or "").strip()
-            if pk:
-                return pk
-    except Exception:
-        pass
-    return ""
+// ============================================================
+// STATUS
+// ============================================================
+async function loadStatus() {
+  try {
+    const [status, chain] = await Promise.all([
+      fetchJSON("/api/status-proxy"),
+      fetchJSON("/api/chain-info-proxy"),
+    ]);
 
+    if (status.error) {
+      setConn(false, "server offline");
+      showAlert("err", "⚠ server.py (:5000) não está respondendo. "
+                       + "Verifique a janela do nó.");
+      return;
+    }
 
-class Miner:
-    def __init__(self, chain):
-        self.chain = chain
-        self._thread = None
-        self._stop_evt = threading.Event()
-        self.address = ""
-        self.pubkey = ""
-        self.running = False
-        self.blocks_mined = 0
-        self.last_error = ""
-        self.last_height = None
-        self.started_at = 0.0
-        self.fork_aborts = 0
-        self.last_fork_at = 0.0
+    document.getElementById("cHeight").textContent = formatNum(status.height);
+    document.getElementById("cTipHash").textContent = shortHash(chain.tip_hash);
+    document.getElementById("cPeers").textContent = formatNum(status.peers ?? 0);
+    document.getElementById("cPeersActive").textContent =
+      `${formatNum(status.peers ?? 0)} conectados`;
+    document.getElementById("cMempool").textContent = formatNum(status.mempool ?? 0);
+    document.getElementById("cDifficulty").textContent = status.difficulty ?? "—";
+    document.getElementById("cUtxos").textContent = formatNum(status.utxos ?? 0);
 
-    def start(self, address, pubkey_hex=""):
-        if self.running:
-            return False, "ja rodando"
-        if not address:
-            return False, "endereco obrigatorio"
-        if not pubkey_hex:
-            pubkey_hex = _pubkey_no_db(self.chain, address)
-        if not pubkey_hex:
-            msg = f"pubkey desconhecida para {address} (receba uma tx antes)"
-            self.last_error = msg
-            _log(msg)
-            return False, msg
+    const reward = status.reward ?? 0;
+    document.getElementById("cReward").textContent =
+      (reward / 1e8).toFixed(0) + " BRN";
 
-        self.address = address
-        self.pubkey = pubkey_hex
-        self.blocks_mined = 0
-        self.last_error = ""
-        self.last_height = None
-        self.started_at = time.time()
-        self.fork_aborts = 0
-        self.last_fork_at = 0.0
-        self._stop_evt.clear()
-        self.running = True
+    setConn(true);
+    showAlert(null, null);
+    lastStatusOk = true;
+  } catch (e) {
+    setConn(false, "offline");
+    if (lastStatusOk) {
+      showAlert("err", "⚠ Não consegui falar com o explorer (:8080). "
+                       + "Erro: " + e.message);
+    }
+    lastStatusOk = false;
+    console.error("status:", e);
+  }
+}
 
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="Miner")
-        self._thread.start()
-        _log(f"Miner iniciado | addr={address[:16]}... | pub={pubkey_hex[:16]}...")
-        return True, "iniciado"
+// ============================================================
+// SYNC
+// ============================================================
+async function loadSync() {
+  try {
+    const s = await fetchJSON("/api/sync-status-proxy");
+    if (s.error) return;
 
-    def stop(self):
-        if not self.running:
-            return False, "nao estava rodando"
-        self._stop_evt.set()
-        self.running = False
-        _log(f"Miner parado (total={self.blocks_mined})")
-        return True, "parado"
+    const progress = Math.min(100, s.progress ?? 0);
+    const bar = document.getElementById("syncBar");
+    bar.style.width = progress + "%";
+    if (s.forking) {
+      bar.classList.add("forking");
+      document.getElementById("syncText").textContent =
+        `⚠ FORK — reorg em andamento`;
+    } else {
+      bar.classList.remove("forking");
+      document.getElementById("syncText").textContent =
+        `${progress.toFixed(1)}% — ${s.eta_legivel || ""}`;
+    }
+    document.getElementById("syncLocal").textContent = s.local_height ?? "—";
+    document.getElementById("syncTarget").textContent = s.target_height ?? "—";
+    document.getElementById("syncPeer").textContent = s.active_peer || "—";
+    document.getElementById("syncReorgs").textContent =
+      `${s.reorgs_total ?? 0} (último: #${s.last_reorg_height ?? "—"})`;
 
-    def status(self):
-        uptime = 0
-        if self.started_at and self.running:
-            uptime = int(time.time() - self.started_at)
-        elif self.started_at and not self.running:
-            uptime = int(time.time() - self.started_at) if self.blocks_mined else 0
+    let tag = '<span class="tag info">sincronizando</span>';
+    if (s.forking) tag = '<span class="tag err">reorg</span>';
+    else if (s.synced) tag = '<span class="tag ok">sincronizado</span>';
+    document.getElementById("syncStatus").innerHTML = tag;
+  } catch (e) {
+    console.error("sync:", e);
+  }
+}
 
-        fork_sig = getattr(self.chain, "_fork_signal", None)
-        forking = bool(fork_sig and fork_sig.is_set())
+// ============================================================
+// MINER
+// ============================================================
+async function loadMiner() {
+  try {
+    const m = await fetchJSON("/api/miner-status-proxy");
+    if (m.error) return;
 
-        status_msg = ""
-        if not self.chain.rede_descentralizada and not IS_ORIGIN:
-            status_msg = f"Aguardando Fila ({len(self.chain.fila_mineracao)}/20)"
-        elif not self.chain.rede_descentralizada and IS_ORIGIN:
-            status_msg = "Validador (Bootstrap)"
+    const badge = m.running
+      ? '<span class="tag ok">● Rodando</span>'
+      : '<span class="tag warn">○ Parado</span>';
 
-        return {
-            "running": self.running,
-            "address": self.address,
-            "pubkey": self.pubkey,
-            "blocks_mined": self.blocks_mined,
-            "height": self.chain.db.height(),
-            "difficulty": self.chain.current_difficulty(),
-            "last_error": self.last_error,
-            "count": self.blocks_mined,
-            "last_height": self.last_height,
-            "uptime": uptime,
-            "fork_aborts": self.fork_aborts,
-            "last_fork_ago_s": (int(time.time() - self.last_fork_at) if self.last_fork_at else None),
-            "fork_in_progress": forking,
-            "bootstrap_status": status_msg,
-            "rede_descentralizada": self.chain.rede_descentralizada
-        }
+    document.getElementById("minerStatus").innerHTML = badge;
+    document.getElementById("minerAddress").innerHTML =
+      m.address ? `<code>${m.address}</code>` : "—";
+    document.getElementById("minerBlocks").textContent = m.blocks_mined ?? 0;
+    document.getElementById("minerUptime").textContent =
+      formatUptime(m.uptime ?? 0);
+    document.getElementById("minerError").textContent = m.last_error || "—";
+    document.getElementById("minerForkAborts").textContent =
+      m.fork_aborts ?? 0;
+      
+    // NOVO: Atualiza o status de Bootstrap
+    document.getElementById("minerBootstrapStatus").innerHTML = m.rede_descentralizada 
+        ? '<span class="tag ok">Descentralizada</span>' 
+        : '<span class="tag warn">Bootstrap: ' + (m.bootstrap_status || 'Aguardando Fila') + '</span>';
+        
+  } catch (e) {
+    console.error("miner:", e);
+  }
+}
 
-    def _should_continue(self) -> bool:
-        if self._stop_evt.is_set():
-            return False
-        fork_sig = getattr(self.chain, "_fork_signal", None)
-        if fork_sig is not None and fork_sig.is_set():
-            self.fork_aborts += 1
-            self.last_fork_at = time.time()
-            _log(f"[FORK] abortando bloco atual — reorg em andamento")
-            return False
-        return True
+// ============================================================
+// PEERS
+// ============================================================
+async function loadPeers() {
+  try {
+    const data = await fetchJSON("/api/peers-score-proxy");
+    if (data.error) return;
 
-    # ============================================================
-    # [FIX v6.7] Le a resposta do servidor e atualiza o estado
-    # ============================================================
-    def _enviar_para_fila(self):
-        try:
-            from p2p_unified import P2PClient
-            from brn_config import get_config
-            
-            cfg = get_config()
-            peers = cfg.get("bootstrap_peers", [])
-            
-            msg = {
-                "type": "join_mining_queue",
-                "address": self.address,
-                "pubkey": self.pubkey
-            }
-            
-            for peer in peers:
-                if ":" in peer:
-                    ip, port = peer.split(":")
-                    # Envia e espera a resposta
-                    resp, _ = P2PClient.send_message(ip, int(port), msg)
-                    
-                    if resp and resp.get("type") == "queue_ack":
-                        if resp.get("decentralized"):
-                            _log("[BOOTSTRAP] O Validador confirmou que a rede descentralizou!")
-                            self.chain.rede_descentralizada = True
-                        else:
-                            tam = resp.get("queue_size", 0)
-                            _log(f"Fila atualizada pelo Validador: {tam}/20")
-                    else:
-                        _log(f"Pedido de fila enviado para {ip}:{port} (sem resposta ack)")
-        except Exception as e:
-            _log(f"Falha ao enviar para fila: {e}")
+    const tbody = document.getElementById("peersTable");
+    const peers = data.peers || [];
 
-    def _loop(self):
-        while not self._stop_evt.is_set():
-            try:
-                if self.chain.db.height() < 0:
-                    _log("Aguardando genesis (DB vazio)...")
-                    if self._stop_evt.wait(timeout=5):
-                        break
-                    continue
+    if (peers.length === 0) {
+      tbody.innerHTML =
+        '<tr><td colspan="5" style="color:#8b949e">Nenhum peer conectado</td></tr>';
+      return;
+    }
 
-                if not self.pubkey:
-                    _log("Sem pubkey — parando")
-                    self.running = False
-                    return
+    tbody.innerHTML = "";
+    const now = Date.now() / 1000;
+    for (const p of peers) {
+      const tr = document.createElement("tr");
+      const addr = p.address || "—";
+      const nodeId = (p.node_id || "").slice(0, 16) || "—";
+      const height = p.height || 0;
+      const score = p.score ?? 0;
+      const lastSeen = p.last_seen
+        ? formatAgo(Math.floor(now - p.last_seen))
+        : "—";
+      tr.innerHTML = `
+        <td><code>${addr}</code></td>
+        <td><code>${nodeId}…</code></td>
+        <td>${height}</td>
+        <td>${score}</td>
+        <td>${lastSeen}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    console.error("peers:", e);
+  }
+}
 
-                # ============================================================
-                # FASE DE BOOTSTRAP: Se nao é origin e rede nao descentralizou
-                # ============================================================
-                if not IS_ORIGIN and not self.chain.rede_descentralizada:
-                    self._enviar_para_fila()
-                    _log(f"Aguardando 20 mineradores... ({len(self.chain.fila_mineracao)}/20 na fila)")
-                    if self._stop_evt.wait(timeout=15): # Avisa a cada 15s
-                        break
-                    continue
+// ============================================================
+// BLOCOS
+// ============================================================
+async function loadBlocks() {
+  try {
+    let blocks = await fetchJSON("/api/latest");
+    if (!Array.isArray(blocks)) throw new Error("formato inválido");
 
-                # Se chegou aqui, o Validador está minerando OU a rede já descentralizou
-                fork_sig = getattr(self.chain, "_fork_signal", None)
-                if fork_sig is not None and fork_sig.is_set():
-                    waited = 0.0
-                    while (fork_sig.is_set() and waited < 60.0 and not self._stop_evt.is_set()):
-                        if self._stop_evt.wait(FORK_POLL_INTERVAL):
-                            break
-                        waited += FORK_POLL_INTERVAL
-                    if self._stop_evt.is_set(): break
-                    continue
+    blocks = blocks.sort((a, b) => b.height - a.height).slice(0, 10);
+    const tbody = document.getElementById("blocksTable");
 
-                block = self.chain.mine_block_interruptible(
-                    self.address,
-                    self.pubkey,
-                    should_continue=self._should_continue,
-                )
+    if (blocks.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#8b949e">—</td></tr>';
+      return;
+    }
 
-                if block is None:
-                    if self._stop_evt.is_set(): break
-                    continue
+    tbody.innerHTML = "";
+    for (const b of blocks) {
+      const ts = b.timestamp
+        ? new Date(b.timestamp * 1000).toLocaleString("pt-BR")
+        : "—";
+      const txs = b.transactions ? b.transactions.length : 0;
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td><strong>${b.height}</strong></td>
+        <td><code>${shortHash(b.hash)}</code></td>
+        <td>${ts}</td>
+        <td>${b.difficulty ?? "—"}</td>
+        <td>${txs}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    console.error("blocks:", e);
+  }
+}
 
-                self.blocks_mined += 1
-                h = block.get("height")
-                self.last_height = h
-                _log(f"OK Bloco #{h} minerado (total={self.blocks_mined})")
+// ============================================================
+// AÇÕES
+// ============================================================
+async function startMiner() {
+  if (!confirm("Iniciar mineração com a carteira atual?")) return;
+  try {
+    const r = await fetch(API + "/api/miner/start-proxy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      showAlert("warn", "✅ Miner iniciado");
+      setTimeout(() => showAlert(null, null), 3000);
+    } else {
+      showAlert("err", "❌ " + (data.msg || "falha ao iniciar"));
+    }
+    loadMiner();
+  } catch (e) {
+    showAlert("err", "❌ Erro: " + e.message);
+  }
+}
 
-            except ValueError as e:
-                self.last_error = str(e)
-                _log(f"Miner erro: {e}")
-                self.running = False
-                return
-            except Exception as e:
-                self.last_error = str(e)
-                _log(f"Miner exception: {e}")
-                traceback.print_exc()
-                if self._stop_evt.wait(timeout=3):
-                    break
+async function stopMiner() {
+  if (!confirm("Parar a mineração?")) return;
+  try {
+    const r = await fetch(API + "/api/miner/stop-proxy", { method: "POST" });
+    const data = await r.json();
+    if (data.ok) {
+      showAlert("warn", "✅ Miner parado");
+      setTimeout(() => showAlert(null, null), 3000);
+    } else {
+      showAlert("err", "❌ " + (data.msg || "falha ao parar"));
+    }
+    loadMiner();
+  } catch (e) {
+    showAlert("err", "❌ Erro: " + e.message);
+  }
+}
 
-        self.running = False
-        _log("Miner loop encerrado")
+// ============================================================
+// CICLO
+// ============================================================
+async function loadAll() {
+  await Promise.all([
+    loadStatus(),
+    loadSync(),
+    loadMiner(),
+    loadPeers(),
+    loadBlocks(),
+  ]);
+}
 
-# ============================================================
-# AUTO-START
-# ============================================================
-def loop_mineracao(chain, intervalo=None):
-    if not MINER_AUTO:
-        _log("Auto-mineracao DESATIVADA")
-        return
-    intervalo = intervalo or MINER_INTERVAL
-    time.sleep(5)
-    m = get_miner(chain)
-    w = _ler_carteira_aberta()
-    if w.get("address"):
-        ok, msg = m.start(w["address"], w.get("pubkey", ""))
-        _log(f"auto-start: {ok} ({msg})")
-    else:
-        _log("auto-start: sem carteira aberta — aguardando current_wallet")
+function startAuto() {
+  if (autoTimer) clearInterval(autoTimer);
+  autoTimer = setInterval(loadAll, 3000);
+}
 
-def iniciar_mineracao(chain, intervalo=None):
-    t = threading.Thread(target=loop_mineracao, args=(chain, intervalo), daemon=True, name="MinerLoop")
-    t.start()
-    return t
+function stopAuto() {
+  if (autoTimer) clearInterval(autoTimer);
+  autoTimer = null;
+}
 
-start_miner = start_mining = iniciar_miner = iniciar_miner_loop = iniciar_mineracao
+document.getElementById("autoRefresh").addEventListener("change", (e) => {
+  if (e.target.checked) startAuto();
+  else stopAuto();
+});
+
+// Inicial
+loadAll();
+startAuto();
+</script>
+</body>
+</html>
