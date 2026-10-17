@@ -1,11 +1,10 @@
 """
-miner_loop.py — Loop de mineracao do BRN (v6.6 - Bootstrap)
+miner_loop.py — Loop de mineracao do BRN (v6.7 - Bootstrap Final)
 ================================================================
-v6.6:
-  [NEW] Fase de Bootstrap:
-        - Cliente nao minera se rede_descentralizada == False
-        - Cliente envia P2P "join_mining_queue" para o validador
-        - Aguarda ate que 20 mineradores entrem na rede
+v6.7:
+  [FIX] _enviar_para_fila agora le a resposta do servidor.
+        Se o servidor disser "decentralized=True", o cliente
+        muda o estado local e comeca a minerar imediatamente.
 ================================================================
 """
 import os
@@ -157,7 +156,6 @@ class Miner:
         fork_sig = getattr(self.chain, "_fork_signal", None)
         forking = bool(fork_sig and fork_sig.is_set())
 
-        # [NOVO] Status da Fila para o Frontend
         status_msg = ""
         if not self.chain.rede_descentralizada and not IS_ORIGIN:
             status_msg = f"Aguardando Fila ({len(self.chain.fila_mineracao)}/20)"
@@ -178,8 +176,8 @@ class Miner:
             "fork_aborts": self.fork_aborts,
             "last_fork_ago_s": (int(time.time() - self.last_fork_at) if self.last_fork_at else None),
             "fork_in_progress": forking,
-            "bootstrap_status": status_msg,  # [NOVO]
-            "rede_descentralizada": self.chain.rede_descentralizada # [NOVO]
+            "bootstrap_status": status_msg,
+            "rede_descentralizada": self.chain.rede_descentralizada
         }
 
     def _should_continue(self) -> bool:
@@ -194,7 +192,7 @@ class Miner:
         return True
 
     # ============================================================
-    # [NOVO] Manda o P2P avisando o Validador que quer minerar
+    # [FIX v6.7] Le a resposta do servidor e atualiza o estado
     # ============================================================
     def _enviar_para_fila(self):
         try:
@@ -213,8 +211,18 @@ class Miner:
             for peer in peers:
                 if ":" in peer:
                     ip, port = peer.split(":")
-                    P2PClient.send_message(ip, int(port), msg)
-                    _log(f"Pedido de fila enviado para {ip}:{port}")
+                    # Envia e espera a resposta
+                    resp, _ = P2PClient.send_message(ip, int(port), msg)
+                    
+                    if resp and resp.get("type") == "queue_ack":
+                        if resp.get("decentralized"):
+                            _log("[BOOTSTRAP] O Validador confirmou que a rede descentralizou!")
+                            self.chain.rede_descentralizada = True
+                        else:
+                            tam = resp.get("queue_size", 0)
+                            _log(f"Fila atualizada pelo Validador: {tam}/20")
+                    else:
+                        _log(f"Pedido de fila enviado para {ip}:{port} (sem resposta ack)")
         except Exception as e:
             _log(f"Falha ao enviar para fila: {e}")
 
@@ -233,18 +241,16 @@ class Miner:
                     return
 
                 # ============================================================
-                # [NOVO] FASE DE BOOTSTRAP: Se nao é origin e rede nao descentralizou
+                # FASE DE BOOTSTRAP: Se nao é origin e rede nao descentralizou
                 # ============================================================
                 if not IS_ORIGIN and not self.chain.rede_descentralizada:
                     self._enviar_para_fila()
-                    _log(f"Aguardando 20 mineradores para descentralizar... ({len(self.chain.fila_mineracao)}/20 na fila)")
+                    _log(f"Aguardando 20 mineradores... ({len(self.chain.fila_mineracao)}/20 na fila)")
                     if self._stop_evt.wait(timeout=15): # Avisa a cada 15s
                         break
                     continue
 
                 # Se chegou aqui, o Validador está minerando OU a rede já descentralizou
-                # e todos os clientes começam a minerar de verdade.
-                
                 fork_sig = getattr(self.chain, "_fork_signal", None)
                 if fork_sig is not None and fork_sig.is_set():
                     waited = 0.0
