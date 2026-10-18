@@ -1,12 +1,23 @@
 """
-explorer.py — Explorador de blocos BRN (Flask) v9.6
+explorer.py — Explorador de blocos BRN (Flask) v9.7
 ================================================================
-- Corrigido timeout dos proxies (60s) para não mostrar Offline.
+- Timeout dos proxies ajustado para 60s.
+- Tratamento robusto de erros no SQLite.
 - Serve as páginas HTML (index, panel, monitor).
+================================================================
 """
 from __future__ import annotations
-import os, re, time, atexit, logging, threading
+import os
+import re
+import time
+import atexit
+import logging
+import threading
+import urllib.request
+import urllib.error
+import json as _json
 from pathlib import Path
+
 from flask import Flask, jsonify, send_from_directory, request, abort
 
 try:
@@ -40,29 +51,20 @@ except Exception:
     _HAS_SECURITY = False
 
     def require_rate_limit(name):
-        def deco(fn):
-            return fn
+        def deco(fn): return fn
         return deco
 
-    def audit_log(event, data=None):
-        pass
-
-    def close_audit():
-        pass
-
-    def hash_short(v, n=12):
-        return str(v)[:n] if v else ""
-
-    def get_client_ip():
-        return request.remote_addr or "0.0.0.0"
+    def audit_log(event, data=None): pass
+    def close_audit(): pass
+    def hash_short(v, n=12): return str(v)[:n] if v else ""
+    def get_client_ip(): return request.remote_addr or "0.0.0.0"
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = os.environ.get("BRN_DB", "brn_v2_chain.db")
+DB_PATH = os.environ.get("BRN_DB", str(BASE_DIR / "brn_v2_chain.db"))
 PORT = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
 HOST = os.environ.get("BRN_EXPLORER_HOST", "127.0.0.1")
 CORS_ORIGIN = os.environ.get("BRN_CORS_ORIGIN", "").strip()
 BEHIND_PROXY = os.environ.get("BRN_BEHIND_PROXY", "0") == "1"
-VERIFY_TTL = int(os.environ.get("BRN_VERIFY_TTL", "300"))
 
 SERVER_PORT = int(os.environ.get("BRN_WEB_PORT", "5000"))
 SERVER_HOST = os.environ.get("BRN_PROXY_HOST", "127.0.0.1")
@@ -141,6 +143,9 @@ def _parse_int(name, default, lo, hi):
 def _valid_address(addr):
     return bool(BRN_ADDRESS_RE.match(addr or ""))
 
+# ============================================================
+# ROTAS HTML (Painel, Monitor, Explorer)
+# ============================================================
 @app.route("/")
 def index():
     try: return send_from_directory(BASE_DIR, "index.html", max_age=60)
@@ -150,20 +155,19 @@ def index():
 @app.route("/panel.html")
 def panel():
     try: return send_from_directory(BASE_DIR, "panel.html", max_age=5)
-    except Exception as e: return f"<h1>Panel não encontrado</h1><p>Crie o arquivo <code>panel.html</code> em <code>{BASE_DIR}</code>.</p><p>Erro: {e}</p>", 404
+    except Exception as e: return f"<h1>Painel não encontrado</h1><p>Erro: {e}</p>", 404
 
 @app.route("/monitor")
 @app.route("/monitor.html")
 def monitor():
     try: return send_from_directory(BASE_DIR, "monitor.html", max_age=5)
-    except Exception as e: return f"<h1>Monitor não encontrado</h1><p>Crie o arquivo <code>monitor.html</code> em <code>{BASE_DIR}</code>.</p><p>Erro: {e}</p>", 404
+    except Exception as e: return f"<h1>Monitor não encontrado</h1><p>Erro: {e}</p>", 404
 
-import urllib.request
-import urllib.error
-import json as _json
-
-# Timeout de 60s para evitar que a UI mostre "Offline" enquanto o node processa blocos
+# ============================================================
+# PROXIES (Para o server.py na porta 5000)
+# ============================================================
 def _proxy_get(path: str, timeout: float = 60.0):
+    """Faz GET para o server.py e devolve o JSON."""
     url = f"http://{SERVER_HOST}:{SERVER_PORT}{path}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "brn-explorer"})
@@ -179,6 +183,7 @@ def _proxy_get(path: str, timeout: float = 60.0):
         return {"error": str(e)}, 503
 
 def _proxy_post(path: str, body: dict, timeout: float = 60.0):
+    """Faz POST para o server.py."""
     url = f"http://{SERVER_HOST}:{SERVER_PORT}{path}"
     data = _json.dumps(body).encode("utf-8")
     try:
@@ -245,37 +250,49 @@ def peers_discovered_proxy():
     data, code = _proxy_get("/api/peers/discovered")
     return jsonify(data), code
 
+# ============================================================
+# ROTAS LOCAIS (Leitura direta do SQLite)
+# ============================================================
 @app.route("/api/stats")
 @require_rate_limit("status")
 def stats():
-    db = _db()
-    s = db.get_stats()
-    try: s["peers_count"] = db.contar_peers(apenas_ativos=False)
-    except Exception: s["peers_count"] = 0
-    return jsonify(s)
+    try:
+        db = _db()
+        s = db.get_stats()
+        s["peers_count"] = db.contar_peers(apenas_ativos=False)
+        return jsonify(s)
+    except Exception as e:
+        log.error(f"Erro em /api/stats: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/latest")
 @require_rate_limit("list_blocks")
 def latest():
-    return jsonify(_db().latest_blocks(n=50))
+    try:
+        return jsonify(_db().latest_blocks(n=50))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/blocks")
 @require_rate_limit("list_blocks")
 def blocks_paginado():
-    start = _parse_int("start", 0, 0, 10 ** 9)
-    limit = _parse_int("limit", 50, 1, 1000)
-    db = _db()
-    top = db.height()
-    out = []
-    for h in range(start, min(start + limit, top + 1)):
-        b = db.get_block(h)
-        if b:
-            out.append({
-                "height": b["height"], "hash": b["hash"],
-                "timestamp": b["timestamp"], "txs": len(b["transactions"]),
-                "difficulty": b["difficulty"],
-            })
-    return jsonify({"start": start, "count": len(out), "blocks": out})
+    try:
+        start = _parse_int("start", 0, 0, 10 ** 9)
+        limit = _parse_int("limit", 50, 1, 1000)
+        db = _db()
+        top = db.height()
+        out = []
+        for h in range(start, min(start + limit, top + 1)):
+            b = db.get_block(h)
+            if b:
+                out.append({
+                    "height": b["height"], "hash": b["hash"],
+                    "timestamp": b["timestamp"], "txs": len(b["transactions"]),
+                    "difficulty": b["difficulty"],
+                })
+        return jsonify({"start": start, "count": len(out), "blocks": out})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/health")
 def health():
@@ -296,7 +313,7 @@ def _shutdown():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print(f"  BRN Explorer v9.6")
+    print(f"  BRN Explorer v9.7")
     print(f"  → http://{HOST}:{PORT}")
     print(f"  → Painel: http://{HOST}:{PORT}/panel")
     print(f"  → Monitor: http://{HOST}:{PORT}/monitor")

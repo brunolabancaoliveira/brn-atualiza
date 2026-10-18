@@ -1,4 +1,4 @@
-"""blockchain.py — Núcleo da Blockchain BRN (v9.2.1-Bootstrap)"""
+"""blockchain.py — Núcleo da Blockchain BRN (v9.2.2-Bootstrap)"""
 from __future__ import annotations
 import os, time, hmac, hashlib, logging, orjson, json
 from crypto import double_sha256, sha256
@@ -24,6 +24,7 @@ MAX_REORG_DEPTH = 100
 HASH_BATCH_SIZE = 5000
 AUTH_TAG_START_HEIGHT = 6000
 CHECKPOINT_INTERVAL = 1000
+MTP_WINDOW = 11  # [SEGURANÇA] Median Time Past: janela de 11 blocos
 
 GENESIS_PREV = "0" * 64
 GENESIS_TIMESTAMP = 1700000000
@@ -321,6 +322,16 @@ class Blockchain:
         if not self.db.add_mempool(tx, fee): return False, "falha na mempool"
         return True, tx["txid"]
 
+    def median_time_past(self, height: int) -> int:
+        """[SEGURANÇA] Median Time Past: mediana dos últimos 11 timestamps."""
+        timestamps = []
+        for i in range(max(0, height - MTP_WINDOW), height):
+            b = self.db.get_block(i)
+            if b: timestamps.append(b["timestamp"])
+        if not timestamps: return 0
+        timestamps.sort()
+        return timestamps[len(timestamps) // 2]
+
     def validate_block(self, block: dict, prev_block=None) -> tuple:
         if block["height"] == 0 and prev_block is None:
             if self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash: return False, "genesis nao corresponde"
@@ -328,6 +339,13 @@ class Blockchain:
         if block["prev_hash"] != expected_prev: return False, "prev_hash incorreto"
         expected_height = (prev_block["height"] + 1) if prev_block else self.db.height() + 1
         if block["height"] != expected_height: return False, "altura invalida"
+        
+        # [SEGURANÇA] Median Time Past (MTP)
+        if block["height"] > MTP_WINDOW:
+            mtp = self.median_time_past(block["height"])
+            if block["timestamp"] <= mtp:
+                return False, f"timestamp ({block['timestamp']}) <= MTP ({mtp})"
+
         if not meets_difficulty(block["hash"], block["difficulty"]): return False, "PoW invalido"
         h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"], block["nonce"], block["difficulty"])
         if h != block["hash"]: return False, "hash incorreto"
