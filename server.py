@@ -1,13 +1,31 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.5 - Sem limites de exibição)
+server.py — Backend HTTP do nó BRN (v9.9.6 - Bootstrap P2P Sync)
+================================================================
+v9.9.6:
+  [NEW] Rota /api/bootstrap/add para receber aviso de mineradores remotos
+  [NEW] /api/miner/start agora avisa os nós Origin via HTTP
+v9.9.5:
+  [FIX] Limites de exibição altos (histórico, mempool, blocos)
+  [NEW] L2, Pool, Contracts, Security mantidos
+================================================================
 """
 from __future__ import annotations
-import os, time, json, atexit, hmac, logging, threading
+import os
+import time
+import json
+import atexit
+import hmac
+import logging
+import threading
+import urllib.request
+import urllib.error
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import wraps
 from pathlib import Path
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+
 from wallet import Wallet, WalletManager, HDWalletManager
 from blockchain import Blockchain, make_coinbase, txid as calc_txid, signing_hash
 
@@ -31,20 +49,25 @@ except ImportError:
 
 log = logging.getLogger("server")
 BASE_DIR = Path(__file__).resolve().parent
+
 WEB_HOST = os.environ.get("BRN_WEB_HOST", "127.0.0.1")
 BEHIND_PROXY = os.environ.get("BRN_BEHIND_PROXY", "0") == "1"
 CORS_ORIGINS = [o.strip() for o in os.environ.get("BRN_CORS_ORIGIN", "").split(",") if o.strip()]
 ADMIN_TOKEN = os.environ.get("BRN_ADMIN_TOKEN", "").strip()
+
 WALLETS_FILE = str(BASE_DIR / "user_wallets.json")
 CURRENT_WALLET_FILE = str(BASE_DIR / "current_wallet.json")
+
 FAUCET_AMOUNT_BRN, FAUCET_MAX_PER_ADDRESS, FAUCET_COOLDOWN_S, CACHE_TTL_S = 10, 3, 60 * 60, 5
 
 _CHAIN = None
 CHAIN_LOCK = threading.RLock()
+
 def set_chain(chain) -> None:
     global _CHAIN
     with CHAIN_LOCK: _CHAIN = chain
     log.info("server: chain injetada (height=%s)", chain.db.height())
+
 def _get_chain():
     global _CHAIN
     if _CHAIN is not None: return _CHAIN
@@ -54,6 +77,7 @@ def _get_chain():
             _CHAIN = _BC(str(BASE_DIR / "brn_v2_chain.db"))
             log.warning("server: chain NÃO injetada — criei uma local")
         return _CHAIN
+
 class _LazyChain:
     def __getattr__(self, name): return getattr(_get_chain(), name)
 CHAIN = _LazyChain()
@@ -113,6 +137,7 @@ def _require_admin() -> bool:
     hdr = request.headers.get("Authorization", "")
     if not hdr.startswith("Bearer "): return False
     return hmac.compare_digest(hdr[7:], ADMIN_TOKEN)
+
 def _admin_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -125,6 +150,7 @@ def _admin_required(f):
 _cache_saldos: dict = {}
 _cache_lock = threading.Lock()
 _faucet_history: dict = {}
+
 def _saldo_cache_get(addr):
     with _cache_lock:
         if addr in _cache_saldos:
@@ -142,12 +168,14 @@ def carregar_wallets() -> dict:
     try:
         with open(WALLETS_FILE, encoding="utf-8") as f: return json.load(f)
     except Exception: return {}
+
 def salvar_wallets(w: dict) -> None:
     with _wallets_lock:
         tmp = f"{WALLETS_FILE}.tmp.{os.getpid()}"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(w, f, indent=2); f.flush(); os.fsync(f.fileno())
         os.replace(tmp, WALLETS_FILE)
+
 def _registrar_pubkey(addr, pk):
     if not addr or not pk: return
     try:
@@ -227,6 +255,35 @@ def _cleanup_loop():
         except Exception as e: log.warning(f"cleanup: {e}")
 threading.Thread(target=_cleanup_loop, daemon=True, name="CacheCleanup").start()
 
+# ============================================================
+# NOVO: SINCRONIZAÇÃO DA FILA DE BOOTSTRAP ENTRE NÓS
+# ============================================================
+@app.route("/api/bootstrap/add", methods=["POST"])
+def bootstrap_add():
+    """Recebe aviso de outro nó (ex: Windows) que começou a minerar."""
+    try:
+        data = request.get_json(force=True) or {}
+        addr = (data.get("address") or "").strip()
+        pubkey = (data.get("pubkey") or "").strip()
+        
+        if not addr or not pubkey:
+            return jsonify({"ok": False, "msg": "Dados incompletos"}), 400
+
+        chain = _get_chain()
+        chain.adicionar_na_fila(addr, pubkey)
+        
+        return jsonify({
+            "ok": True,
+            "fila_tamanho": len(chain.fila_mineracao),
+            "rede_descentralizada": chain.rede_descentralizada
+        })
+    except Exception as e:
+        log.error(f"bootstrap_add falhou: {e}")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+# ============================================================
+# CARTEIRA
+# ============================================================
 @app.route("/api/nova-carteira", methods=["POST"])
 @require_rate_limit("nova_carteira")
 def nova_carteira():
@@ -417,6 +474,9 @@ def mine():
         return jsonify({"ok": True, "msg": f"Bloco #{block['height']} minerado!", "block": {"height": block["height"], "hash": block["hash"], "txs": len(block["transactions"]), "difficulty": block["difficulty"], "nonce": block["nonce"]}})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+# ============================================================
+# INÍCIO DA MINERAÇÃO (ENVIA AVISO VIA HTTP PARA A ORIGEM)
+# ============================================================
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
 def miner_start():
@@ -425,8 +485,32 @@ def miner_start():
         if not WalletManager.validate_address(addr): return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
         pubkey = _pubkey_from_db_or_payload(addr, pubkey_payload, sk_payload)
         if not pubkey: return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
+        
         chain = _get_chain()
+        
+        # 1. Adiciona na fila local
         chain.adicionar_na_fila(addr, pubkey)
+
+        # 2. Avisa os nós Origin via HTTP para sincronizar a fila global
+        bootstrap_peers = os.environ.get("BRN_BOOTSTRAP_PEERS", "").split(",")
+        for b in bootstrap_peers:
+            b = b.strip()
+            if not b: continue
+            try:
+                origin_ip = b.split(":")[0].strip()
+                url = f"http://{origin_ip}:5000/api/bootstrap/add"
+                
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    log.info(f"[BOOTSTRAP] Aviso de fila enviado para {origin_ip}")
+            except Exception as e:
+                log.warning(f"[BOOTSTRAP] Nao foi possivel avisar {b}: {e}")
+
         from miner_loop import get_miner
         m = get_miner(chain); ok, msg = m.start(addr, pubkey)
         audit_log("miner_start_ok" if ok else "miner_start_failed", {"addr": hash_short(addr, 16), "ip": get_client_ip(), "msg": msg})
@@ -476,6 +560,9 @@ def faucet():
         return jsonify({"ok": True, "msg": f"Faucet enviado! +{reward_sats/1e8} BRN", "txid": block["transactions"][0]["txid"], "amount": reward_sats / 1e8})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+# ============================================================
+# POOL DE MINERAÇÃO
+# ============================================================
 @app.route("/api/pool/register", methods=["POST"])
 @require_rate_limit("status")
 def pool_register():
@@ -808,11 +895,11 @@ def l2_cancel(escrow_id):
 
 @app.route("/health", methods=["GET"])
 def health():
-    try: return jsonify({"ok": True, "height": _get_chain().db.height(), "l2_enabled": L2_ENABLED, "chain_injected": _CHAIN is not None, "sync_injected": _SYNC_MANAGER is not None, "p2p_injected": _P2P_MANAGER is not None, "pool_injected": _POOL_MANAGER is not None, "mode": "modo2_aberto", "version": "9.9.5"})
+    try: return jsonify({"ok": True, "height": _get_chain().db.height(), "l2_enabled": L2_ENABLED, "chain_injected": _CHAIN is not None, "sync_injected": _SYNC_MANAGER is not None, "p2p_injected": _P2P_MANAGER is not None, "pool_injected": _POOL_MANAGER is not None, "mode": "modo2_aberto", "version": "9.9.6"})
     except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/", methods=["GET"])
-def index(): return jsonify({"name": "BRN Node API", "version": "9.9.5", "mode": "modo2_aberto", "l2_enabled": L2_ENABLED, "pool_enabled": _POOL_MANAGER is not None, "admin_protected": bool(ADMIN_TOKEN)})
+def index(): return jsonify({"name": "BRN Node API", "version": "9.9.6", "mode": "modo2_aberto", "l2_enabled": L2_ENABLED, "pool_enabled": _POOL_MANAGER is not None, "admin_protected": bool(ADMIN_TOKEN)})
 
 @atexit.register
 def _shutdown():
@@ -822,7 +909,7 @@ def _shutdown():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.5 (Sem limites de exibição)")
+    print(f"BRN Server v9.9.6 (Bootstrap P2P Sync)")
     print(f"  → http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
