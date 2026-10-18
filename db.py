@@ -1,18 +1,9 @@
-"""db.py — Banco SQLite do BRN (v6.5)
+"""db.py — Banco SQLite do BRN (v6.7)
 ================================================================
-v6.5:
-  [NEW] utxos_gastos_na_mempool() — retorna set de (txid,vout) que
-        transações na mempool estão a gastar. Usado para anti
-        double-spend antes da mineração.
-  [FIX] _prune_mempool: TTL aumentado de 1h → 24h (evita apagar
-        transações válidas antes de serem mineradas)
-v6.4:
-  [NEW] get_txs_for_address() — histórico completo por endereço
-v6.3:
-  [FIX] contract_spend — corrigida corrupção de sintaxe
-  [NEW] get_tx_block_height(txid) — usado por Blockchain.count_confirmations
-v6.2:
-  + backfill automático de transactions.raw no __init__ (idempotente)
+v6.7:
+  [FIX] Restaurados todos os métodos essenciais (count_utxos, etc.)
+  [FIX] Limite de get_txs_for_address subiu para 10000
+  [FIX] Limite de all_mempool subiu para 10000
 ================================================================
 """
 import os
@@ -145,11 +136,9 @@ class ChainDB:
                 cols = self.conn.execute("PRAGMA table_info(peers)").fetchall()
                 names = {c["name"] for c in cols}
                 if "score" not in names:
-                    self.conn.execute(
-                        "ALTER TABLE peers ADD COLUMN score INTEGER DEFAULT 0")
+                    self.conn.execute("ALTER TABLE peers ADD COLUMN score INTEGER DEFAULT 0")
                 if "public_key" not in names:
-                    self.conn.execute(
-                        "ALTER TABLE peers ADD COLUMN public_key TEXT DEFAULT ''")
+                    self.conn.execute("ALTER TABLE peers ADD COLUMN public_key TEXT DEFAULT ''")
             except Exception:
                 pass
 
@@ -157,12 +146,10 @@ class ChainDB:
                 cols = self.conn.execute("PRAGMA table_info(transactions)").fetchall()
                 names = {c["name"] for c in cols}
                 if "raw" not in names:
-                    self.conn.execute(
-                        "ALTER TABLE transactions ADD COLUMN raw BLOB")
+                    self.conn.execute("ALTER TABLE transactions ADD COLUMN raw BLOB")
             except Exception:
                 pass
 
-    # ==================== BACKFILL AUTOMÁTICO ====================
     def _migrate_raw_txs(self):
         if os.environ.get("BRN_SKIP_RAW_BACKFILL", "0") == "1":
             return
@@ -221,7 +208,6 @@ class ChainDB:
         dt = time.time() - t0
         print(f"[db] backfill concluído: {done}/{total} blocos em {dt:.1f}s")
 
-    # ==================== BLOCOS ====================
     def add_block(self, block):
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
@@ -293,7 +279,6 @@ class ChainDB:
         return [b for b in (self.get_block(h)
                             for h in range(max(0, top - n + 1), top + 1)) if b]
 
-    # ==================== TX LOOKUP ====================
     def get_tx_by_txid(self, txid: str):
         try:
             row = self.conn.execute(
@@ -307,7 +292,6 @@ class ChainDB:
             return None, None
 
     def get_tx_block_height(self, txid: str) -> int:
-        """Retorna o height do bloco onde a tx está, ou -1 se não encontrada."""
         try:
             row = self.conn.execute(
                 "SELECT block_height FROM transactions WHERE txid = ? LIMIT 1",
@@ -317,25 +301,11 @@ class ChainDB:
         except Exception:
             return -1
 
-    # ==================== [v6.4] HISTÓRICO POR ENDEREÇO ====================
-    def get_txs_for_address(self, address: str, limit: int = 200) -> list:
-        """
-        Retorna todas as txs relacionadas a um endereço:
-        - recebidas (address aparece nos outputs)
-        - enviadas (address gastou algum input)
-        - mempool (pendentes)
-
-        Cada item: {
-            "tx": dict (tx completa),
-            "block_height": int | None,
-            "is_mempool": bool,
-        }
-        """
+    def get_txs_for_address(self, address: str, limit: int = 10000) -> list:
         result = []
         seen_txids = set()
 
         with self.lock:
-            # 1) Txids onde o endereço recebeu (aparece em utxos)
             try:
                 rows = self.conn.execute(
                     "SELECT DISTINCT txid FROM utxos WHERE address = ? LIMIT ?",
@@ -345,7 +315,6 @@ class ChainDB:
             except Exception:
                 received_txids = set()
 
-            # 2) Txids onde o endereço gastou (spent_by)
             try:
                 rows = self.conn.execute(
                     "SELECT DISTINCT spent_by FROM utxos "
@@ -356,7 +325,6 @@ class ChainDB:
             except Exception:
                 sent_txids = set()
 
-            # 3) Carrega cada tx confirmada
             for txid_str in (received_txids | sent_txids):
                 try:
                     row = self.conn.execute(
@@ -379,7 +347,6 @@ class ChainDB:
                 })
                 seen_txids.add(txid_str)
 
-            # 4) Mempool — checa se o endereço aparece
             try:
                 mp_rows = self.conn.execute(
                     "SELECT txid, raw FROM mempool"
@@ -397,14 +364,11 @@ class ChainDB:
                     continue
 
                 touches = False
-
-                # 4a) Outputs
                 for o in tx.get("outputs", []):
                     if o.get("address") == address:
                         touches = True
                         break
 
-                # 4b) Inputs — consulta utxos para descobrir de quem é
                 if not touches:
                     for inp in tx.get("inputs", []):
                         if inp.get("txid") == "0" * 64:
@@ -428,7 +392,6 @@ class ChainDB:
                         "is_mempool": True,
                     })
 
-        # Ordena: pendentes primeiro, depois por altura decrescente
         result.sort(key=lambda x: (
             0 if x["is_mempool"] else 1,
             -(x["block_height"] or 0),
@@ -436,7 +399,6 @@ class ChainDB:
 
         return result[:limit]
 
-    # ==================== UTXO ====================
     def balance(self, address):
         row = self.conn.execute(
             "SELECT COALESCE(SUM(amount),0) AS s FROM utxos "
@@ -510,7 +472,6 @@ class ChainDB:
                 self.conn.execute("ROLLBACK")
                 raise
 
-    # ==================== NONCE ====================
     def get_next_nonce(self, address: str) -> int:
         row = self.conn.execute(
             "SELECT COUNT(*) AS c FROM utxos WHERE address=? AND spent=1",
@@ -525,7 +486,6 @@ class ChainDB:
         ).fetchone()
         return int(row["c"])
 
-    # ==================== MEMPOOL ====================
     def add_mempool(self, tx, fee):
         with self.lock:
             try:
@@ -538,13 +498,7 @@ class ChainDB:
             self._prune_mempool()
             return True
 
-    def _prune_mempool(self, max_size=1000, ttl=86400):
-        """
-        [FIX v6.5] TTL aumentado de 1h → 24h.
-        Motivo: em rede lenta ou com pouca hash rate, um bloco pode
-        demorar mais de 1h para ser minerado. Antes, transações válidas
-        eram apagadas silenciosamente antes de serem incluídas num bloco.
-        """
+    def _prune_mempool(self, max_size=10000, ttl=86400):
         self.conn.execute(
             "DELETE FROM mempool WHERE received_at < ?", (time.time() - ttl,))
         n = self.conn.execute("SELECT COUNT(*) AS c FROM mempool").fetchone()["c"]
@@ -563,7 +517,7 @@ class ChainDB:
             "SELECT raw FROM mempool WHERE txid=?", (txid,)).fetchone()
         return orjson.loads(zlib.decompress(row["raw"])) if row else None
 
-    def all_mempool(self, limit=1000):
+    def all_mempool(self, limit=10000):
         rows = self.conn.execute(
             "SELECT raw FROM mempool ORDER BY fee DESC LIMIT ?", (limit,)).fetchall()
         return [orjson.loads(zlib.decompress(r["raw"])) for r in rows]
@@ -584,19 +538,7 @@ class ChainDB:
         return {"count": row["c"], "sum_fee": row["sf"],
                 "fees": [f["fee"] for f in fees]}
 
-    # ==================== [NEW v6.5] ANTI DOUBLE-SPEND ====================
     def utxos_gastos_na_mempool(self) -> set:
-        """
-        Retorna um set de (txid, vout) que estão a ser gastos por
-        transações atualmente na mempool.
-
-        Usado por Blockchain.validate_tx() para evitar double-spend
-        antes das transações serem mineradas.
-
-        Exemplo:
-            gastos = db.utxos_gastos_na_mempool()
-            # {( 'abc123...', 0 ), ( 'def456...', 1 )}
-        """
         gastos = set()
         try:
             rows = self.conn.execute("SELECT raw FROM mempool").fetchall()
@@ -613,7 +555,6 @@ class ChainDB:
             pass
         return gastos
 
-    # ==================== L2 ====================
     def save_l2_escrow(self, escrow_dict):
         with self.lock:
             self.conn.execute("""
@@ -711,7 +652,6 @@ class ChainDB:
             (limit,)).fetchall()
         return [json.loads(r["raw_json"]) for r in rows]
 
-    # ==================== ESTATÍSTICAS ====================
     def get_stats(self):
         return {
             "height": self.height(),
@@ -741,7 +681,6 @@ class ChainDB:
         with self.lock:
             self.conn.execute("VACUUM")
 
-    # ==================== META ====================
     def set_meta(self, key, value):
         with self.lock:
             self.conn.execute(
@@ -753,7 +692,6 @@ class ChainDB:
             "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
-    # ==================== PEERS ====================
     def upsert_peer(self, node_id, address, genesis_hash, version="?", height=0,
                     is_miner=False, public_key="", metadata=None):
         with self.lock:
@@ -847,7 +785,6 @@ class ChainDB:
                 "DELETE FROM peers WHERE last_seen < ?",
                 (int(time.time()) - janela,))
 
-    # ==================== EVENTOS ====================
     def _log_event(self, tipo, peer="", details=""):
         with self.lock:
             self.conn.execute(
@@ -862,7 +799,6 @@ class ChainDB:
             (n,)).fetchall()
         return [dict(r) for r in rows]
 
-    # ==================== CONTRATOS ====================
     def contract_insert(self, contract_id, owner, code, metadata=None):
         with self.lock:
             self.conn.execute(
@@ -955,9 +891,7 @@ class ChainDB:
             (limit,)).fetchall()
         return [dict(r) for r in rows]
 
-    # ==================== CONTRACT_SPEND ====================
     def contract_spend(self, from_addr: str, to_addr: str, amount: int):
-        """Move fundos de from_addr para to_addr. Chamado por contracts.py."""
         import hashlib
         import os as _os
 
@@ -1011,7 +945,6 @@ class ChainDB:
                 self.conn.execute("ROLLBACK")
                 raise
 
-    # ==================== CLOSE ====================
     def close(self):
         try:
             self.conn.close()

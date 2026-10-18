@@ -455,9 +455,11 @@ async function loadMiner() {
     document.getElementById("minerForkAborts").textContent =
       m.fork_aborts ?? 0;
       
+    // [CORRIGIDO] Agora exibe quantos mineradores estão na fila
+    const filaTamanho = m.fila_tamanho || 0;
     document.getElementById("minerBootstrapStatus").innerHTML = m.rede_descentralizada 
         ? '<span class="tag ok">Descentralizada</span>' 
-        : '<span class="tag warn">Bootstrap: ' + (m.bootstrap_status || 'Aguardando Fila') + '</span>';
+        : `<span class="tag warn">Bootstrap: ${filaTamanho}/20 na fila</span>`;
         
   } catch (e) {
     console.error("miner:", e);
@@ -465,12 +467,11 @@ async function loadMiner() {
 }
 
 // ============================================================
-// PEERS (CORRIGIDO)
+// PEERS
 // ============================================================
 async function loadPeers() {
   try {
     const data = await fetchJSON("/api/peers-score-proxy");
-    // O endpoint retorna success: true, então verificamos se a propriedade peers existe
     if (!data || !data.peers) return;
 
     const tbody = document.getElementById("peersTable");
