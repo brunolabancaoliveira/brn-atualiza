@@ -1,4 +1,4 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.3)"""
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.5)"""
 from __future__ import annotations
 import os
 import time
@@ -14,6 +14,7 @@ API_TIMEOUT = float(os.environ.get("BRN_API_TIMEOUT", "200"))
 
 _POOL_CLIENT = None
 _POOL_LOCK = threading.RLock()
+_WALLET_SESSION = {}  # Armazena os dados da carteira em memória enquanto desbloqueada
 
 def _post(path: str, body: dict, timeout: float = None) -> dict:
     import requests
@@ -38,24 +39,94 @@ def _get(path: str, timeout: float = 10.0) -> dict:
 
 class WalletApi:
     def __init__(self):
-        log.info("WalletApi v3.3 iniciada (API_BASE=%s)", API_BASE)
+        log.info("WalletApi v3.5 iniciada (API_BASE=%s)", API_BASE)
 
-    def get_experiment_variant(self) -> dict:
+    # ========================================================
+    # GERENCIAMENTO DE SESSÃO DA CARTEIRA
+    # ========================================================
+    def has_wallet(self) -> dict:
+        """Verifica se o arquivo current_wallet.enc existe no disco."""
+        try:
+            p = BASE_DIR / "current_wallet.enc"
+            return {"ok": True, "exists": p.exists()}
+        except Exception as e:
+            return {"ok": False, "exists": False, "msg": str(e)}
+
+    def create_and_unlock(self, password: str) -> dict:
+        """Cria uma nova carteira, salva com a senha e a desbloqueia."""
+        global _WALLET_SESSION
+        if not password or len(password) < 4:
+            return {"ok": False, "msg": "A senha deve ter pelo menos 4 caracteres."}
+        try:
+            from wallet import Wallet
+            from secure_store import save_current_wallet
+            
+            # 1. Gera a carteira
+            w = Wallet()
+            data = {
+                "address": w.address,
+                "private_key": w.priv_hex,
+                "public_key": w.pub_hex
+            }
+            
+            # 2. Salva criptografada no disco
+            r = save_current_wallet(password, data)
+            if not r.get("ok"):
+                return {"ok": False, "msg": "Erro ao salvar: " + str(r.get("msg", ""))}
+            
+            # 3. Coloca na sessão
+            _WALLET_SESSION["address"] = w.address
+            _WALLET_SESSION["private_key"] = w.priv_hex
+            _WALLET_SESSION["public_key"] = w.pub_hex
+            
+            log.info(f"Nova carteira criada automaticamente: {w.address[:16]}...")
+            return {"ok": True, "address": w.address}
+        except Exception as e:
+            log.exception("Erro ao criar carteira")
+            return {"ok": False, "msg": str(e)}
+
+    def unlock_wallet(self, password: str) -> dict:
+        """Tenta desbloquear uma carteira existente com a senha fornecida."""
+        global _WALLET_SESSION
         try:
             from secure_store import load_current_wallet
+            r = load_current_wallet(password)
+            if r and r.get("ok"):
+                _WALLET_SESSION["address"] = r.get("address", "")
+                _WALLET_SESSION["private_key"] = r.get("private_key", "")
+                _WALLET_SESSION["public_key"] = (r.get("public_key") or r.get("pubkey") or r.get("pub_hex") or "")
+                return {"ok": True, "address": _WALLET_SESSION["address"]}
+            return {"ok": False, "msg": r.get("msg", "Senha incorreta ou arquivo corrompido")}
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
+    def lock_wallet(self) -> dict:
+        """Limpa a sessão da carteira da memória."""
+        global _WALLET_SESSION
+        _WALLET_SESSION.clear()
+        return {"ok": True}
+
+    def get_active_wallet(self) -> dict:
+        """Retorna os dados da carteira se estiver desbloqueada."""
+        if _WALLET_SESSION.get("address"):
+            return {"ok": True, **_WALLET_SESSION}
+        return {"ok": False, "msg": "locked"}
+
+    # ========================================================
+    # EXPERIMENTO A/B
+    # ========================================================
+    def get_experiment_variant(self) -> dict:
+        try:
             from ab_test import get_variant, get_node_id_hash
-            senha = (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip() or os.environ.get("BRN_NODE_PASSWORD", "").strip())
-            if not senha: return {"variant": "A", "error": "sem senha"}
-            w = load_current_wallet(senha)
-            if not w or not w.get("ok"): return {"variant": "A", "error": "sem carteira"}
-            node_id = w.get("address") or w.get("pubkey")
+            if not _WALLET_SESSION.get("address"):
+                return {"variant": "A", "error": "locked"}
+            
+            node_id = _WALLET_SESSION["address"]
             node_hash = get_node_id_hash(node_id)
             from security import set_node_id_hash
             set_node_id_hash(node_hash)
-            variant = get_variant(node_hash)
-            return {"variant": variant, "node_hash": node_hash}
+            return {"variant": get_variant(node_hash), "node_hash": node_hash}
         except Exception as e:
-            log.error(f"A/B erro: {e}")
             return {"variant": "A", "error": str(e)}
 
     def log_exposure(self, variant: str) -> dict:
@@ -63,9 +134,11 @@ class WalletApi:
             from security import audit_log
             audit_log("exposure_log", {"experiment_id": "activation_v1", "variant": variant, "trigger_event": "wallet_open", "rendered_flag": 1})
             return {"ok": True}
-        except Exception as e:
-            return {"ok": False, "msg": str(e)}
+        except Exception as e: return {"ok": False, "msg": str(e)}
 
+    # ========================================================
+    # NÓ / CHAIN
+    # ========================================================
     def node_status(self) -> dict:
         try:
             s = _get("/api/status", timeout=30.0)
@@ -76,49 +149,35 @@ class WalletApi:
     def sync_info(self) -> dict:
         try:
             s = _get("/api/sync-info", timeout=30.0)
-            if "erro" in s: return {"erro": s["erro"]}
-            return s
+            return s if "erro" not in s else {"erro": s["erro"]}
         except Exception as e: return {"erro": str(e)}
 
     def list_blocks(self, start: int = 0, limit: int = 15) -> dict:
         try:
             s = _get(f"/api/blocks?start={int(start)}&limit={int(limit)}")
-            if "error" in s: return {"erro": s["error"]}
-            return {"blocks": s.get("blocks", []), "start": s.get("start", 0), "count": s.get("count", 0)}
+            return {"erro": s["error"]} if "error" in s else {"blocks": s.get("blocks", []), "start": s.get("start", 0), "count": s.get("count", 0)}
         except Exception as e: return {"erro": str(e)}
 
     def get_block(self, height: int) -> dict:
         try:
             s = _get(f"/api/block/{int(height)}")
-            if "error" in s: return {"erro": s["error"]}
-            return {"block": s}
+            return {"erro": s["error"]} if "error" in s else {"block": s}
+        except Exception as e: return {"erro": str(e)}
+
+    # ========================================================
+    # CARTEIRA BÁSICA
+    # ========================================================
+    def portfolio(self, address: str) -> dict:
+        try:
+            s = _get(f"/api/portfolio/{address}", timeout=15.0)
+            return {"erro": s["error"]} if "error" in s else s.get("portfolio", {"BRN": 0, "KYC": 0})
         except Exception as e: return {"erro": str(e)}
 
     def generate_wallet(self) -> dict:
         try:
             r = _post("/api/nova-carteira", {})
-            if not r.get("success"): return {"erro": r.get("error", "falha")}
-            return {"address": r["address"], "private_key": r["private_key"], "public_key": r["public_key"]}
+            return {"address": r["address"], "private_key": r["private_key"], "public_key": r["public_key"]} if r.get("success") else {"erro": r.get("error", "falha")}
         except Exception as e: return {"erro": str(e)}
-
-    def portfolio(self, address: str) -> dict:
-        try:
-            s = _get(f"/api/portfolio/{address}", timeout=15.0)
-            if "error" in s: return {"erro": s["error"]}
-            return s.get("portfolio", {"BRN": 0, "KYC": 0})
-        except Exception as e: return {"erro": str(e)}
-
-    def get_active_wallet(self) -> dict:
-        try:
-            senha = (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip() or os.environ.get("BRN_NODE_PASSWORD", "").strip())
-            if not senha: return {"ok": False, "msg": "sem senha"}
-            try:
-                from secure_store import load_current_wallet
-                r = load_current_wallet(senha)
-                if r and r.get("ok"): return {"ok": True, "address": r.get("address", ""), "private_key": r.get("private_key", ""), "public_key": (r.get("public_key") or r.get("pubkey") or r.get("pub_hex") or "")}
-            except Exception: pass
-            return {"ok": False, "msg": "sem carteira ativa"}
-        except Exception as e: return {"ok": False, "msg": str(e)}
 
     def save_wallet(self, name: str, password: str, address: str, sk: str, pk: str) -> dict:
         try:
@@ -138,6 +197,9 @@ class WalletApi:
             return WalletManager.load_encrypted_wallet(name, password)
         except Exception as e: return {"ok": False, "msg": str(e)}
 
+    # ========================================================
+    # TRANSAÇÕES
+    # ========================================================
     def transfer(self, from_addr: str, to_addr: str, asset: str, amount, sk: str, pk: str) -> dict:
         try: return _post("/api/transfer", {"from": from_addr, "to": to_addr, "asset_id": asset or "BRN", "amount": str(amount), "private_key": sk, "pubkey": pk})
         except Exception as e: return {"ok": False, "msg": str(e)}
@@ -145,10 +207,6 @@ class WalletApi:
     def minhas_txs(self, address: str) -> dict:
         try: return _get(f"/api/minhas-txs/{address}", timeout=15.0)
         except Exception as e: return {"ok": False, "msg": str(e)}
-
-    def list_transactions(self, address: str) -> dict:
-        try: return _get(f"/api/transacoes/{address}", timeout=15.0)
-        except Exception as e: return {"erro": str(e)}
 
     def tx_status(self, txid: str) -> dict:
         try: return _get(f"/api/tx-status/{txid}")
@@ -158,6 +216,9 @@ class WalletApi:
         try: return _get(f"/api/verificar-recebimento/{address}/{txid}")
         except Exception as e: return {"ok": False, "msg": str(e)}
 
+    # ========================================================
+    # MINERAÇÃO
+    # ========================================================
     def start_mining(self, address: str, pubkey: str) -> dict:
         try: return _post("/api/miner/start", {"address": address, "miner_pubkey": pubkey})
         except Exception as e: return {"ok": False, "msg": str(e)}
@@ -183,12 +244,10 @@ class WalletApi:
                 except Exception: pass
             
             try:
-                # [FIX] Usa BRN_POOL_URL se estiver definido no ambiente
                 pool_url = os.environ.get("BRN_POOL_URL", API_BASE)
                 _POOL_CLIENT = PoolClient(address=address, pubkey=pubkey, pool_url=pool_url)
                 ok, msg = _POOL_CLIENT.start_mining()
-                if not ok: return {"ok": False, "msg": msg}
-                return {"ok": True, "msg": "Pool miner iniciado", "miner_id": _POOL_CLIENT.miner_id}
+                return {"ok": True, "msg": "Pool miner iniciado", "miner_id": _POOL_CLIENT.miner_id} if ok else {"ok": False, "msg": msg}
             except Exception as e: return {"ok": False, "msg": str(e)}
 
     def pool_stop_mining(self) -> dict:
@@ -215,6 +274,9 @@ class WalletApi:
         try: return _get("/api/pool/miners", timeout=10.0)
         except Exception as e: return {"ok": False, "msg": str(e)}
 
+    # ========================================================
+    # FAUCET / BRIDGE
+    # ========================================================
     def call_faucet(self, address: str, sk: str, pk: str) -> dict:
         try: return _post("/api/faucet", {"address": address, "private_key": sk, "pubkey": pk})
         except Exception as e: return {"ok": False, "msg": str(e)}
@@ -223,6 +285,9 @@ class WalletApi:
         try: return _post("/api/l2/claim", {"btc_txid": txid, "buyer_brn": address})
         except Exception as e: return {"ok": False, "msg": str(e)}
 
+    # ========================================================
+    # UTIL
+    # ========================================================
     def ping(self) -> dict:
         try: return _get("/health", timeout=5.0)
         except Exception as e: return {"ok": False, "msg": str(e)}
