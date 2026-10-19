@@ -1,16 +1,16 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.2.4 | Data: 18/10/2026
+Versão: 9.2.5 | Data: 18/10/2026
 ================================================================
+v9.2.5:
+  [OPT] cumulative_work() agora faz SELECT apenas da coluna 'difficulty'
+        em vez de descomprimir o bloco inteiro (raw). Isso evita
+        gargalos de CPU/Memória em cadeias grandes e acelera o boot.
 v9.2.4:
-  [FIX] CRÍTICO: Median Time Past (MTP) alterado de <= para <.
-        A regra anterior rejeitava blocos minerados no mesmo segundo
-        (timestamp igual ao MTP), travando a sincronização quando
-        a rede produzia blocos em rajada.
+  [FIX] MTP alterado de <= para < para aceitar blocos no mesmo segundo.
 v9.2.3:
-  [FIX] accept_block() reativa self._fork_signal a CADA bloco aceite.
+  [FIX] accept_block() reativa self._fork_signal.
 v9.2.2:
   [NEW] Modo Bootstrap: fila de mineradores.
-  [NEW] Median Time Past (MTP).
 ================================================================
 """
 from __future__ import annotations
@@ -362,11 +362,20 @@ class Blockchain:
         new = max(prev // 4, min(prev * 4, new))
         return max(1, min(MAX_DIFFICULTY, new))
 
+    # ============================================================
+    # [FIX v9.2.5] cumulative_work otimizado
+    # ============================================================
     def cumulative_work(self) -> int:
         total = 0
-        for h in range(self.db.height() + 1):
-            b = self.db.get_block(h)
-            if b: total += work_from_difficulty(b["difficulty"])
+        # [FIX] Otimização: busca apenas a coluna 'difficulty', sem descomprimir o bloco!
+        with self.db.lock:
+            rows = self.db.conn.execute("SELECT difficulty FROM blocks").fetchall()
+            for r in rows:
+                try:
+                    # 'difficulty' já vem como int direto do SQLite
+                    total += work_from_difficulty(r["difficulty"])
+                except Exception:
+                    continue
         return total
 
     def get_latest_height(self) -> int: return self.db.height()
