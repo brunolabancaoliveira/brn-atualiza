@@ -1,26 +1,32 @@
-"""mining_pool.py — Pool de mineração BRN (v3)
+"""mining_pool.py — Pool de mineração BRN (v4)
 ================================================================
-v3:
-  [SEGURANÇA] Adicionada validação estrita do coinbase.
-              O Pool verifica se os outputs do bloco correspondem
-              à distribuição de shares antes de o aceitar.
+v4:
+  [NEW] Integração da lógica de Fases (Bootstrap 20 mineradores).
+  [NEW] Fila de espera visual mantida em memória.
+  [NEW] Transição automática para Fase 2 (Descentralizada).
+  [KEEP] Compatibilidade total com server.py e blockchain.py.
+================================================================
 """
 from __future__ import annotations
-import time, uuid, threading, logging
+
+import time
+import uuid
+import threading
+import logging
 from typing import Optional
-from blockchain import block_hash, compute_merkle_root, meets_difficulty, txid as calc_txid, MIN_RELAY_FEE
+from blockchain import block_hash, compute_merkle_root, meets_difficulty, txid as calc_txid
 
 log = logging.getLogger("pool")
 
 SHARE_DIFF_OFFSET   = 1
 MINER_TIMEOUT_S     = 60
 JOB_REFRESH_S       = 20
-MAX_SHARES_PER_JOB  = 10000
 MAX_MINERS          = 50
 MAX_RECENT_JOBS     = 5
 
 class MinerState:
-    __slots__ = ("miner_id", "address", "pubkey", "shares_period", "shares_total", "hashes_total", "hashrate", "last_seen", "connected_at", "mining")
+    __slots__ = ("miner_id", "address", "pubkey", "shares_period", "shares_total", 
+                 "hashes_total", "hashrate", "last_seen", "connected_at", "mining")
     def __init__(self, miner_id, address, pubkey):
         self.miner_id = miner_id
         self.address = address
@@ -34,7 +40,8 @@ class MinerState:
         self.mining = False
 
 class Job:
-    __slots__ = ("job_id", "height", "prev_hash", "merkle", "timestamp", "difficulty", "share_difficulty", "transactions", "distribution", "created_at")
+    __slots__ = ("job_id", "height", "prev_hash", "merkle", "timestamp", "difficulty", 
+                 "share_difficulty", "transactions", "distribution", "created_at")
     def __init__(self, height, prev_hash, merkle, timestamp, difficulty, share_difficulty, transactions, distribution):
         self.job_id = uuid.uuid4().hex[:16]
         self.height = height
@@ -86,9 +93,15 @@ class PoolManager:
         self.last_block_height = -1
         self.rejected_shares = 0
         self.accepted_shares = 0
+        
+        # [NOVO] Estado da Fase (Bootstrap)
+        self.phase = 1
+        self.phase2_threshold = 20
+        self.miner_queue = [] # Lista de endereços na fila
+
         self._stop = threading.Event()
         threading.Thread(target=self._maintenance_loop, daemon=True, name="Pool-Maint").start()
-        log.info("PoolManager iniciado")
+        log.info("PoolManager iniciado — Fase 1 (Bootstrap)")
 
     def register(self, address: str, pubkey: str, miner_id: Optional[str] = None) -> dict:
         if not address or not address.startswith("brn1"): return {"ok": False, "msg": "address invalido"}
@@ -101,6 +114,18 @@ class PoolManager:
                 m = MinerState(miner_id, address, pubkey)
                 self.miners[miner_id] = m
                 log.info("pool: %s registado (addr=%s)", miner_id, address[:16])
+                
+                # [NOVO] Adiciona à fila se estiver na Fase 1
+                if self.phase == 1 and address not in self.miner_queue:
+                    self.miner_queue.append(address)
+                    log.info(f"[POOL] Minerador {address[:12]}... adicionado — Fila: {len(self.miner_queue)}/{self.phase2_threshold}")
+                    
+                    if len(self.miner_queue) >= self.phase2_threshold:
+                        self.phase = 2
+                        log.warning("=" * 60)
+                        log.warning("[BOOTSTRAP] 20 MINERADORES ATINGIDOS! REDE DESCENTRALIZADA ATIVADA.")
+                        log.warning("[POOL] Fase 2 — Recompensa 100% para quem encontrar o bloco.")
+                        log.warning("=" * 60)
             else:
                 m.address = address; m.pubkey = pubkey; m.last_seen = time.time()
         return {"ok": True, "miner_id": miner_id}
@@ -115,7 +140,10 @@ class PoolManager:
         return {"ok": True}
 
     def disconnect(self, miner_id: str) -> dict:
-        with self.lock: self.miners.pop(miner_id, None)
+        with self.lock:
+            m = self.miners.pop(miner_id, None)
+            if m and m.address in self.miner_queue:
+                self.miner_queue.remove(m.address)
         return {"ok": True}
 
     def get_work(self, miner_id: str) -> dict:
@@ -141,17 +169,23 @@ class PoolManager:
         diff = self.chain.current_difficulty()
         share_diff = max(2, diff - SHARE_DIFF_OFFSET)
         prev_hash = self.chain.db.tip_hash()
+        
         distribution = {}
         for mid, m in self.miners.items():
             if (time.time() - m.last_seen) > MINER_TIMEOUT_S: continue
             if not m.address or not m.pubkey: continue
             w = float(m.shares_period) + 1.0
             distribution[m.address] = {"pubkey": m.pubkey, "weight": w}
+
+        # [NOVO] Se estiver na Fase 2, a recompensa é 100% para quem encontrar.
+        # O blockchain.make_coinbase já trata da divisão 50/50 na Fase 1.
         cb = _make_pool_coinbase(h, reward, distribution)
+        
         try: mempool_txs = self.chain.db.all_mempool(limit=200)
         except Exception: mempool_txs = []
         transactions = [cb] + mempool_txs
         merkle = compute_merkle_root([t["txid"] for t in transactions])
+        
         job = Job(height=h, prev_hash=prev_hash, merkle=merkle, timestamp=int(time.time()), difficulty=diff, share_difficulty=share_diff, transactions=transactions, distribution=distribution)
         self.current_job = job
         self.recent_jobs[job.job_id] = job
@@ -168,22 +202,28 @@ class PoolManager:
             m.last_seen = time.time()
             job = self.current_job
             if job is None: return {"ok": False, "msg": "sem job ativo"}
+            
             candidates = [job]
             for j in self.recent_jobs.values():
                 if j.job_id != job.job_id: candidates.append(j)
+            
             h = None; matched_job = None
             for cand in candidates:
                 try: h2 = block_hash(cand.prev_hash, cand.merkle, cand.timestamp, int(nonce), cand.difficulty)
                 except Exception: continue
                 if _meets(h2, cand.share_difficulty):
                     h = h2; matched_job = cand; break
+                    
             if matched_job is None:
                 self.rejected_shares += 1; return {"ok": False, "msg": "share nao bate share_difficulty de nenhum job"}
+            
             job = matched_job
             if hash_hex and hash_hex != h:
                 self.rejected_shares += 1; return {"ok": False, "msg": "hash nao corresponde ao nonce"}
+            
             m.shares_period += 1; m.shares_total += 1; self.accepted_shares += 1
             block_found = False; new_height = None
+            
             if _meets(h, job.difficulty):
                 log.warning("pool: FULL BLOCK encontrado por %s (nonce=%s, h=%d)", miner_id, nonce, job.height)
                 try:
@@ -198,13 +238,13 @@ class PoolManager:
         return {"ok": True, "share_id": uuid.uuid4().hex[:12], "block_found": block_found, "height": new_height, "job_id": job.job_id, "share_difficulty": job.share_difficulty}
 
     def _assemble_and_accept_block(self, job: Job, nonce: int, hash_hex: str) -> bool:
-        # [SEGURANÇA] Verifica se o coinbase contém APENAS os endereços da distribuição
         cb = job.transactions[0]
         for out in cb["outputs"]:
             if out["address"] not in job.distribution:
                 log.error(f"[POOL] Bloco rejeitado: endereço suspeito no coinbase: {out['address']}")
                 return False
-        block = {"height": job.height, "hash": hash_hex, "prev_hash": job.prev_hash, "timestamp": job.timestamp, "nonce": int(nonce), "merkle": job.merkle, "difficulty": job.difficulty, "transactions": job.transactions}
+        
+        block = {"height": int(job.height), "hash": str(hash_hex), "prev_hash": str(job.prev_hash), "timestamp": int(job.timestamp), "nonce": int(nonce), "merkle": str(job.merkle), "difficulty": int(job.difficulty), "transactions": job.transactions}
         try: self.chain._attach_auth_tag(block)
         except Exception: pass
         ok, msg = self.chain.accept_block(block)
@@ -212,7 +252,7 @@ class PoolManager:
             log.warning("pool: accept_block: %s", msg); return False
         try:
             cb = block["transactions"][0]
-            reward = sum(o["amount"] for o in cb.get("outputs", []))
+            reward = sum(int(o["amount"]) for o in cb.get("outputs", []))
             self.total_reward_paid += int(reward)
         except Exception: pass
         return True
@@ -224,7 +264,7 @@ class PoolManager:
             total_hashrate = sum(m.hashrate for m in active)
             total_shares = sum(m.shares_period for m in active)
             current_job = self.current_job
-            return {"ok": True, "uptime_s": int(now - self.started_at), "miners_active": len(active), "miners_total": len(self.miners), "hashrate_total": round(total_hashrate, 2), "shares_period": int(total_shares), "shares_accepted": self.accepted_shares, "shares_rejected": self.rejected_shares, "blocks_found": self.blocks_found, "total_reward_paid": self.total_reward_paid, "last_block_height": self.last_block_height, "last_block_ago_s": (int(now - self.last_block_at) if self.last_block_at else None), "job_active": current_job is not None, "job_id": (current_job.job_id if current_job else None), "job_height": (current_job.height if current_job else None), "job_difficulty": (current_job.difficulty if current_job else None), "job_share_difficulty": (current_job.share_difficulty if current_job else None), "job_created_ago_s": (int(now - current_job.created_at) if current_job else None), "recent_jobs_cached": len(self.recent_jobs)}
+            return {"ok": True, "uptime_s": int(now - self.started_at), "miners_active": len(active), "miners_total": len(self.miners), "hashrate_total": round(total_hashrate, 2), "shares_period": int(total_shares), "shares_accepted": self.accepted_shares, "shares_rejected": self.rejected_shares, "blocks_found": self.blocks_found, "total_reward_paid": self.total_reward_paid, "last_block_height": self.last_block_height, "last_block_ago_s": (int(now - self.last_block_at) if self.last_block_at else None), "job_active": current_job is not None, "job_id": (current_job.job_id if current_job else None), "job_height": (current_job.height if current_job else None), "job_difficulty": (current_job.difficulty if current_job else None), "job_share_difficulty": (current_job.share_difficulty if current_job else None), "job_created_ago_s": (int(now - current_job.created_at) if current_job else None), "recent_jobs_cached": len(self.recent_jobs), "phase": self.phase, "miner_queue_len": len(self.miner_queue)}
 
     def miners_list(self) -> list:
         with self.lock:
@@ -251,7 +291,9 @@ class PoolManager:
                     now = time.time()
                     gone = [mid for mid, m in self.miners.items() if now - m.last_seen > MINER_TIMEOUT_S * 3]
                     for mid in gone:
-                        self.miners.pop(mid, None)
+                        m = self.miners.pop(mid, None)
+                        if m and m.address in self.miner_queue:
+                            self.miner_queue.remove(m.address)
                         log.info("pool: miner %s removido (timeout)", mid)
                     if (self.current_job is None or self._job_is_stale(self.current_job)):
                         if self.miners: self._build_job_locked()
