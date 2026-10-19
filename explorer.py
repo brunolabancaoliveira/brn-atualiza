@@ -1,9 +1,7 @@
 """
-explorer.py — Explorador de blocos BRN (Flask) v9.7
+explorer.py — Explorador de blocos BRN (Flask) v9.8
 ================================================================
-- Timeout dos proxies ajustado para 60s.
-- Tratamento robusto de erros no SQLite.
-- Serve as páginas HTML (index, panel, monitor).
+v9.8: [FIX] Adicionado proxies para /api/pool/stats e /api/pool/miners.
 ================================================================
 """
 from __future__ import annotations
@@ -140,11 +138,8 @@ def _parse_int(name, default, lo, hi):
     if v < lo or v > hi: abort(400)
     return v
 
-def _valid_address(addr):
-    return bool(BRN_ADDRESS_RE.match(addr or ""))
-
 # ============================================================
-# ROTAS HTML (Painel, Monitor, Explorer)
+# ROTAS HTML
 # ============================================================
 @app.route("/")
 def index():
@@ -164,10 +159,9 @@ def monitor():
     except Exception as e: return f"<h1>Monitor não encontrado</h1><p>Erro: {e}</p>", 404
 
 # ============================================================
-# PROXIES (Para o server.py na porta 5000)
+# PROXIES
 # ============================================================
 def _proxy_get(path: str, timeout: float = 60.0):
-    """Faz GET para o server.py e devolve o JSON."""
     url = f"http://{SERVER_HOST}:{SERVER_PORT}{path}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "brn-explorer"})
@@ -183,7 +177,6 @@ def _proxy_get(path: str, timeout: float = 60.0):
         return {"error": str(e)}, 503
 
 def _proxy_post(path: str, body: dict, timeout: float = 60.0):
-    """Faz POST para o server.py."""
     url = f"http://{SERVER_HOST}:{SERVER_PORT}{path}"
     data = _json.dumps(body).encode("utf-8")
     try:
@@ -250,6 +243,19 @@ def peers_discovered_proxy():
     data, code = _proxy_get("/api/peers/discovered")
     return jsonify(data), code
 
+# [FIX v9.8] Proxies do Pool para o Painel Web
+@app.route("/api/pool/stats-proxy")
+@require_rate_limit("status")
+def pool_stats_proxy():
+    data, code = _proxy_get("/api/pool/stats")
+    return jsonify(data), code
+
+@app.route("/api/pool/miners-proxy")
+@require_rate_limit("status")
+def pool_miners_proxy():
+    data, code = _proxy_get("/api/pool/miners")
+    return jsonify(data), code
+
 # ============================================================
 # ROTAS LOCAIS (Leitura direta do SQLite)
 # ============================================================
@@ -313,11 +319,9 @@ def _shutdown():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print(f"  BRN Explorer v9.7")
+    print(f"  BRN Explorer v9.8")
     print(f"  → http://{HOST}:{PORT}")
     print(f"  → Painel: http://{HOST}:{PORT}/panel")
-    print(f"  → Monitor: http://{HOST}:{PORT}/monitor")
     print(f"  → Proxies para: http://{SERVER_HOST}:{SERVER_PORT}")
-    print(f"  DB: {DB_PATH}")
     print("=" * 60)
     app.run(host=HOST, port=PORT, threaded=True, debug=False)
