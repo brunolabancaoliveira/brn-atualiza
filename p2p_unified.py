@@ -2,7 +2,7 @@
 p2p_unified.py — BRN P2P Network v6.6.5-Bootstrap
 ================================================================
 v6.6.5:
-  [FIX] P2PClient.get_chain_height agora aceita timeout.
+  [FIX] P2PClient.send_message e variantes aceitam timeout.
 ================================================================
 """
 from __future__ import annotations
