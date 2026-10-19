@@ -1,4 +1,4 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.6)"""
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.7)"""
 from __future__ import annotations
 import os
 import time
@@ -39,13 +39,12 @@ def _get(path: str, timeout: float = 10.0) -> dict:
 
 class WalletApi:
     def __init__(self):
-        log.info("WalletApi v3.6 iniciada (API_BASE=%s)", API_BASE)
+        log.info("WalletApi v3.7 iniciada (API_BASE=%s)", API_BASE)
 
     # ========================================================
     # GERENCIAMENTO DE SESSÃO E BLOQUEIO
     # ========================================================
     def has_wallet(self) -> dict:
-        """Verifica se o arquivo current_wallet.enc já existe no disco."""
         try:
             p = BASE_DIR / "current_wallet.enc"
             return {"ok": True, "exists": p.exists()}
@@ -53,32 +52,24 @@ class WalletApi:
             return {"ok": False, "exists": False, "msg": str(e)}
 
     def create_and_unlock(self, password: str) -> dict:
-        """Cria uma nova carteira, salva com a senha e a desbloqueia na memória."""
         global _WALLET_SESSION
         if not password or len(password) < 4:
             return {"ok": False, "msg": "A senha deve ter pelo menos 4 caracteres."}
         try:
             from wallet import Wallet
             from secure_store import save_current_wallet
-            
-            # 1. Gera a carteira nova
             w = Wallet()
             data = {
                 "address": w.address,
                 "private_key": w.priv_hex,
                 "public_key": w.pub_hex
             }
-            
-            # 2. Salva criptografada no disco usando a senha digitada
             r = save_current_wallet(password, data)
             if not r.get("ok"):
                 return {"ok": False, "msg": "Erro ao salvar: " + str(r.get("msg", ""))}
-            
-            # 3. Coloca na sessão em memória para o app usar agora
             _WALLET_SESSION["address"] = w.address
             _WALLET_SESSION["private_key"] = w.priv_hex
             _WALLET_SESSION["public_key"] = w.pub_hex
-            
             log.info(f"Nova carteira criada: {w.address[:16]}...")
             return {"ok": True, "address": w.address}
         except Exception as e:
@@ -86,7 +77,6 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def unlock_wallet(self, password: str) -> dict:
-        """Tenta abrir uma carteira existente usando a senha."""
         global _WALLET_SESSION
         try:
             from secure_store import load_current_wallet
@@ -101,16 +91,38 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def lock_wallet(self) -> dict:
-        """Apaga a chave privada da memória RAM."""
         global _WALLET_SESSION
         _WALLET_SESSION.clear()
         return {"ok": True}
 
     def get_active_wallet(self) -> dict:
-        """Retorna os dados apenas se a sessão estiver desbloqueada."""
         if _WALLET_SESSION.get("address"):
             return {"ok": True, **_WALLET_SESSION}
         return {"ok": False, "msg": "locked"}
+
+    # ========================================================
+    # ARQUIVO (SALVAR E CARREGAR)
+    # ========================================================
+    def save_wallet(self, name: str, password: str, address: str, sk: str, pk: str) -> dict:
+        try:
+            from wallet import WalletManager
+            return WalletManager.save_encrypted_wallet(name, password, address, sk, pk)
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
+    def list_wallets(self) -> list:
+        try:
+            from wallet import WalletManager
+            return WalletManager.list_wallets()
+        except Exception:
+            return []
+
+    def load_wallet(self, name: str, password: str) -> dict:
+        try:
+            from wallet import WalletManager
+            return WalletManager.load_encrypted_wallet(name, password)
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
 
     # ========================================================
     # EXPERIMENTO A/B
@@ -120,7 +132,6 @@ class WalletApi:
             from ab_test import get_variant, get_node_id_hash
             if not _WALLET_SESSION.get("address"):
                 return {"variant": "A", "error": "locked"}
-            
             node_id = _WALLET_SESSION["address"]
             node_hash = get_node_id_hash(node_id)
             from security import set_node_id_hash
