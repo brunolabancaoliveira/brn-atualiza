@@ -1,15 +1,9 @@
 """
-security.py — Camada de segurança HTTP do BRN (v5 - A/B Testing)
+security.py — Camada de segurança HTTP do BRN (v5.2 - Pool Fix Definitivo)
 ================================================================
-Fornece:
-  * RateLimiter         — janela deslizante em memória (single-node)
-  * RateLimiterMongo    — janela fixa distribuída (multi-node)
-  * AuditLogger         — log JSON-lines com rotação por tamanho
-  * require_rate_limit  — decorator Flask
-  * ensure_self_signed_cert / get_ssl_context
-  * get_client_ip       — respeita X-Forwarded-For com CIDR
-  * hash_short          — fingerprint seguro
-  * set_node_id_hash    — [NOVO] Injeção do A/B test nos logs
+v5.2:
+  [FIX] Limites do Pool aumentados para 100.000 req/min. O minerador
+        estava enviando shares muito rápido e estourando o limite de 2000.
 ================================================================
 """
 from __future__ import annotations
@@ -32,7 +26,6 @@ from typing import Any, Optional
 from flask import request, jsonify
 
 log = logging.getLogger("security")
-
 
 # ============================================================
 # CONFIG
@@ -80,20 +73,21 @@ DEFAULT_RATE_LIMITS = {
     "l2_cancel":     (10,  60),
     "fee_estimate":  (60,  60),
     "work":          (60,  60),
+    # [FIX v5.2] Limites ALTÍSSIMOS para o pool nunca travar
+    "pool_submit":    (100000, 60),
+    "pool_work":      (100000, 60),
+    "pool_heartbeat": (100000, 60),
 }
 
-
 # ============================================================
-# [A/B TEST] INJEÇÃO DO HASH DO USUÁRIO
+# A/B TEST INSTRUMENTATION
 # ============================================================
 _node_id_hash = "unknown"
 
 def set_node_id_hash(node_id: str) -> None:
-    """Injeta o hash do node_id globalmente para os logs do A/B test."""
     global _node_id_hash
     if node_id:
         _node_id_hash = node_id
-
 
 # ============================================================
 # TRUSTED PROXIES
@@ -120,9 +114,7 @@ def _parse_trusted_proxies(raw: str) -> tuple[set, list]:
                 log.warning("BRN_TRUSTED_PROXIES: IP inválido '%s'", s)
     return ips, nets
 
-
 _TRUSTED_IPS, _TRUSTED_NETS = _parse_trusted_proxies(_TRUSTED_RAW)
-
 
 def _is_trusted_proxy(ip: str) -> bool:
     if not ip:
@@ -138,7 +130,6 @@ def _is_trusted_proxy(ip: str) -> bool:
         except ValueError:
             return False
     return False
-
 
 def get_client_ip() -> str:
     try:
@@ -156,7 +147,6 @@ def get_client_ip() -> str:
                 except ValueError:
                     pass
     return direct
-
 
 # ============================================================
 # RATE LIMITER EM MEMÓRIA
@@ -235,7 +225,6 @@ class RateLimiter:
             "hits_total": self._hits,
             "last_cleanup_ago_s": int(time.time() - self._last_cleanup),
         }
-
 
 # ============================================================
 # RATE LIMITER DISTRIBUÍDO (MongoDB)
@@ -323,8 +312,10 @@ class RateLimiterMongo:
             return self._fallback.reset(key, ip)
         try:
             q: dict = {}
-            if key: q["key"] = key
-            if ip: q["ip"] = ip
+            if key:
+                q["key"] = key
+            if ip:
+                q["ip"] = ip
             result = coll.delete_many(q)
             return result.deleted_count
         except Exception as e:
@@ -347,8 +338,10 @@ class RateLimiterMongo:
             h_mongo = self._hits_mongo
             h_fallback = self._hits_fallback
         if ok and coll is not None:
-            try: n_docs = coll.estimated_document_count()
-            except Exception: n_docs = -1
+            try:
+                n_docs = coll.estimated_document_count()
+            except Exception:
+                n_docs = -1
         else:
             n_docs = -1
         return {
@@ -358,7 +351,6 @@ class RateLimiterMongo:
             "hits_fallback": h_fallback,
             "fallback_stats": self._fallback.stats(),
         }
-
 
 # ============================================================
 # FACTORY
@@ -398,7 +390,6 @@ def get_rate_limiter():
 
 _limiter = get_rate_limiter()
 
-
 # ============================================================
 # CLEANUP THREAD
 # ============================================================
@@ -424,7 +415,6 @@ def _ensure_cleanup_started() -> None:
 
 _ensure_cleanup_started()
 
-
 # ============================================================
 # DECORATOR FLASK
 # ============================================================
@@ -449,7 +439,7 @@ def require_rate_limit(endpoint_key: str):
                     "window":   window,
                     "backend":  backend,
                 })
-                resp = jsonify({"ok":  False, "msg": f"Muitas requisições. Tente em {retry}s."})
+                resp = jsonify({"ok": False, "msg": f"Muitas requisições. Tente em {retry}s."})
                 resp.status_code = 429
                 resp.headers["Retry-After"]           = str(retry)
                 resp.headers["X-RateLimit-Limit"]     = str(limit)
@@ -472,9 +462,8 @@ def require_rate_limit(endpoint_key: str):
         return wrapper
     return decorator
 
-
 # ============================================================
-# AUDIT LOG (COM A/B TEST)
+# AUDIT LOG
 # ============================================================
 _audit_lock = threading.RLock()
 _audit_fp = None
@@ -573,18 +562,18 @@ def audit_log(event: str, data: Optional[dict] = None) -> None:
         ua = (request.headers.get("User-Agent", "")[:120] if request else "")
     except Exception:
         ip, ua = "unknown", ""
-        
+
     payload = {
         "ts":    datetime.now(timezone.utc).isoformat(),
-        "event": event, 
-        "ip":    ip, 
-        "ua":    ua, 
+        "event": event,
+        "ip":    ip,
+        "ua":    ua,
         "pid":   os.getpid(),
-        "node_id_hash": _node_id_hash,  # <-- INJEÇÃO A/B TEST
+        "node_id_hash": _node_id_hash,
     }
     if data:
         payload.update(_sanitize(data))
-        
+
     line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with _audit_lock:
         fp = _open_audit()
@@ -603,7 +592,6 @@ def close_audit() -> None:
             try: _audit_fp.close()
             except Exception: pass
             _audit_fp = None
-
 
 # ============================================================
 # HTTPS
@@ -670,7 +658,6 @@ def get_ssl_context() -> Optional[tuple[str, str]]:
         log.warning("get_ssl_context falhou (%s)", e)
         return None
 
-
 # ============================================================
 # DIAGNÓSTICO
 # ============================================================
@@ -695,7 +682,6 @@ def info() -> dict:
         "limiter":            _limiter.stats(),
         "node_id_hash":       _node_id_hash,
     }
-
 
 # ============================================================
 # CLI
