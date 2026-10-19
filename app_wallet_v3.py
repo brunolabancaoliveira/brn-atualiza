@@ -1,4 +1,4 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.7)"""
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.8)"""
 from __future__ import annotations
 import os
 import time
@@ -14,7 +14,7 @@ API_TIMEOUT = float(os.environ.get("BRN_API_TIMEOUT", "200"))
 
 _POOL_CLIENT = None
 _POOL_LOCK = threading.RLock()
-_WALLET_SESSION = {}  # Armazena os dados da carteira em memória (chave privada, etc)
+_WALLET_SESSION = {}
 
 def _post(path: str, body: dict, timeout: float = None) -> dict:
     import requests
@@ -39,10 +39,27 @@ def _get(path: str, timeout: float = 10.0) -> dict:
 
 class WalletApi:
     def __init__(self):
-        log.info("WalletApi v3.7 iniciada (API_BASE=%s)", API_BASE)
+        log.info("WalletApi v3.8 iniciada (API_BASE=%s)", API_BASE)
 
     # ========================================================
-    # GERENCIAMENTO DE SESSÃO E BLOQUEIO
+    # CRIAÇÃO E RECUPERAÇÃO DE CARTEIRA (GERAR NOVA)
+    # ========================================================
+    def generate_wallet(self) -> dict:
+        """Cria uma nova carteira e a deixa pronta na memória."""
+        global _WALLET_SESSION
+        try:
+            from wallet import Wallet
+            w = Wallet()
+            _WALLET_SESSION["address"] = w.address
+            _WALLET_SESSION["private_key"] = w.priv_hex
+            _WALLET_SESSION["public_key"] = w.pub_hex
+            log.info(f"Nova carteira (botão) gerada: {w.address[:16]}...")
+            return {"address": w.address, "private_key": w.priv_hex, "public_key": w.pub_hex}
+        except Exception as e:
+            return {"erro": str(e)}
+
+    # ========================================================
+    # SESSÃO E BLOQUEIO
     # ========================================================
     def has_wallet(self) -> dict:
         try:
@@ -58,22 +75,21 @@ class WalletApi:
         try:
             from wallet import Wallet
             from secure_store import save_current_wallet
+            
             w = Wallet()
             data = {
                 "address": w.address,
                 "private_key": w.priv_hex,
                 "public_key": w.pub_hex
             }
+            
             r = save_current_wallet(password, data)
             if not r.get("ok"):
                 return {"ok": False, "msg": "Erro ao salvar: " + str(r.get("msg", ""))}
-            _WALLET_SESSION["address"] = w.address
-            _WALLET_SESSION["private_key"] = w.priv_hex
-            _WALLET_SESSION["public_key"] = w.pub_hex
-            log.info(f"Nova carteira criada: {w.address[:16]}...")
+            
+            _WALLET_SESSION.update(data)
             return {"ok": True, "address": w.address}
         except Exception as e:
-            log.exception("Erro ao criar carteira")
             return {"ok": False, "msg": str(e)}
 
     def unlock_wallet(self, password: str) -> dict:
@@ -81,11 +97,22 @@ class WalletApi:
         try:
             from secure_store import load_current_wallet
             r = load_current_wallet(password)
+            
             if r and r.get("ok"):
-                _WALLET_SESSION["address"] = r.get("address", "")
-                _WALLET_SESSION["private_key"] = r.get("private_key", "")
-                _WALLET_SESSION["public_key"] = (r.get("public_key") or r.get("pubkey") or r.get("pub_hex") or "")
-                return {"ok": True, "address": _WALLET_SESSION["address"]}
+                addr = r.get("address", "")
+                sk = r.get("private_key", "")
+                pk = r.get("public_key") or r.get("pubkey") or r.get("pub_hex") or ""
+                
+                # [FIX v3.8] Se o arquivo antigo nao tinha pubkey, deriva agora
+                if not pk and sk:
+                    from wallet import Wallet
+                    w = Wallet(private_key_hex=sk)
+                    pk = w.pub_hex
+                
+                _WALLET_SESSION["address"] = addr
+                _WALLET_SESSION["private_key"] = sk
+                _WALLET_SESSION["public_key"] = pk
+                return {"ok": True, "address": addr}
             return {"ok": False, "msg": r.get("msg", "Senha incorreta")}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -101,7 +128,7 @@ class WalletApi:
         return {"ok": False, "msg": "locked"}
 
     # ========================================================
-    # ARQUIVO (SALVAR E CARREGAR)
+    # SALVAR E CARREGAR ARQUIVOS
     # ========================================================
     def save_wallet(self, name: str, password: str, address: str, sk: str, pk: str) -> dict:
         try:
@@ -130,15 +157,12 @@ class WalletApi:
     def get_experiment_variant(self) -> dict:
         try:
             from ab_test import get_variant, get_node_id_hash
-            if not _WALLET_SESSION.get("address"):
-                return {"variant": "A", "error": "locked"}
-            node_id = _WALLET_SESSION["address"]
-            node_hash = get_node_id_hash(node_id)
+            if not _WALLET_SESSION.get("address"): return {"variant": "A", "error": "locked"}
+            node_hash = get_node_id_hash(_WALLET_SESSION["address"])
             from security import set_node_id_hash
             set_node_id_hash(node_hash)
             return {"variant": get_variant(node_hash), "node_hash": node_hash}
-        except Exception as e:
-            return {"variant": "A", "error": str(e)}
+        except Exception as e: return {"variant": "A", "error": str(e)}
 
     def log_exposure(self, variant: str) -> dict:
         try:
