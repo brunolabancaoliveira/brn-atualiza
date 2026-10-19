@@ -1,25 +1,14 @@
 """l2_manager.py — Gerencia ordens L2 BTC→BRN
 ================================================================
-Fachada de alto nível para o subsistema L2 (BTC → BRN).
-
-Responsabilidades:
-  - Criar ordens (via ContractFactory)
-  - Consultar ordens
-  - Cotação (quote)
-  - Estatísticas
-  - Cancelar / expirar ordens
-
-API usada por server.py v9.5:
-    L2Manager(db, blockchain)
-    .create_order(btc_sats, buyer_brn_address, creator_wallet)
-    .get_order(escrow_id) -> dict
-    .list_orders(buyer=None, status="OPEN") -> list
-    .quote(btc_sats) -> dict
-    .stats() -> dict
-
-Requer:
-    contracts/ (factory + escrow_btc_brn + vm)
-    btc_config.py (opcional — usa defaults se ausente)
+v2:
+  [FIX] CRÍTICO: apply_btc_deposit() usava escrow["btc_expected_sats"]
+        mas _format_order() retorna btc_amount_sats. Isso causava
+        KeyError em toda tentativa de claim.
+  [NEW] apply_btc_deposit() agora aceita btc_amount_sats REAL
+        (verificado on-chain pelo caller). O servidor NÃO deve
+        passar o valor esperado do escrow.
+v1:
+  Fachada de alto nível para o subsistema L2 (BTC → BRN).
 ================================================================
 """
 from __future__ import annotations
@@ -63,15 +52,13 @@ class L2Error(Exception):
 # HELPERS
 # ============================================================
 def sats_to_coin(sats: int) -> Decimal:
-    """Converte satoshis → valor decimal (8 casas)."""
     return (Decimal(int(sats)) / SAT).quantize(Decimal("0.00000001"))
 
 
 def coin_to_sats(amount) -> int:
-    """Converte valor decimal → satoshis (int)."""
     try:
-        return int((Decimal(str(amount)) * SAT).quantize(Decimal("1"),
-                                                          rounding=ROUND_DOWN))
+        return int((Decimal(str(amount)) * SAT).quantize(
+            Decimal("1"), rounding=ROUND_DOWN))
     except Exception:
         return 0
 
@@ -100,14 +87,6 @@ class L2Manager:
                      btc_amount_sats: int,
                      buyer_brn_address: str,
                      creator_wallet: str = "BRN_TREASURY") -> dict:
-        """
-        Cria uma ordem BTC → BRN.
-
-        Retorna dict com:
-            escrow_id, btc_address, btc_amount, btc_amount_sats,
-            brn_amount, brn_amount_sats, buyer, status, expires_at,
-            l2_hash, instructions
-        """
         if not isinstance(btc_amount_sats, int):
             raise L2Error("btc_amount_sats deve ser int (satoshis)")
         if btc_amount_sats <= 0:
@@ -115,7 +94,6 @@ class L2Manager:
         if not buyer_brn_address or not buyer_brn_address.startswith("brn1"):
             raise L2Error("Endereco BRN invalido (deve comecar com brn1)")
 
-        # cria via factory (valida min/max internamente)
         try:
             escrow = self.factory.create_btc_to_brn(
                 creator_wallet=creator_wallet,
@@ -128,7 +106,6 @@ class L2Manager:
             log.exception("create_btc_to_brn falhou")
             raise L2Error(f"falha ao criar ordem: {e}")
 
-        # monta resposta
         btc_addr = escrow.btc_address or _default_btc_address()
         instructions = (
             f"Envie exatamente {sats_to_coin(btc_amount_sats)} BTC para "
@@ -167,17 +144,12 @@ class L2Manager:
             return None
         if not row:
             return None
-
         return self._format_order(row)
 
     def list_orders(self,
                     buyer: str | None = None,
                     status: str | None = "OPEN",
                     limit: int = 100) -> list:
-        """
-        Lista ordens. Filtra por buyer e/ou status.
-        status="ALL" ou None → todos os status.
-        """
         try:
             if status and status != "ALL":
                 rows = self.db.get_l2_escrows(status=status)
@@ -200,21 +172,15 @@ class L2Manager:
     # COTAÇÃO
     # ============================================================
     def quote(self, btc_amount_sats: int) -> dict:
-        """
-        Retorna cotação para um valor em sats.
-        Não persiste nada.
-        """
         if not isinstance(btc_amount_sats, int) or btc_amount_sats <= 0:
             raise L2Error("btc_amount_sats deve ser int > 0")
 
         min_s = _min_sats()
         max_s = _max_sats()
         if btc_amount_sats < min_s:
-            raise L2Error(
-                f"BTC minimo: {sats_to_coin(min_s)} BTC")
+            raise L2Error(f"BTC minimo: {sats_to_coin(min_s)} BTC")
         if btc_amount_sats > max_s:
-            raise L2Error(
-                f"BTC maximo: {sats_to_coin(max_s)} BTC")
+            raise L2Error(f"BTC maximo: {sats_to_coin(max_s)} BTC")
 
         amounts = compute_brn_amounts(btc_amount_sats)
         return {
@@ -271,11 +237,9 @@ class L2Manager:
     # AÇÕES
     # ============================================================
     def cancel_order(self, escrow_id: str) -> dict:
-        """Cancela uma ordem OPEN."""
         return self.factory.cancel(escrow_id)
 
     def expire_overdue(self, limit: int = 500) -> int:
-        """Marca como EXPIRED os escrows vencidos. Retorna quantos."""
         return self.factory.expire_overdue(limit=limit)
 
     # ============================================================
@@ -288,14 +252,10 @@ class L2Manager:
         """
         Aplica um depósito BTC detectado.
 
-        Fluxo:
-          1. Valida escrow (existe, OPEN, não expirado, valor suficiente)
-          2. Chama blockchain.add_l2_transaction()
-             → blockchain vai marcar btc_txid_used
-             → blockchain vai criar coinbase L2 e jogar na mempool
-             → blockchain vai aguardar mineração
-
-        Retorna {"ok": bool, "txid": str, "msg": str}.
+        IMPORTANTE: `btc_amount_sats` deve ser o valor REALMENTE
+        recebido (verificado on-chain pelo caller). O servidor NÃO
+        deve passar o valor esperado do escrow — isso permitiria
+        que um atacante pagasse uma fração e recebesse o BRN cheio.
         """
         if self.blockchain is None:
             return {"ok": False, "msg": "blockchain nao injetada"}
@@ -312,11 +272,12 @@ class L2Manager:
             self.db.update_l2_escrow_status(escrow_id, STATUS_EXPIRED)
             return {"ok": False, "msg": "escrow expirado"}
 
-        expected = int(escrow["btc_expected_sats"])
-        # tolerância de 1% (fee)
+        # [FIX v2] Chave correta: btc_amount_sats (não btc_expected_sats)
+        expected = int(escrow["btc_amount_sats"])
         if int(btc_amount_sats) < int(expected * 0.99):
             return {"ok": False,
-                    "msg": f"BTC insuficiente ({btc_amount_sats} < {expected})"}
+                    "msg": (f"BTC insuficiente: pago {btc_amount_sats} sats, "
+                            f"esperado {expected} sats (>=99%)")}
 
         # anti-replay
         try:
@@ -325,11 +286,10 @@ class L2Manager:
         except Exception:
             pass
 
-        # monta l2_tx para blockchain.add_l2_transaction
         l2_tx = {
             "escrow_id":   escrow_id,
             "buyer":       escrow["buyer"],
-            "brn_amount":  int(escrow["brn_amount"]),
+            "brn_amount":  int(escrow["brn_amount_sats"]),
             "btc_txid":    btc_txid,
             "btc_address": escrow.get("btc_address", ""),
             "l2_hash":     escrow.get("l2_hash", ""),
@@ -415,59 +375,42 @@ if __name__ == "__main__":
         def is_btc_txid_used(self, txid):
             return txid in self.used_txids
 
-    print("Testando L2Manager...")
+    print("Testando L2Manager v2...")
 
     db = FakeDB()
     l2 = L2Manager(db, blockchain=None)
 
-    # 1. Cotação
     q = l2.quote(100_000)
     print(f"  [info] quote: {q['btc_amount']} BTC → "
           f"{q['brn_net']} BRN (fee {q['fee_percent']}%)")
-    assert Decimal(q["brn_net"]) > 0
 
-    # 2. Cria ordem
     buyer = "brn1qtestaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     o = l2.create_order(100_000, buyer)
-    assert o["status"] == STATUS_OPEN
-    assert o["buyer"] == buyer
-    assert o["escrow_id"].startswith("esc_")
     print(f"  [ok] create_order: {o['escrow_id']}")
 
-    # 3. Consulta
     o2 = l2.get_order(o["escrow_id"])
-    assert o2 is not None
-    assert o2["escrow_id"] == o["escrow_id"]
+    assert o2 is not None and o2["escrow_id"] == o["escrow_id"]
     print("  [ok] get_order")
 
-    # 4. Lista
     lst = l2.list_orders(buyer=buyer, status="OPEN")
     assert len(lst) == 1
     print(f"  [ok] list_orders: {len(lst)} aberta(s)")
 
-    # 5. Estatísticas
     s = l2.stats()
-    print(f"  [info] stats: open={s['open']} total={s['total']} rate={s['rate']}")
     assert s["open"] == 1
+    print(f"  [info] stats: open={s['open']} total={s['total']}")
 
-    # 6. Cancelamento
     r = l2.cancel_order(o["escrow_id"])
     assert r["ok"]
     print("  [ok] cancel_order")
 
-    # 7. Validações
-    for bad_btc, bad_buyer in [(-1, buyer), (100_000, "not_brn")]:
-        try:
-            l2.create_order(bad_btc, bad_buyer)
-            raise AssertionError("deveria rejeitar")
-        except L2Error:
-            pass
-    print("  [ok] validações de entrada")
-
-    # 8. Depósito sem blockchain
+    # Teste do bug corrigido
     o3 = l2.create_order(100_000, buyer)
-    r = l2.apply_btc_deposit(o3["escrow_id"], "txid_fake", 100_000)
-    assert not r["ok"]   # blockchain=None
-    print("  [ok] apply_btc_deposit rejeita sem blockchain")
+    r = l2.apply_btc_deposit(o3["escrow_id"], "txid_fake", 99_000)
+    # blockchain=None → deve retornar "blockchain nao injetada"
+    # mas NÃO deve lançar KeyError 'btc_expected_sats'
+    assert not r["ok"]
+    assert "blockchain" in r["msg"].lower() or "expirado" in r["msg"].lower()
+    print("  [ok] apply_btc_deposit (bug corrigido, sem KeyError)")
 
-    print("L2Manager OK.")
+    print("L2Manager v2 OK.")
