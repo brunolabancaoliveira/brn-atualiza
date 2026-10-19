@@ -1,13 +1,15 @@
 """
-sync_manager.py — Sincronização + Reorg automático (v8.3)
+sync_manager.py — Sincronização + Reorg automático (v8.4)
 ================================================================
+v8.4:
+  [FIX] CRÍTICO: _refresh_peers_from_p2p agora usa fallback para
+        disc.listar_peers() se o cache de altura estiver vazio.
+        Se a altura vier 0, faz um P2PClient.get_chain_height()
+        na hora para acordar o sync.
 v8.3:
-  [FIX] CRÍTICO: _fork_signal agora usa a mesma Event injetada
-        na blockchain (chain._fork_signal). Antes o sync_manager
-        criava uma flag isolada que o miner_loop não via.
+  [FIX] _fork_signal sincronizado com a blockchain.
 v8.2:
-  [FIX] CRÍTICO: _fetch_chain_from chamava `resp, _ = self._do_send(...)`
-        mas `_do_send` retorna APENAS um dict.
+  [FIX] _fetch_chain_from corrigido.
 ================================================================
 """
 from __future__ import annotations
@@ -98,7 +100,7 @@ class ChainSyncManager:
 
         self._has_save_header = hasattr(self.db, "save_header")
 
-        # [FIX v8.3] Sincroniza a flag com a blockchain
+        # Sincroniza a flag com a blockchain
         if hasattr(self.chain, "_fork_signal") and self.chain._fork_signal is not None:
             self._fork_signal = self.chain._fork_signal
         else:
@@ -318,29 +320,58 @@ class ChainSyncManager:
                 self.status.forking = False
                 self._fork_signal.clear()
 
+    # ══════════════════════════════════════════════════════════════
+    # [FIX v8.4] Refresh peers com fallback e fetch on-demand
+    # ══════════════════════════════════════════════════════════════
     def _refresh_peers_from_p2p(self) -> int:
         p2p = self.p2p
         if p2p is None:
             return 0
         count = 0
         disc = getattr(p2p, "discovery", None)
+        
+        # 1. Tenta pegar do cache de alturas
+        peers_info = []
         if disc is not None and hasattr(disc, "listar_peers_com_altura"):
             try:
-                for p in disc.listar_peers_com_altura() or []:
-                    addr = p.get("address", "")
-                    if not addr or ":" not in addr:
-                        continue
-                    ip, _, port_s = addr.rpartition(":")
-                    try:
-                        port = int(port_s)
-                    except ValueError:
-                        continue
-                    height = int(p.get("height", 0) or 0)
-                    work = int(p.get("work", 0) or 0)
-                    self.register_peer(addr, ip, port, height, work)
-                    count += 1
-            except Exception as e:
-                log.debug(f"_refresh_peers_from_p2p: {e}")
+                peers_info = disc.listar_peers_com_altura() or []
+            except Exception:
+                pass
+                
+        # 2. Se o cache estiver vazio, pega a lista crua de peers
+        if not peers_info and disc is not None and hasattr(disc, "listar_peers"):
+            for addr in disc.listar_peers():
+                if ":" in addr:
+                    peers_info.append({"address": addr, "height": 0, "work": 0})
+
+        # 3. Registra e, se necessário, busca a altura na hora
+        for p in peers_info:
+            addr = p.get("address", "")
+            if not addr or ":" not in addr:
+                continue
+            ip, _, port_s = addr.rpartition(":")
+            try:
+                port = int(port_s)
+            except ValueError:
+                continue
+                
+            height = int(p.get("height", 0) or 0)
+            work = int(p.get("work", 0) or 0)
+            
+            # Se não sabemos a altura, pergunta pro peer agora
+            if height == 0:
+                try:
+                    from p2p_unified import P2PClient
+                    resp, _ = P2PClient.get_chain_height(ip, port, timeout=2.0)
+                    if resp:
+                        height = int(resp.get("height", 0))
+                        work = int(resp.get("work", 0))
+                except Exception:
+                    pass
+            
+            self.register_peer(addr, ip, port, height, work)
+            count += 1
+            
         return count
 
     def _do_send(self, ip: str, port: int, msg: dict, timeout: float = DEFAULT_TIMEOUT) -> Optional[dict]:
@@ -477,7 +508,7 @@ class ChainSyncManager:
 
         self.sync_thread = threading.Thread(target=_loop, daemon=True, name="ChainSync")
         self.sync_thread.start()
-        log.info("ChainSyncManager v8.3 iniciado")
+        log.info("ChainSyncManager v8.4 iniciado")
 
     def _best_peer_by_work(self) -> Optional[PeerStatus]:
         local_h = self._safe_height()
