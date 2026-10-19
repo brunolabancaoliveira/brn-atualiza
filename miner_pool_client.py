@@ -4,6 +4,10 @@ v3:
   [FIX] Corrigido o bug onde _http_post ignorava o self.pool_url
         e tentava ligar sempre a 127.0.0.1 (localhost).
         Agora usa o IP do Ubuntu (API_BASE) corretamente.
+  [FIX] CORREÇÃO CRÍTICA: _mine_batch agora usa share_difficulty
+        no pow_search da biblioteca C. Antes usava a dificuldade
+        do bloco inteiro, fazendo com que o minerador C nunca
+        enviasse shares para o pool.
 ================================================================
 """
 from __future__ import annotations
@@ -47,7 +51,7 @@ except Exception as e:
 
 
 # ============================================================
-# HTTP (AGORA RECEBE A BASE_URL)
+# HTTP (RECEBE A BASE_URL)
 # ============================================================
 def _http_post(base_url: str, path: str, body: dict, timeout: float = HTTP_TIMEOUT_S) -> dict:
     url = base_url.rstrip("/") + path
@@ -109,14 +113,15 @@ def _target_from_difficulty(diff: int) -> int:
     return int("0" * int(diff) + "f" * (64 - int(diff)), 16)
 
 
-def _mine_batch(prev_hash: str, merkle: str, ts: int, diff: int,
+def _mine_batch(prev_hash: str, merkle: str, ts: int, diff: int, share_difficulty: int,
                 nonce_start: int, batch: int, share_target: int) -> tuple:
     if _HAS_C and _brn_miner_c is not None:
         prefix = prev_hash + merkle + str(ts)
         diff_str = str(int(diff))
         try:
+            # [FIX CRÍTICO] Usa share_difficulty (não diff) no pow_search em C
             result = _brn_miner_c.pow_search(
-                prefix, diff_str, int(diff),
+                prefix, diff_str, int(share_difficulty),
                 nonce_start=nonce_start,
                 max_iters=batch,
             )
@@ -276,9 +281,8 @@ class PoolClient(threading.Thread):
                 nonce = 0
                 log.info("pool client: mining job %s", last_job_id)
 
-            share_target = _target_from_difficulty(
-                int(job.get("share_difficulty", 4))
-            )
+            share_diff = int(job.get("share_difficulty", 4))
+            share_target = _target_from_difficulty(share_diff)
 
             try:
                 found_nonce, found_hash, hashes, nonce = _mine_batch(
@@ -286,6 +290,7 @@ class PoolClient(threading.Thread):
                     merkle=job["merkle"],
                     ts=int(job["timestamp"]),
                     diff=int(job["difficulty"]),
+                    share_difficulty=share_diff,  # [FIX] Passando a dificuldade do share
                     nonce_start=nonce,
                     batch=HASH_BATCH,
                     share_target=share_target,
