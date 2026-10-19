@@ -1,327 +1,343 @@
 """
-explorer.py — Explorador de blocos BRN (Flask) v9.8
+explorer.py — Backend do Explorer + Painéis + Block Explorer (v3.0)
 ================================================================
-v9.8: [FIX] Adicionado proxies para /api/pool/stats e /api/pool/miners.
+v3.0:
+  [NEW] Block Explorer estilo Bitcoin (Busca, Blocos, Carteiras, TXs).
+  [KEEP] Rotas de proxy (/api/*-proxy) usadas pelo panel.html e monitor.html.
+  [KEEP] Servidor dos arquivos estáticos panel.html e monitor.html.
 ================================================================
 """
-from __future__ import annotations
-import os
-import re
+from flask import Flask, render_template_string, request, jsonify, send_file, abort
+import sqlite3
+import zlib
+import orjson
 import time
-import atexit
-import logging
-import threading
-import urllib.request
-import urllib.error
-import json as _json
+import os
+import requests
+from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, send_from_directory, request, abort
-
-try:
-    from flask_cors import CORS
-    _HAS_CORS = True
-except ImportError:
-    _HAS_CORS = False
-
-try:
-    from werkzeug.middleware.proxy_fix import ProxyFix
-    _HAS_PROXYFIX = True
-except ImportError:
-    _HAS_PROXYFIX = False
-
-from db import ChainDB
-
-try:
-    from mongo_client import mongo
-    _HAS_MONGO = True
-except Exception:
-    mongo = None
-    _HAS_MONGO = False
-
-try:
-    from security import (
-        require_rate_limit, audit_log, close_audit,
-        hash_short, get_client_ip,
-    )
-    _HAS_SECURITY = True
-except Exception:
-    _HAS_SECURITY = False
-
-    def require_rate_limit(name):
-        def deco(fn): return fn
-        return deco
-
-    def audit_log(event, data=None): pass
-    def close_audit(): pass
-    def hash_short(v, n=12): return str(v)[:n] if v else ""
-    def get_client_ip(): return request.remote_addr or "0.0.0.0"
-
+app = Flask(__name__)
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = os.environ.get("BRN_DB", str(BASE_DIR / "brn_v2_chain.db"))
-PORT = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
-HOST = os.environ.get("BRN_EXPLORER_HOST", "127.0.0.1")
-CORS_ORIGIN = os.environ.get("BRN_CORS_ORIGIN", "").strip()
-BEHIND_PROXY = os.environ.get("BRN_BEHIND_PROXY", "0") == "1"
-
-SERVER_PORT = int(os.environ.get("BRN_WEB_PORT", "5000"))
-SERVER_HOST = os.environ.get("BRN_PROXY_HOST", "127.0.0.1")
-
-BRN_ADDRESS_RE = re.compile(r"^brn1[a-z0-9]{20,90}$")
-
-logging.basicConfig(
-    level=os.environ.get("BRN_LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("explorer")
-
-app = Flask(__name__, static_folder=str(BASE_DIR))
-
-if _HAS_CORS:
-    if CORS_ORIGIN:
-        CORS(app, origins=[CORS_ORIGIN])
-    else:
-        CORS(app, origins="*")
-
-@app.before_request
-def _before():
-    if request.method == "OPTIONS":
-        return ("", 200)
-
-@app.after_request
-def _after(resp):
-    if CORS_ORIGIN:
-        resp.headers["Access-Control-Allow-Origin"] = CORS_ORIGIN
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        resp.headers["Vary"] = "Origin"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    return resp
-
-@app.errorhandler(400)
-def _e400(_): return jsonify({"error": "bad request"}), 400
-
-@app.errorhandler(404)
-def _e404(_): return jsonify({"error": "not found"}), 404
-
-@app.errorhandler(429)
-def _e429(_): return jsonify({"error": "rate limit exceeded"}), 429
-
-@app.errorhandler(500)
-def _e500(e):
-    log.exception("erro interno: %s", e)
-    return jsonify({"error": "internal error"}), 500
-
-@app.errorhandler(Exception)
-def _eany(e):
-    from werkzeug.exceptions import HTTPException
-    if isinstance(e, HTTPException):
-        return jsonify({"error": e.description}), e.code
-    log.exception("excecao: %s", e)
-    return jsonify({"error": "internal error"}), 500
-
-_local = threading.local()
-
-def _db() -> ChainDB:
-    db = getattr(_local, "db", None)
-    if db is None:
-        db = ChainDB(DB_PATH)
-        _local.db = db
-    return db
-
-def _parse_int(name, default, lo, hi):
-    raw = request.args.get(name, default)
-    try: v = int(raw)
-    except (TypeError, ValueError): abort(400)
-    if v < lo or v > hi: abort(400)
-    return v
+DB_PATH = str(BASE_DIR / "brn_v2_chain.db")
+API_BASE = "http://127.0.0.1:5000" # Porta do server.py
 
 # ============================================================
-# ROTAS HTML
+# TEMPLATES HTML (Block Explorer)
+# ============================================================
+LAYOUT = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>BRN Explorer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { background: #0d1117; color: #c9d1d9; font-family: -apple-system, sans-serif; margin: 0; padding: 20px; }
+        .container { max-width: 1100px; margin: 0 auto; }
+        header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #30363d; padding-bottom: 15px; margin-bottom: 20px; }
+        h1 { margin: 0; color: #58a6ff; font-size: 1.5rem; }
+        .search-box { display: flex; gap: 10px; margin-bottom: 20px; }
+        .search-box input { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: #fff; }
+        .search-box button { padding: 10px 20px; background: #238636; border: none; border-radius: 6px; color: #fff; cursor: pointer; font-weight: bold; }
+        .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+        .card h2 { font-size: 1.1rem; border-bottom: 1px solid #30363d; padding-bottom: 10px; margin-top: 0; color: #8b949e; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #21262d; }
+        th { color: #8b949e; font-size: 0.8rem; text-transform: uppercase; }
+        tr:hover { background: #1c2128; }
+        .mono { font-family: monospace; font-size: 0.85rem; color: #79c0ff; word-break: break-all; }
+        .tag { padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
+        .tag.ok { background: rgba(63,185,80,0.15); color: #3fb950; }
+        .tag.warn { background: rgba(210,153,34,0.15); color: #d29922; }
+        a { color: #58a6ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>🔷 BRN Explorer</h1>
+        <div><a href="/">Home</a> | <a href="/panel">Painel</a> | <a href="/monitor">Monitor</a></div>
+    </header>
+    <form class="search-box" action="/search" method="GET">
+        <input type="text" name="q" placeholder="Pesquisar por Bloco, TxID ou Endereço (brn1...)">
+        <button type="submit">Pesquisar</button>
+    </form>
+    {% block content %}{% endblock %}
+</div>
+</body>
+</html>
+"""
+
+HOME_HTML = """
+{% extends "layout" %}
+{% block content %}
+<div class="grid">
+    <div class="card">
+        <h2>Últimos Blocos</h2>
+        <table>
+            <tr><th>Altura</th><th>Hash</th><th>TXs</th><th>Tempo</th></tr>
+            {% for b in blocks %}
+            <tr>
+                <td><a href="/block/{{ b.height }}"><b>{{ b.height }}</b></a></td>
+                <td class="mono">{{ b.hash[:16] }}...</td>
+                <td>{{ b.txs }}</td>
+                <td>{{ b.time }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    <div class="card">
+        <h2>Últimas Transações</h2>
+        <table>
+            <tr><th>TxID</th><th>Valor</th><th>Hora</th></tr>
+            {% for tx in txs %}
+            <tr>
+                <td><a href="/tx/{{ tx.txid }}" class="mono">{{ tx.txid[:16] }}...</a></td>
+                <td>{{ tx.value }} BRN</td>
+                <td>{{ tx.time }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+</div>
+{% endblock %}
+"""
+
+BLOCK_HTML = """
+{% extends "layout" %}
+{% block content %}
+<div class="card">
+    <h2>Bloco #{{ block.height }}</h2>
+    <table>
+        <tr><td><b>Hash</b></td><td class="mono">{{ block.hash }}</td></tr>
+        <tr><td><b>Prev Hash</b></td><td class="mono">{{ block.prev_hash }}</td></tr>
+        <tr><td><b>Merkle Root</b></td><td class="mono">{{ block.merkle }}</td></tr>
+        <tr><td><b>Timestamp</b></td><td>{{ block.time }}</td></tr>
+        <tr><td><b>Dificuldade</b></td><td>{{ block.difficulty }}</td></tr>
+        <tr><td><b>Nonce</b></td><td>{{ block.nonce }}</td></tr>
+    </table>
+</div>
+<div class="card">
+    <h2>Transações ({{ block.transactions|length }})</h2>
+    <table>
+        <tr><th>TxID</th><th>Tipo</th><th>Valor (BRN)</th></tr>
+        {% for tx in block.transactions %}
+        <tr>
+            <td><a href="/tx/{{ tx.txid }}" class="mono">{{ tx.txid[:20] }}...</a></td>
+            <td>{% if tx.inputs[0].txid == "0"*64 %}<span class="tag warn">Coinbase</span>{% else %}Transferência{% endif %}</td>
+            <td>{{ tx.value }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+{% endblock %}
+"""
+
+ADDRESS_HTML = """
+{% extends "layout" %}
+{% block content %}
+<div class="card">
+    <h2>Endereço {{ address }}</h2>
+    <p><b>Saldo:</b> <span style="font-size:1.5rem; color:#3fb950">{{ balance }} BRN</span></p>
+    <p><b>Total Recebido:</b> {{ total_received }} BRN</p>
+</div>
+<div class="card">
+    <h2>Transações</h2>
+    <table>
+        <tr><th>TxID</th><th>Direção</th><th>Valor</th><th>Status</th></tr>
+        {% for tx in txs %}
+        <tr>
+            <td><a href="/tx/{{ tx.txid }}" class="mono">{{ tx.txid[:20] }}...</a></td>
+            <td>{% if tx.direction == 'received' %}<span style="color:#3fb950">Recebido</span>{% elif tx.direction == 'sent' %}<span style="color:#f85149">Enviado</span>{% else %}Próprio{% endif %}</td>
+            <td>{{ tx.amount }} BRN</td>
+            <td>{% if tx.status == 'confirmed' %}<span class="tag ok">Confirmado</span>{% else %}<span class="tag warn">Pendente</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+{% endblock %}
+"""
+
+# ============================================================
+# HELPERS DB (Block Explorer)
+# ============================================================
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def get_latest_blocks(n=10):
+    conn = get_db()
+    rows = conn.execute("SELECT height, raw FROM blocks ORDER BY height DESC LIMIT ?", (n,)).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        b = orjson.loads(zlib.decompress(r["raw"]))
+        out.append({
+            "height": b["height"],
+            "hash": b["hash"],
+            "txs": len(b["transactions"]),
+            "time": datetime.fromtimestamp(b["timestamp"]).strftime("%H:%M:%S")
+        })
+    return out
+
+def get_latest_txs(n=10):
+    conn = get_db()
+    rows = conn.execute("SELECT raw FROM transactions ORDER BY block_height DESC LIMIT ?", (n,)).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        tx = orjson.loads(zlib.decompress(r["raw"]))
+        if tx["inputs"][0]["txid"] == "0"*64:
+            continue 
+        val = sum(o["amount"] for o in tx["outputs"]) / 1e8
+        out.append({
+            "txid": tx["txid"],
+            "value": f"{val:.2f}",
+            "time": datetime.fromtimestamp(tx["timestamp"]).strftime("%H:%M")
+        })
+    return out
+
+# ============================================================
+# ROTAS DO BLOCK EXPLORER
 # ============================================================
 @app.route("/")
-def index():
-    try: return send_from_directory(BASE_DIR, "index.html", max_age=60)
-    except Exception: return jsonify({"ok": True, "service": "BRN Explorer"})
+def home():
+    blocks = get_latest_blocks(10)
+    txs = get_latest_txs(10)
+    return render_template_string(HOME_HTML, blocks=blocks, txs=txs)
 
+@app.route("/block/<int:height>")
+def block_detail(height):
+    conn = get_db()
+    row = conn.execute("SELECT raw FROM blocks WHERE height=?", (height,)).fetchone()
+    conn.close()
+    if not row:
+        return "Bloco não encontrado", 404
+    
+    b = orjson.loads(zlib.decompress(row["raw"]))
+    b["time"] = datetime.fromtimestamp(b["timestamp"]).strftime("%d/%m/%Y %H:%M:%S")
+    for tx in b["transactions"]:
+        tx["value"] = f"{sum(o['amount'] for o in tx['outputs'])/1e8:.8f}"
+    
+    return render_template_string(BLOCK_HTML, block=b)
+
+@app.route("/address/<address>")
+def address_detail(address):
+    if not address.startswith("brn1"):
+        return "Endereço inválido", 400
+    
+    conn = get_db()
+    row = conn.execute("SELECT SUM(amount) as s FROM utxos WHERE address=? AND spent=0", (address,)).fetchone()
+    balance = (row["s"] or 0) / 1e8
+    
+    row2 = conn.execute("SELECT SUM(amount) as s FROM utxos WHERE address=?", (address,)).fetchone()
+    total_received = (row2["s"] or 0) / 1e8
+    
+    txs = []
+    rows = conn.execute("SELECT txid, amount, spent, block_height FROM utxos WHERE address=? ORDER BY block_height DESC LIMIT 50", (address,)).fetchall()
+    seen_txids = set()
+    for r in rows:
+        if r["txid"] in seen_txids: continue
+        seen_txids.add(r["txid"])
+        txs.append({
+            "txid": r["txid"],
+            "amount": f"{r['amount']/1e8:.8f}",
+            "direction": "received",
+            "status": "confirmed",
+            "block_height": r["block_height"]
+        })
+        
+    conn.close()
+    return render_template_string(ADDRESS_HTML, address=address, balance=f"{balance:.8f}", total_received=f"{total_received:.8f}", txs=txs)
+
+@app.route("/tx/<txid>")
+def tx_detail(txid):
+    conn = get_db()
+    row = conn.execute("SELECT raw, block_height FROM transactions WHERE txid=?", (txid,)).fetchone()
+    conn.close()
+    if not row:
+        return "Transação não encontrada", 404
+    tx = orjson.loads(zlib.decompress(row["raw"]))
+    return jsonify({"ok": True, "tx": tx, "block_height": row["block_height"]})
+
+@app.route("/search")
+def search():
+    q = request.args.get("q", "").strip()
+    if not q: return "Busca vazia", 400
+    if q.isdigit(): return block_detail(int(q))
+    elif q.startswith("brn1"): return address_detail(q)
+    elif len(q) == 64: return tx_detail(q)
+    else: return "Formato não reconhecido.", 400
+
+# ============================================================
+# SERVIDOR DE ARQUIVOS (Panel e Monitor)
+# ============================================================
 @app.route("/panel")
-@app.route("/panel.html")
-def panel():
-    try: return send_from_directory(BASE_DIR, "panel.html", max_age=5)
-    except Exception as e: return f"<h1>Painel não encontrado</h1><p>Erro: {e}</p>", 404
+def serve_panel():
+    p = BASE_DIR / "panel.html"
+    if p.exists(): return send_file(p)
+    return "panel.html não encontrado", 404
 
 @app.route("/monitor")
-@app.route("/monitor.html")
-def monitor():
-    try: return send_from_directory(BASE_DIR, "monitor.html", max_age=5)
-    except Exception as e: return f"<h1>Monitor não encontrado</h1><p>Erro: {e}</p>", 404
+def serve_monitor():
+    p = BASE_DIR / "monitor.html"
+    if p.exists(): return send_file(p)
+    return "monitor.html não encontrado", 404
 
 # ============================================================
-# PROXIES
+# ROTAS DE PROXY (Para o Panel.html e Monitor.html)
 # ============================================================
-def _proxy_get(path: str, timeout: float = 60.0):
-    url = f"http://{SERVER_HOST}:{SERVER_PORT}{path}"
+def _proxy_get(path):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "brn-explorer"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return _json.loads(r.read().decode("utf-8")), 200
-    except urllib.error.HTTPError as e:
-        try: body = _json.loads(e.read().decode("utf-8"))
-        except Exception: body = {"error": f"HTTP {e.code}"}
-        return body, e.code
-    except urllib.error.URLError as e:
-        return {"error": f"server offline: {e.reason}"}, 503
+        r = requests.get(f"{API_BASE}{path}", timeout=10)
+        return jsonify(r.json())
     except Exception as e:
-        return {"error": str(e)}, 503
+        return jsonify({"error": str(e)}), 500
 
-def _proxy_post(path: str, body: dict, timeout: float = 60.0):
-    url = f"http://{SERVER_HOST}:{SERVER_PORT}{path}"
-    data = _json.dumps(body).encode("utf-8")
+def _proxy_post(path, data=None):
     try:
-        req = urllib.request.Request(
-            url, data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "brn-explorer"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return _json.loads(r.read().decode("utf-8")), 200
-    except urllib.error.HTTPError as e:
-        try: body_err = _json.loads(e.read().decode("utf-8"))
-        except Exception: body_err = {"error": f"HTTP {e.code}"}
-        return body_err, e.code
-    except urllib.error.URLError as e:
-        return {"error": f"server offline: {e.reason}"}, 503
+        r = requests.post(f"{API_BASE}{path}", json=data, timeout=10)
+        return jsonify(r.json())
     except Exception as e:
-        return {"error": str(e)}, 503
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/status-proxy")
-@require_rate_limit("status")
-def status_proxy():
-    data, code = _proxy_get("/api/status")
-    return jsonify(data), code
+def p_status(): return _proxy_get("/api/status")
 
 @app.route("/api/chain-info-proxy")
-@require_rate_limit("status")
-def chain_info_proxy():
-    data, code = _proxy_get("/api/chain-info")
-    return jsonify(data), code
+def p_chain_info(): return _proxy_get("/api/chain-info")
 
 @app.route("/api/sync-status-proxy")
-@require_rate_limit("status")
-def sync_status_proxy():
-    data, code = _proxy_get("/api/sync/status")
-    return jsonify(data), code
+def p_sync_status(): return _proxy_get("/api/sync/status")
+
+@app.route("/api/sync-info-proxy")
+def p_sync_info(): return _proxy_get("/api/sync-info")
 
 @app.route("/api/miner-status-proxy")
-@require_rate_limit("status")
-def miner_status_proxy():
-    data, code = _proxy_get("/api/miner/status")
-    return jsonify(data), code
-
-@app.route("/api/miner/start-proxy", methods=["POST"])
-def miner_start_proxy():
-    body = request.get_json(force=True, silent=True) or {}
-    data, code = _proxy_post("/api/miner/start", body)
-    return jsonify(data), code
-
-@app.route("/api/miner/stop-proxy", methods=["POST"])
-def miner_stop_proxy():
-    data, code = _proxy_post("/api/miner/stop", {})
-    return jsonify(data), code
+def p_miner_status(): return _proxy_get("/api/miner/status")
 
 @app.route("/api/peers-score-proxy")
-@require_rate_limit("status")
-def peers_score_proxy():
-    data, code = _proxy_get("/api/peers/score")
-    return jsonify(data), code
+def p_peers_score(): return _proxy_get("/api/peers/score")
 
 @app.route("/api/peers-discovered-proxy")
-@require_rate_limit("status")
-def peers_discovered_proxy():
-    data, code = _proxy_get("/api/peers/discovered")
-    return jsonify(data), code
-
-# [FIX v9.8] Proxies do Pool para o Painel Web
-@app.route("/api/pool/stats-proxy")
-@require_rate_limit("status")
-def pool_stats_proxy():
-    data, code = _proxy_get("/api/pool/stats")
-    return jsonify(data), code
-
-@app.route("/api/pool/miners-proxy")
-@require_rate_limit("status")
-def pool_miners_proxy():
-    data, code = _proxy_get("/api/pool/miners")
-    return jsonify(data), code
-
-# ============================================================
-# ROTAS LOCAIS (Leitura direta do SQLite)
-# ============================================================
-@app.route("/api/stats")
-@require_rate_limit("status")
-def stats():
-    try:
-        db = _db()
-        s = db.get_stats()
-        s["peers_count"] = db.contar_peers(apenas_ativos=False)
-        return jsonify(s)
-    except Exception as e:
-        log.error(f"Erro em /api/stats: {e}")
-        return jsonify({"error": str(e)}), 500
+def p_peers_discovered(): return _proxy_get("/api/peers/discovered")
 
 @app.route("/api/latest")
-@require_rate_limit("list_blocks")
-def latest():
-    try:
-        return jsonify(_db().latest_blocks(n=50))
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+def p_latest(): return _proxy_get("/api/latest")
 
-@app.route("/api/blocks")
-@require_rate_limit("list_blocks")
-def blocks_paginado():
-    try:
-        start = _parse_int("start", 0, 0, 10 ** 9)
-        limit = _parse_int("limit", 50, 1, 1000)
-        db = _db()
-        top = db.height()
-        out = []
-        for h in range(start, min(start + limit, top + 1)):
-            b = db.get_block(h)
-            if b:
-                out.append({
-                    "height": b["height"], "hash": b["hash"],
-                    "timestamp": b["timestamp"], "txs": len(b["transactions"]),
-                    "difficulty": b["difficulty"],
-                })
-        return jsonify({"start": start, "count": len(out), "blocks": out})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.route("/api/miner/start-proxy", methods=["POST"])
+def p_miner_start(): return _proxy_post("/api/miner/start", request.json)
 
-@app.route("/health")
-def health():
-    return jsonify({
-        "ok": True, "ts": time.time(), "server_port": SERVER_PORT,
-        "panel_disponivel": (BASE_DIR / "panel.html").exists(),
-        "monitor_disponivel": (BASE_DIR / "monitor.html").exists(),
-    })
+@app.route("/api/miner/stop-proxy", methods=["POST"])
+def p_miner_stop(): return _proxy_post("/api/miner/stop")
 
-@atexit.register
-def _shutdown():
-    log.info("encerrando explorer...")
-    try:
-        if _HAS_MONGO and mongo is not None: mongo.close()
-    except Exception: pass
-    try: close_audit()
-    except Exception: pass
-
+# ============================================================
+# MAIN
+# ============================================================
 if __name__ == "__main__":
-    print("=" * 60)
-    print(f"  BRN Explorer v9.8")
-    print(f"  → http://{HOST}:{PORT}")
-    print(f"  → Painel: http://{HOST}:{PORT}/panel")
-    print(f"  → Proxies para: http://{SERVER_HOST}:{SERVER_PORT}")
-    print("=" * 60)
-    app.run(host=HOST, port=PORT, threaded=True, debug=False)
+    port = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
+    print(f"BRN Explorer + Painéis rodando em http://127.0.0.1:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
