@@ -1,5 +1,8 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.5)
+"""main.py — Entrypoint unificado do nó BRN (v13.6)
 ================================================================
+v13.6:
+  [NEW] Adicionado argumento --pool-client e resolvido conflito com
+        --no-pool-client (para bater com o iniciar.bat v6).
 v13.5:
   [FIX] Importação do PoolClient agora é independente do PoolManager.
         Permite que o Cliente (Windows) minere no Pool remoto mesmo
@@ -136,7 +139,7 @@ except Exception as _e:
 def _l2_disponivel() -> bool: return L2_ENABLED and btc_config and BTCWatcher and L2Manager
 
 # ============================================================
-# POOL [FIX v13.5]
+# POOL
 # ============================================================
 POOL_ENABLED = os.environ.get("BRN_POOL_ENABLED", "1") == "1"
 PoolManager = None
@@ -210,10 +213,12 @@ def parse_args():
     p.add_argument("--no-tailscale", action="store_true")
     p.add_argument("--no-sync", action="store_true")
     p.add_argument("--no-pool", action="store_true")
-    p.add_argument("--no-pool-client", action="store_true")
     p.add_argument("--pool-stats", action="store_true")
     p.add_argument("--gui", action="store_true")
     p.add_argument("--no-gui", action="store_true")
+    # [FIX v13.6] Adicionado --pool-client e --no-pool-client
+    p.add_argument("--pool-client", action="store_true", help="Força iniciar PoolClient no boot")
+    p.add_argument("--no-pool-client", action="store_true", help="Não inicia PoolClient no boot")
     return p.parse_args()
 
 def _resolve_password(args) -> str:
@@ -555,7 +560,16 @@ def main():
     if pool: _inject_into_server("pool", pool, log)
     if trust_net: _inject_into_server("trust", trust_net, log)
 
-    pool_client = _setup_pool_client_local(chain, pool, log, disabled=args.no_pool_client, is_origin_node=is_origin)
+    # [FIX v13.6] Resolve conflito entre --pool-client e --no-pool-client
+    disabled_pool_client = args.no_pool_client
+    if args.pool_client:
+        disabled_pool_client = False
+
+    pool_client = _setup_pool_client_local(
+        chain, pool, log,
+        disabled=disabled_pool_client,
+        is_origin_node=is_origin
+    )
     if pool_client: _register_service("pool_client", pool_client)
 
     _setup_local_miner_broadcast(chain, p2p, log)
