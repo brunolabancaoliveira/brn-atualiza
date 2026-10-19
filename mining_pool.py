@@ -1,5 +1,10 @@
-"""mining_pool.py — Pool de mineração BRN (v4)
+"""mining_pool.py — Pool de mineração BRN (v4.1)
 ================================================================
+v4.1:
+  [FIX] A fila de mineração e o estado da Fase (1 ou 2) agora são
+        lidos diretamente da blockchain (chain.fila_mineracao e
+        chain.rede_descentralizada). Antes o pool mantinha uma fila
+        paralela e causava divergência entre o Painel e a Carteira.
 v4:
   [NEW] Integração da lógica de Fases (Bootstrap 20 mineradores).
   [NEW] Fila de espera visual mantida em memória.
@@ -94,14 +99,14 @@ class PoolManager:
         self.rejected_shares = 0
         self.accepted_shares = 0
         
-        # [NOVO] Estado da Fase (Bootstrap)
-        self.phase = 1
+        # Estado da Fase (Bootstrap) - Sincronizado com a blockchain
+        self.phase = 2 if self.chain.rede_descentralizada else 1
         self.phase2_threshold = 20
-        self.miner_queue = [] # Lista de endereços na fila
+        self.miner_queue = list(self.chain.fila_mineracao.keys())
 
         self._stop = threading.Event()
         threading.Thread(target=self._maintenance_loop, daemon=True, name="Pool-Maint").start()
-        log.info("PoolManager iniciado — Fase 1 (Bootstrap)")
+        log.info("PoolManager iniciado — Sincronizado com a Blockchain")
 
     def register(self, address: str, pubkey: str, miner_id: Optional[str] = None) -> dict:
         if not address or not address.startswith("brn1"): return {"ok": False, "msg": "address invalido"}
@@ -114,20 +119,13 @@ class PoolManager:
                 m = MinerState(miner_id, address, pubkey)
                 self.miners[miner_id] = m
                 log.info("pool: %s registado (addr=%s)", miner_id, address[:16])
-                
-                # [NOVO] Adiciona à fila se estiver na Fase 1
-                if self.phase == 1 and address not in self.miner_queue:
-                    self.miner_queue.append(address)
-                    log.info(f"[POOL] Minerador {address[:12]}... adicionado — Fila: {len(self.miner_queue)}/{self.phase2_threshold}")
-                    
-                    if len(self.miner_queue) >= self.phase2_threshold:
-                        self.phase = 2
-                        log.warning("=" * 60)
-                        log.warning("[BOOTSTRAP] 20 MINERADORES ATINGIDOS! REDE DESCENTRALIZADA ATIVADA.")
-                        log.warning("[POOL] Fase 2 — Recompensa 100% para quem encontrar o bloco.")
-                        log.warning("=" * 60)
             else:
                 m.address = address; m.pubkey = pubkey; m.last_seen = time.time()
+
+            # [FIX v4.1] Lê o estado real da blockchain
+            self.phase = 2 if self.chain.rede_descentralizada else 1
+            self.miner_queue = list(self.chain.fila_mineracao.keys())
+            
         return {"ok": True, "miner_id": miner_id}
 
     def heartbeat(self, miner_id: str, hashrate: float = 0.0, hashes_total: int = 0) -> dict:
@@ -142,8 +140,6 @@ class PoolManager:
     def disconnect(self, miner_id: str) -> dict:
         with self.lock:
             m = self.miners.pop(miner_id, None)
-            if m and m.address in self.miner_queue:
-                self.miner_queue.remove(m.address)
         return {"ok": True}
 
     def get_work(self, miner_id: str) -> dict:
@@ -177,8 +173,7 @@ class PoolManager:
             w = float(m.shares_period) + 1.0
             distribution[m.address] = {"pubkey": m.pubkey, "weight": w}
 
-        # [NOVO] Se estiver na Fase 2, a recompensa é 100% para quem encontrar.
-        # O blockchain.make_coinbase já trata da divisão 50/50 na Fase 1.
+        # Se estiver na Fase 2, a recompensa é 100% para quem encontrar.
         cb = _make_pool_coinbase(h, reward, distribution)
         
         try: mempool_txs = self.chain.db.all_mempool(limit=200)
@@ -259,6 +254,10 @@ class PoolManager:
 
     def stats(self) -> dict:
         with self.lock:
+            # [FIX v4.1] Lê o estado real da blockchain antes de gerar o status
+            self.phase = 2 if self.chain.rede_descentralizada else 1
+            self.miner_queue = list(self.chain.fila_mineracao.keys())
+
             now = time.time()
             active = [m for m in self.miners.values() if now - m.last_seen < MINER_TIMEOUT_S]
             total_hashrate = sum(m.hashrate for m in active)
@@ -292,8 +291,6 @@ class PoolManager:
                     gone = [mid for mid, m in self.miners.items() if now - m.last_seen > MINER_TIMEOUT_S * 3]
                     for mid in gone:
                         m = self.miners.pop(mid, None)
-                        if m and m.address in self.miner_queue:
-                            self.miner_queue.remove(m.address)
                         log.info("pool: miner %s removido (timeout)", mid)
                     if (self.current_job is None or self._job_is_stale(self.current_job)):
                         if self.miners: self._build_job_locked()
