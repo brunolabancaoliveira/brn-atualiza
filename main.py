@@ -145,14 +145,12 @@ POOL_ENABLED = os.environ.get("BRN_POOL_ENABLED", "1") == "1"
 PoolManager = None
 PoolClient = None
 
-# Sempre tenta importar o PoolClient (para o Windows conseguir minerar no Pool remoto)
 try:
     from miner_pool_client import PoolClient
     print("[Pool] PoolClient carregado OK")
 except Exception as _e:
     print("[AVISO] miner_pool_client indisponível: " + str(_e))
 
-# Só importa o PoolManager (Servidor) se estiver habilitado
 if POOL_ENABLED:
     try:
         from mining_pool import PoolManager
@@ -216,9 +214,8 @@ def parse_args():
     p.add_argument("--pool-stats", action="store_true")
     p.add_argument("--gui", action="store_true")
     p.add_argument("--no-gui", action="store_true")
-    # [FIX v13.6] Adicionado --pool-client e --no-pool-client
-    p.add_argument("--pool-client", action="store_true", help="Força iniciar PoolClient no boot")
-    p.add_argument("--no-pool-client", action="store_true", help="Não inicia PoolClient no boot")
+    p.add_argument("--pool-client", action="store_true")
+    p.add_argument("--no-pool-client", action="store_true")
     return p.parse_args()
 
 def _resolve_password(args) -> str:
@@ -560,7 +557,6 @@ def main():
     if pool: _inject_into_server("pool", pool, log)
     if trust_net: _inject_into_server("trust", trust_net, log)
 
-    # [FIX v13.6] Resolve conflito entre --pool-client e --no-pool-client
     disabled_pool_client = args.no_pool_client
     if args.pool_client:
         disabled_pool_client = False
