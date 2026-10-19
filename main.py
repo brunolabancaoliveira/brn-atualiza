@@ -1,13 +1,9 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.3)
+"""main.py — Entrypoint unificado do nó BRN (v13.5)
 ================================================================
-v13.3:
-  [FIX] Injeção do exposure_log (Teste A/B) em load_or_create_node_identity.
-  [FIX] PoolClient agora inicia no Windows (Cliente) via BRN_POOL_URL.
-v13.2:
-  [FIX] COMPLETO: main() agora tem try/except no bloco da senha.
-  [FIX] CRÍTICO: PoolClient usava senha errada.
-  [FIX] CRÍTICO: sync_manager injetado.
-  [NEW] Integração da Trust Network (Reputação)
+v13.5:
+  [FIX] Importação do PoolClient agora é independente do PoolManager.
+        Permite que o Cliente (Windows) minere no Pool remoto mesmo
+        com BRN_POOL_ENABLED=0.
 ================================================================
 """
 from __future__ import annotations
@@ -140,12 +136,20 @@ except Exception as _e:
 def _l2_disponivel() -> bool: return L2_ENABLED and btc_config and BTCWatcher and L2Manager
 
 # ============================================================
-# POOL
+# POOL [FIX v13.5]
 # ============================================================
 POOL_ENABLED = os.environ.get("BRN_POOL_ENABLED", "1") == "1"
 PoolManager = None
 PoolClient = None
 
+# Sempre tenta importar o PoolClient (para o Windows conseguir minerar no Pool remoto)
+try:
+    from miner_pool_client import PoolClient
+    print("[Pool] PoolClient carregado OK")
+except Exception as _e:
+    print("[AVISO] miner_pool_client indisponível: " + str(_e))
+
+# Só importa o PoolManager (Servidor) se estiver habilitado
 if POOL_ENABLED:
     try:
         from mining_pool import PoolManager
@@ -153,13 +157,6 @@ if POOL_ENABLED:
     except Exception as _e:
         print("[AVISO] mining_pool indisponível: " + str(_e))
         POOL_ENABLED = False
-
-    if POOL_ENABLED:
-        try:
-            from miner_pool_client import PoolClient
-            print("[Pool] PoolClient carregado OK")
-        except Exception as _e:
-            print("[AVISO] miner_pool_client indisponível: " + str(_e))
 
 def _pool_disponivel() -> bool: return POOL_ENABLED and PoolManager is not None
 
@@ -235,7 +232,7 @@ def _resolve_wallet_password() -> str:
     return (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip() or os.environ.get("BRN_NODE_PASSWORD", "").strip())
 
 # ============================================================
-# IDENTIDADE + A/B TEST [NOVO]
+# IDENTIDADE + A/B TEST
 # ============================================================
 def load_or_create_node_identity(password: str, rotate: bool = False):
     from crypto import Ed25519PrivateKey
@@ -256,7 +253,6 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
         save_wallet({"sk": sk.private_bytes_raw().hex(), "pub": pub_hex}, password, str(NODE_ID_PATH))
         log.info("Identidade nova criada: " + pub_hex[:16] + "...")
 
-    # [FIX v13.3] Injeção do Teste A/B
     try:
         from ab_test import get_variant, get_node_id_hash
         from security import set_node_id_hash, audit_log
@@ -269,7 +265,6 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
         log.info(f"Teste A/B: Variante atribuída -> {variant}")
     except Exception as e:
         log.warning(f"Falha ao registrar A/B test: {e}")
-    # -----------------------------------
 
     return sk, pub_hex
 
@@ -396,9 +391,9 @@ def run_wallet_main_thread():
     except Exception as e: get_logger("wallet").error("Falha: " + str(e))
 
 # ============================================================
-# POOL CLIENT [FIX v13.3]
+# POOL CLIENT
 # ============================================================
-def _setup_pool_client_local(chain, pool, log, disabled: bool):
+def _setup_pool_client_local(chain, pool, log, disabled: bool, is_origin_node: bool):
     if disabled: return None
     if PoolClient is None: return None
 
@@ -416,9 +411,8 @@ def _setup_pool_client_local(chain, pool, log, disabled: bool):
 
     if not addr.startswith("brn1") or not pub: return None
 
-    # [FIX v13.3] Se for cliente (Windows), lê o BRN_POOL_URL (Ubuntu)
     pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "http://127.0.0.1:5000")
-    if not _is_origin(False):
+    if not is_origin_node:
         pool_url = os.environ.get("BRN_POOL_URL", pool_url)
         
     try:
@@ -561,8 +555,7 @@ def main():
     if pool: _inject_into_server("pool", pool, log)
     if trust_net: _inject_into_server("trust", trust_net, log)
 
-    # [FIX v13.3] Inicia PoolClient para Origem OU Cliente
-    pool_client = _setup_pool_client_local(chain, pool, log, disabled=args.no_pool_client)
+    pool_client = _setup_pool_client_local(chain, pool, log, disabled=args.no_pool_client, is_origin_node=is_origin)
     if pool_client: _register_service("pool_client", pool_client)
 
     _setup_local_miner_broadcast(chain, p2p, log)
