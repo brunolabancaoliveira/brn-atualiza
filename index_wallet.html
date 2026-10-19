@@ -195,6 +195,18 @@
 <body>
 <div class="wrap">
 
+  <!-- CTA de Mineração (Variante B do Teste A/B) -->
+  <div id="abBanner" style="display:none; background: linear-gradient(90deg, #238636 0%, #2ea043 100%); padding: 16px; border-radius: 8px; margin-bottom: 20px; text-align: center; border: 2px solid #3fb950; box-shadow: 0 4px 12px rgba(46,160,67,0.3);">
+    <h2 style="color: #fff; margin: 0 0 10px 0;">⛏️ Ajude a rede a crescer!</h2>
+    <p style="color: #e6edf3; margin: 0 0 15px 0; font-size: 0.9rem;">
+      Estamos na Fase Bootstrap (<span id="abQueueCount">1</span>/20 mineradores). 
+      Minerar em pool garante <b>50% da recompensa</b> para você enquanto a rede não descentraliza.
+    </p>
+    <button id="abBtnMine" class="btn p big" style="background: #fff; color: #238636; font-weight: bold; border: none; padding: 10px 24px; font-size: 1rem; cursor: pointer;">
+      ▶️ Iniciar Mineração em Pool
+    </button>
+  </div>
+
   <header>
     <h1>🔷 <span>BRN</span> Wallet</h1>
     <div class="topbar">
@@ -588,6 +600,40 @@ function fmtUptime(sec) {
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   return h + "h " + m + "m";
+}
+
+// ============================================================
+// LÓGICA DO TESTE A/B
+// ============================================================
+async function checkABTest() {
+  try {
+    const res = await api("get_experiment_variant");
+    if (res.error) return;
+    
+    // Loga a exposição assim que a tela carrega (apenas se estiver pronto)
+    await api("log_exposure", res.variant);
+    
+    if (res.variant === "B") {
+      const banner = $("abBanner");
+      banner.style.display = "block";
+      
+      // Puxa o contador da fila real (do status da rede)
+      const st = await api("node_status");
+      if (st.ok) $("abQueueCount").textContent = st.fila_tamanho || 1;
+      
+      // Ação do botão do Banner
+      $("abBtnMine").onclick = function() {
+        // Redireciona para a aba de mineração e clica no botão original
+        document.querySelector('.tab[data-tab="enviar"]').click();
+        setTimeout(() => {
+          $("bMinerarPool").click();
+          banner.style.display = "none"; // Esconde após ação
+        }, 300);
+      };
+    }
+  } catch (e) {
+    console.error("Erro AB test:", e);
+  }
 }
 
 // ============================================================
@@ -1492,6 +1538,8 @@ async function boot() {
   configTabs();
   configEventos();
   $("apiLbl").textContent = "127.0.0.1:5000 · 8080";
+
+  await checkABTest(); // <--- CHAMADA DO TESTE A/B
 
   try {
     const w = await api("get_active_wallet");

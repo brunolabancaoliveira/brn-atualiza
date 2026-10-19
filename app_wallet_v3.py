@@ -1,4 +1,4 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.1)"""
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.2 - A/B Test)"""
 from __future__ import annotations
 import os
 import time
@@ -22,30 +22,74 @@ def _post(path: str, body: dict, timeout: float = None) -> dict:
         r = requests.post(url, json=body, timeout=timeout or API_TIMEOUT)
         try: return r.json()
         except Exception: return {"ok": False, "msg": f"HTTP {r.status_code}"}
-    except requests.exceptions.ReadTimeout: return {"ok": False, "msg": "Timeout"}
+    except requests.exceptions.ReadTimeout: return {"ok": False, "msg": "Timeout (servidor ocupado)"}
     except requests.exceptions.ConnectionError: return {"ok": False, "msg": "Servidor offline (:5000)"}
     except Exception as e: return {"ok": False, "msg": str(e)}
 
-def _get(path: str, timeout: float = 10.0) -> dict:
+def _get(path: str, timeout: float = 30.0) -> dict:
     import requests
     url = API_BASE.rstrip("/") + path
     try:
         r = requests.get(url, timeout=timeout)
         try: return r.json()
         except Exception: return {"error": f"HTTP {r.status_code}"}
+    except requests.exceptions.ReadTimeout: return {"error": "Timeout (servidor ocupado)"}
     except requests.exceptions.ConnectionError: return {"error": "Servidor offline (:5000)"}
     except Exception as e: return {"error": str(e)}
 
 class WalletApi:
     def __init__(self):
-        log.info("WalletApi v3.1 iniciada (API_BASE=%s)", API_BASE)
+        log.info("WalletApi v3.2 (A/B) iniciada (API_BASE=%s)", API_BASE)
+
+    # ========================================================
+    # EXPERIMENTO A/B
+    # ========================================================
+    def get_experiment_variant(self) -> dict:
+        try:
+            from secure_store import load_current_wallet
+            from ab_test import get_variant, get_node_id_hash
+            
+            senha = (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+                     or os.environ.get("BRN_NODE_PASSWORD", "").strip())
+            if not senha: return {"variant": "A", "error": "sem senha"}
+            
+            w = load_current_wallet(senha)
+            if not w or not w.get("ok"): 
+                return {"variant": "A", "error": "sem carteira"}
+            
+            node_id = w.get("address") or w.get("pubkey")
+            node_hash = get_node_id_hash(node_id)
+            
+            # Injeta o hash no security.py para os logs
+            from security import set_node_id_hash
+            set_node_id_hash(node_hash)
+            
+            variant = get_variant(node_hash)
+            log.info(f"A/B: node={node_hash} variant={variant}")
+            return {"variant": variant, "node_hash": node_hash}
+        except Exception as e:
+            log.error(f"A/B erro: {e}")
+            return {"variant": "A", "error": str(e)}
+
+    def log_exposure(self, variant: str) -> dict:
+        try:
+            from security import audit_log
+            audit_log("exposure_log", {
+                "experiment_id": "activation_v1",
+                "variant": variant,
+                "trigger_event": "wallet_open",
+                "rendered_flag": 1
+            })
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
 
     # ========================================================
     # NÓ / CHAIN
     # ========================================================
     def node_status(self) -> dict:
         try:
-            s = _get("/api/status", timeout=5.0)
+            s = _get("/api/status", timeout=30.0)
             if "error" in s and not s.get("height"):
                 return {"ok": False, "msg": s.get("error", "erro")}
             return {
@@ -67,7 +111,7 @@ class WalletApi:
 
     def sync_info(self) -> dict:
         try:
-            s = _get("/api/sync-info", timeout=5.0)
+            s = _get("/api/sync-info", timeout=30.0)
             if "erro" in s: return {"erro": s["erro"]}
             return s
         except Exception as e:
@@ -102,7 +146,7 @@ class WalletApi:
 
     def portfolio(self, address: str) -> dict:
         try:
-            s = _get(f"/api/portfolio/{address}", timeout=8.0)
+            s = _get(f"/api/portfolio/{address}", timeout=15.0)
             if "error" in s: return {"erro": s["error"]}
             return s.get("portfolio", {"BRN": 0, "KYC": 0})
         except Exception as e:
@@ -180,7 +224,7 @@ class WalletApi:
         except Exception as e: return {"ok": False, "msg": str(e)}
 
     def mining_status(self) -> dict:
-        try: return _get("/api/miner/status")
+        try: return _get("/api/miner/status", timeout=30.0)
         except Exception as e: return {"running": False, "error": str(e)}
 
     # ========================================================
@@ -222,11 +266,11 @@ class WalletApi:
             except Exception as e: return {"ok": False, "msg": str(e)}
 
     def pool_stats(self) -> dict:
-        try: return _get("/api/pool/stats", timeout=5.0)
+        try: return _get("/api/pool/stats", timeout=10.0)
         except Exception as e: return {"ok": False, "msg": str(e)}
 
     def pool_miners(self) -> dict:
-        try: return _get("/api/pool/miners", timeout=5.0)
+        try: return _get("/api/pool/miners", timeout=10.0)
         except Exception as e: return {"ok": False, "msg": str(e)}
 
     # ========================================================
@@ -244,5 +288,5 @@ class WalletApi:
     # UTIL
     # ========================================================
     def ping(self) -> dict:
-        try: return _get("/health", timeout=3.0)
+        try: return _get("/health", timeout=5.0)
         except Exception as e: return {"ok": False, "msg": str(e)}
