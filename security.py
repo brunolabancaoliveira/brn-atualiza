@@ -1,25 +1,15 @@
 """
-security.py — Camada de segurança HTTP do BRN (v4)
+security.py — Camada de segurança HTTP do BRN (v5 - A/B Testing)
 ================================================================
 Fornece:
   * RateLimiter         — janela deslizante em memória (single-node)
-  * RateLimiterMongo    — janela fixa distribuída (multi-node) [NOVO v4]
+  * RateLimiterMongo    — janela fixa distribuída (multi-node)
   * AuditLogger         — log JSON-lines com rotação por tamanho
-  * require_rate_limit  — decorator Flask (com headers X-RateLimit-*)
+  * require_rate_limit  — decorator Flask
   * ensure_self_signed_cert / get_ssl_context
   * get_client_ip       — respeita X-Forwarded-For com CIDR
-  * hash_short          — fingerprint seguro de chaves/endereços em logs
-
-v4:
-  [NEW] RateLimiterMongo — backend MongoDB para rate limit distribuído
-  [NEW] get_rate_limiter() — escolhe backend automaticamente
-  [NEW] Env BRN_RATE_LIMIT_BACKEND=memory|mongo|auto
-  [NEW] Fallback automático para memória se Mongo falhar
-  [NEW] Headers X-RateLimit-Backend (memory|mongo)
-v3:
-  mine 10→30/min (mineração aberta), miner_start 5→10/min
-v2:
-  audit.log com rotação, cleanup thread, CIDR, X-RateLimit-*
+  * hash_short          — fingerprint seguro
+  * set_node_id_hash    — [NOVO] Injeção do A/B test nos logs
 ================================================================
 """
 from __future__ import annotations
@@ -50,8 +40,7 @@ log = logging.getLogger("security")
 LOG_FILE          = os.environ.get("BRN_AUDIT_LOG", "audit.log")
 AUDIT_ENABLED     = os.environ.get("BRN_AUDIT_ENABLED", "1") == "1"
 try:
-    AUDIT_MAX_BYTES = int(os.environ.get("BRN_AUDIT_MAX_BYTES",
-                                          str(50 * 1024 * 1024)))
+    AUDIT_MAX_BYTES = int(os.environ.get("BRN_AUDIT_MAX_BYTES", str(50 * 1024 * 1024)))
 except (ValueError, TypeError):
     AUDIT_MAX_BYTES = 50 * 1024 * 1024
 try:
@@ -62,15 +51,11 @@ except (ValueError, TypeError):
     AUDIT_BACKUPS = 3
 
 _TRUSTED_RAW = os.environ.get("BRN_TRUSTED_PROXIES", "") or ""
-
-# Backend do rate limit
-_RATE_BACKEND = (os.environ.get("BRN_RATE_LIMIT_BACKEND", "auto")
-                 or "auto").strip().lower()
+_RATE_BACKEND = (os.environ.get("BRN_RATE_LIMIT_BACKEND", "auto") or "auto").strip().lower()
 
 CLEANUP_INTERVAL_S = 300
 BUCKET_MAX_IDLE_S  = 3600
 
-# Limites padrão por endpoint (req / 60s por IP)
 DEFAULT_RATE_LIMITS = {
     "mine":          (30,  60),
     "miner_start":   (10,  60),
@@ -99,7 +84,19 @@ DEFAULT_RATE_LIMITS = {
 
 
 # ============================================================
-# TRUSTED PROXIES (IP exato ou CIDR)
+# [A/B TEST] INJEÇÃO DO HASH DO USUÁRIO
+# ============================================================
+_node_id_hash = "unknown"
+
+def set_node_id_hash(node_id: str) -> None:
+    """Injeta o hash do node_id globalmente para os logs do A/B test."""
+    global _node_id_hash
+    if node_id:
+        _node_id_hash = node_id
+
+
+# ============================================================
+# TRUSTED PROXIES
 # ============================================================
 def _parse_trusted_proxies(raw: str) -> tuple[set, list]:
     ips: set = set()
@@ -162,7 +159,7 @@ def get_client_ip() -> str:
 
 
 # ============================================================
-# RATE LIMITER EM MEMÓRIA (single-node)
+# RATE LIMITER EM MEMÓRIA
 # ============================================================
 class RateLimiter:
     backend = "memory"
@@ -174,8 +171,7 @@ class RateLimiter:
         self._cleanup_every = cleanup_every
         self._hits = 0
 
-    def check(self, key: str, ip: str, limit: int,
-              window: int) -> tuple[bool, int, int]:
+    def check(self, key: str, ip: str, limit: int, window: int) -> tuple[bool, int, int]:
         now = time.time()
         bucket_key = (key, ip)
         with self._lock:
@@ -209,8 +205,7 @@ class RateLimiter:
             self._last_cleanup = now
         return removidos
 
-    def reset(self, key: Optional[str] = None,
-              ip: Optional[str] = None) -> int:
+    def reset(self, key: Optional[str] = None, ip: Optional[str] = None) -> int:
         removidos = 0
         with self._lock:
             for k in list(self._buckets.keys()):
@@ -266,12 +261,7 @@ class RateLimiterMongo:
             coll = db.rate_limits
             if not self._indexes_ok:
                 try:
-                    coll.create_index(
-                        "expires_at",
-                        expireAfterSeconds=0,
-                        name="ttl_expires_at",
-                        background=True,
-                    )
+                    coll.create_index("expires_at", expireAfterSeconds=0, name="ttl_expires_at", background=True)
                     self._indexes_ok = True
                 except Exception as e:
                     log.debug("rate_limits TTL index: %s", e)
@@ -280,8 +270,7 @@ class RateLimiterMongo:
             log.debug("mongo rate limit indisponível: %s", e)
             return None, False
 
-    def check(self, key: str, ip: str, limit: int,
-              window: int) -> tuple[bool, int, int]:
+    def check(self, key: str, ip: str, limit: int, window: int) -> tuple[bool, int, int]:
         coll, ok = self._get_collection()
         if not ok or coll is None:
             with self._lock:
@@ -328,17 +317,14 @@ class RateLimiterMongo:
     def cleanup(self, now: Optional[float] = None) -> int:
         return 0
 
-    def reset(self, key: Optional[str] = None,
-              ip: Optional[str] = None) -> int:
+    def reset(self, key: Optional[str] = None, ip: Optional[str] = None) -> int:
         coll, ok = self._get_collection()
         if not ok or coll is None:
             return self._fallback.reset(key, ip)
         try:
             q: dict = {}
-            if key:
-                q["key"] = key
-            if ip:
-                q["ip"] = ip
+            if key: q["key"] = key
+            if ip: q["ip"] = ip
             result = coll.delete_many(q)
             return result.deleted_count
         except Exception as e:
@@ -361,10 +347,8 @@ class RateLimiterMongo:
             h_mongo = self._hits_mongo
             h_fallback = self._hits_fallback
         if ok and coll is not None:
-            try:
-                n_docs = coll.estimated_document_count()
-            except Exception:
-                n_docs = -1
+            try: n_docs = coll.estimated_document_count()
+            except Exception: n_docs = -1
         else:
             n_docs = -1
         return {
@@ -381,7 +365,6 @@ class RateLimiterMongo:
 # ============================================================
 _limiter: Optional[Any] = None
 _limiter_lock = threading.Lock()
-
 
 def get_rate_limiter():
     global _limiter
@@ -413,7 +396,6 @@ def get_rate_limiter():
 
         return _limiter
 
-
 _limiter = get_rate_limiter()
 
 
@@ -422,7 +404,6 @@ _limiter = get_rate_limiter()
 # ============================================================
 _cleanup_started = [False]
 _cleanup_lock = threading.Lock()
-
 
 def _cleanup_loop() -> None:
     while True:
@@ -434,15 +415,12 @@ def _cleanup_loop() -> None:
         except Exception as e:
             log.debug("cleanup loop erro: %s", e)
 
-
 def _ensure_cleanup_started() -> None:
     with _cleanup_lock:
         if _cleanup_started[0]:
             return
         _cleanup_started[0] = True
-    threading.Thread(target=_cleanup_loop, daemon=True,
-                     name="SecurityCleanup").start()
-
+    threading.Thread(target=_cleanup_loop, daemon=True, name="SecurityCleanup").start()
 
 _ensure_cleanup_started()
 
@@ -460,10 +438,7 @@ def require_rate_limit(endpoint_key: str):
                 return ("", 200)
 
             ip = get_client_ip()
-            ok, retry, remaining = _limiter.check(
-                endpoint_key, ip, limit, window,
-            )
-
+            ok, retry, remaining = _limiter.check(endpoint_key, ip, limit, window)
             backend = getattr(_limiter, "backend", "memory")
 
             if not ok:
@@ -474,10 +449,7 @@ def require_rate_limit(endpoint_key: str):
                     "window":   window,
                     "backend":  backend,
                 })
-                resp = jsonify({
-                    "ok":  False,
-                    "msg": f"Muitas requisições. Tente em {retry}s.",
-                })
+                resp = jsonify({"ok":  False, "msg": f"Muitas requisições. Tente em {retry}s."})
                 resp.status_code = 429
                 resp.headers["Retry-After"]           = str(retry)
                 resp.headers["X-RateLimit-Limit"]     = str(limit)
@@ -502,11 +474,10 @@ def require_rate_limit(endpoint_key: str):
 
 
 # ============================================================
-# AUDIT LOG
+# AUDIT LOG (COM A/B TEST)
 # ============================================================
 _audit_lock = threading.RLock()
 _audit_fp = None
-
 
 def _open_audit():
     global _audit_fp
@@ -522,7 +493,6 @@ def _open_audit():
     except Exception as e:
         print(f"[audit] falha ao abrir {LOG_FILE}: {e}", file=sys.stderr)
         return None
-
 
 def _rotate_audit_if_needed() -> None:
     global _audit_fp
@@ -564,12 +534,10 @@ def _rotate_audit_if_needed() -> None:
         except Exception as e:
             print(f"[audit] rotação inesperada: {e}", file=sys.stderr)
 
-
 _SENSITIVE_KEYS = frozenset({
     "private_key", "priv", "sk", "secret", "password", "senha",
     "mnemonic", "seed", "x-brn-sk", "authorization",
 })
-
 
 def _sanitize(value: Any, depth: int = 0) -> Any:
     if depth > 6:
@@ -591,12 +559,10 @@ def _sanitize(value: Any, depth: int = 0) -> Any:
         return [_sanitize(v, depth + 1) for v in value[:50]]
     return value
 
-
 def hash_short(value: str, length: int = 12) -> str:
     if not value:
         return ""
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:length]
-
 
 def audit_log(event: str, data: Optional[dict] = None) -> None:
     if not AUDIT_ENABLED:
@@ -604,16 +570,21 @@ def audit_log(event: str, data: Optional[dict] = None) -> None:
     _rotate_audit_if_needed()
     try:
         ip = get_client_ip()
-        ua = (request.headers.get("User-Agent", "")[:120]
-              if request else "")
+        ua = (request.headers.get("User-Agent", "")[:120] if request else "")
     except Exception:
         ip, ua = "unknown", ""
+        
     payload = {
         "ts":    datetime.now(timezone.utc).isoformat(),
-        "event": event, "ip": ip, "ua": ua, "pid": os.getpid(),
+        "event": event, 
+        "ip":    ip, 
+        "ua":    ua, 
+        "pid":   os.getpid(),
+        "node_id_hash": _node_id_hash,  # <-- INJEÇÃO A/B TEST
     }
     if data:
         payload.update(_sanitize(data))
+        
     line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with _audit_lock:
         fp = _open_audit()
@@ -624,7 +595,6 @@ def audit_log(event: str, data: Optional[dict] = None) -> None:
                 print(f"[audit] write falhou: {e}", file=sys.stderr)
         else:
             print(f"[audit] {line}", file=sys.stderr, flush=True)
-
 
 def close_audit() -> None:
     global _audit_fp
@@ -641,11 +611,7 @@ def close_audit() -> None:
 CERT_FILE = os.environ.get("BRN_TLS_CERT", "brn_cert.pem")
 KEY_FILE  = os.environ.get("BRN_TLS_KEY",  "brn_key.pem")
 
-
-def ensure_self_signed_cert(cert_file: str = CERT_FILE,
-                            key_file: str = KEY_FILE,
-                            hostname: str = "127.0.0.1",
-                            days: int = 3650) -> tuple[str, str]:
+def ensure_self_signed_cert(cert_file: str = CERT_FILE, key_file: str = KEY_FILE, hostname: str = "127.0.0.1", days: int = 3650) -> tuple[str, str]:
     if os.path.exists(cert_file) and os.path.exists(key_file):
         return cert_file, key_file
     try:
@@ -692,10 +658,8 @@ def ensure_self_signed_cert(cert_file: str = CERT_FILE,
         f.write(cert.public_bytes(serialization.Encoding.PEM))
     return cert_file, key_file
 
-
 def https_enabled() -> bool:
     return os.environ.get("BRN_HTTPS", "0") == "1"
-
 
 def get_ssl_context() -> Optional[tuple[str, str]]:
     if not https_enabled():
@@ -729,6 +693,7 @@ def info() -> dict:
         "rate_backend_actual": getattr(_limiter, "backend", "?"),
         "rate_limits":        dict(DEFAULT_RATE_LIMITS),
         "limiter":            _limiter.stats(),
+        "node_id_hash":       _node_id_hash,
     }
 
 
@@ -739,28 +704,23 @@ def _cmd_info() -> int:
     print(json.dumps(info(), indent=2, ensure_ascii=False))
     return 0
 
-
 def _cmd_cleanup() -> int:
     n = _limiter.cleanup()
     print(f"cleanup: {n} buckets removidos")
     return 0
-
 
 def _cmd_reset_rate() -> int:
     n = _limiter.reset_all()
     print(f"reset: {n} buckets removidos")
     return 0
 
-
 def _cmd_rotate_audit() -> int:
     _rotate_audit_if_needed()
     print(f"rotação verificada.")
     return 0
 
-
 def _cli() -> int:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p = argparse.ArgumentParser(prog="security.py")
     p.add_argument("--info", action="store_true")
     p.add_argument("--cleanup", action="store_true")
@@ -773,7 +733,6 @@ def _cli() -> int:
     if args.rotate_audit: return _cmd_rotate_audit()
     p.print_help()
     return 0
-
 
 if __name__ == "__main__":
     try: sys.exit(_cli())
