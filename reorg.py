@@ -1,11 +1,14 @@
-"""reorg.py — Reorganização de cadeia (Chain Reorganization) BRN (v2.0)
+"""reorg.py — Reorganização de cadeia (Chain Reorganization) BRN (v2.1)
 ================================================================
+v2.1:
+  [FIX] CRÍTICO: find_fork_point agora detecta corretamente o fork
+        quando o lote remoto começa em local_h + 1 e o prev_hash
+        do primeiro bloco bate com o tip local.
+        Antes, o loop descendente não encontrava o ancestral e
+        retornava -1, travando o sync com "sem ancestral comum".
 v2.0:
-  [FIX] Desempate de forks na MESMA altura:
-        - Se work igual, escolhe o ramo com timestamp mais antigo.
-        - Se timestamp igual, escolhe o hash lexicograficamente menor.
-  [FIX] max_depth padrão aumentado para 200.
-  [NEW] Logs detalhados do motivo da decisão.
+  [FIX] Desempate de forks na MESMA altura por timestamp e hash.
+================================================================
 """
 from __future__ import annotations
 import logging
@@ -47,7 +50,9 @@ def _local_work_above(chain, fh):
         if b: total += _work(b.get("difficulty", 0))
     return total
 
-
+# ============================================================
+# [FIX v2.1] find_fork_point — detecta fork em local_h + 1
+# ============================================================
 def find_fork_point(chain, remote_blocks, max_depth=200):
     if not remote_blocks: return -1
     try: local_h = chain.db.height()
@@ -57,6 +62,19 @@ def find_fork_point(chain, remote_blocks, max_depth=200):
         try: remote_by_h[int(b["height"])] = b
         except Exception: continue
     if not remote_by_h: return -1
+
+    # [FIX] Se o lote começa exatamente no próximo bloco local,
+    # e o prev_hash do primeiro bloco remoto bate com o topo local,
+    # o ponto de fork é o próprio topo local.
+    min_remote_h = min(remote_by_h.keys())
+    if min_remote_h == local_h + 1:
+        lowest = remote_by_h[min_remote_h]
+        local_tip = chain.db.tip_hash()
+        if lowest.get("prev_hash") == local_tip:
+            log.info(f"[REORG] ancestral #{local_h} (tip local = prev_hash do lote)")
+            return local_h
+
+    # Fallback: procura o hash em comum
     start_h = min(local_h, max(remote_by_h.keys()))
     end_h = max(-1, start_h - max(1, int(max_depth)))
     for h in range(start_h, end_h - 1, -1):
@@ -69,7 +87,6 @@ def find_fork_point(chain, remote_blocks, max_depth=200):
 
 
 def _should_use_remote(chain, fork_h, blocks_to_add, local_h):
-    """Decide se vale a pena reorg. Regras do Bitcoin + desempate extra."""
     work_remote = _cum_work(blocks_to_add)
     work_local = _local_work_above(chain, fork_h)
     if work_remote > work_local:
@@ -78,26 +95,20 @@ def _should_use_remote(chain, fork_h, blocks_to_add, local_h):
     if work_remote < work_local:
         log.info(f"[REORG] work remoto {work_remote} < local {work_local}")
         return False, "work_menor"
-    # Mesma altura / mesmo work → desempate por timestamp e hash
     first_remote = blocks_to_add[0]
     first_local = chain.db.get_block(fork_h + 1)
-    if not first_local:
-        return True, "local_sem_bloco"
+    if not first_local: return True, "local_sem_bloco"
     ts_r = int(first_remote.get("timestamp", 0))
     ts_l = int(first_local.get("timestamp", 0))
     if ts_r < ts_l:
         log.warning(f"[REORG] timestamps: remoto #{ts_r} < local #{ts_l} → escolhe remoto")
         return True, "timestamp_mais_antigo"
     if ts_r > ts_l:
-        log.info(f"[REORG] timestamps: remoto #{ts_r} > local #{ts_l} → mantém local")
         return False, "timestamp_mais_novo"
-    # Último critério: hash menor (lexicográfico)
     hr = str(first_remote.get("hash", ""))
     hl = str(first_local.get("hash", ""))
     if hr < hl:
-        log.warning(f"[REORG] hash remoto menor → escolhe remoto")
         return True, "hash_menor"
-    log.info(f"[REORG] hash local menor → mantém local")
     return False, "hash_maior"
 
 
@@ -118,8 +129,7 @@ def _pre_validate(chain, fork_h, new_blocks):
         h = int(blk["height"])
         if h != expected_h: return False, f"esperado #{expected_h}, recebido #{h}"
         if blk.get("prev_hash") != prev_hash: return False, f"#{h} prev_hash não encadeia"
-        calc = block_hash(blk["prev_hash"], blk["merkle"], blk["timestamp"],
-                          blk["nonce"], blk["difficulty"])
+        calc = block_hash(blk["prev_hash"], blk["merkle"], blk["timestamp"], blk["nonce"], blk["difficulty"])
         if calc != blk.get("hash"): return False, f"#{h} hash inválido"
         if not meets_difficulty(calc, int(blk["difficulty"])): return False, f"#{h} PoW inválido"
         prev_hash = calc
