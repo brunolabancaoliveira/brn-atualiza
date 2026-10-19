@@ -1,11 +1,20 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.1)
+"""main.py — Entrypoint unificado do nó BRN (v13.2)
 ================================================================
+v13.2:
+  [NEW] Injeta P2P, Sync e Pool em server.py APÓS criar cada um
+        (sem isto, /api/pool/* e /api/sync/status devolvem 503)
+  [NEW] _init_http_server() aceita p2p/sync/pool e injeta internamente
+  [NEW] Logs explícitos das injeções (INFO ou WARN)
+  [FIX] Ordem de boot: HTTP → P2P → Sync → Pool → injeção retroativa
 v13.1:
   [FIX] Corrigido SyntaxError na linha 925 (try sem except)
   [NEW] Inicialização completa do PoolManager + PoolClient
   [NEW] Encerramento gracioso de todas as threads (HTTP, P2P, GUI)
 v13.0:
   [NEW] Pool client automático no nó ORIGEM
+v12.10:
+  [FIX] Aceita --gui e --no-gui
+  [FIX] Wallet() em vez de Wallet.create()
 ================================================================
 """
 from __future__ import annotations
@@ -20,6 +29,7 @@ import json
 import subprocess
 import urllib.request
 from pathlib import Path
+
 
 # ============================================================
 # BASE_DIR
@@ -90,6 +100,7 @@ _bootstrap_env()
 _applied = _apply_hardcoded_defaults()
 if _applied:
     print(f"[boot] defaults aplicados: {_applied} variáveis")
+
 
 # ============================================================
 # IMPORTS APÓS BOOTSTRAP
@@ -179,11 +190,17 @@ PoolClient = None
 if POOL_ENABLED:
     try:
         from mining_pool import PoolManager
-        from miner_pool_client import PoolClient
-        print("[Pool] Módulos de pool carregados OK")
+        print("[Pool] PoolManager carregado OK")
     except Exception as _e:
-        print("[AVISO] mining_pool/miner_pool_client indisponível: " + str(_e))
+        print("[AVISO] mining_pool indisponível: " + str(_e))
         POOL_ENABLED = False
+
+    try:
+        from miner_pool_client import PoolClient
+        print("[Pool] PoolClient carregado OK")
+    except Exception as _e:
+        print("[AVISO] miner_pool_client indisponível: " + str(_e))
+        PoolClient = None
 
 
 # ============================================================
@@ -311,7 +328,7 @@ def _verify_chain(chain) -> str:
     valid = getattr(r, "valid", None)
     if valid is None:
         valid = bool(r)
-    
+
     if valid:
         log.info(f"OK cadeia íntegra ({dt:.2f}s)")
         return "ok"
@@ -321,9 +338,55 @@ def _verify_chain(chain) -> str:
 
 
 # ============================================================
+# [NEW v13.2] INJEÇÕES NO SERVER.PY
+# ============================================================
+def _inject_into_server(what: str, obj) -> bool:
+    """
+    Injeta um manager no server.py.
+    Retorna True se conseguiu, False se server.py não está disponível
+    ou não tem o setter (versões antigas).
+    """
+    log = get_logger("server_inject")
+    setter_name = {
+        "p2p":  "set_p2p_manager",
+        "sync": "set_sync_manager",
+        "pool": "set_pool_manager",
+    }.get(what)
+
+    if setter_name is None:
+        log.warning(f"[inject] tipo desconhecido: {what}")
+        return False
+
+    try:
+        import server as _srv
+        setter = getattr(_srv, setter_name, None)
+        if setter is None:
+            log.warning(
+                f"[inject] server.py NAO tem {setter_name}() — "
+                f"atualize o server.py para v9.9.7+"
+            )
+            return False
+        setter(obj)
+        log.info(f"[inject] {what} injetado em server.py")
+        return True
+    except ImportError:
+        log.warning("[inject] server.py indisponível (import falhou)")
+        return False
+    except Exception as e:
+        log.warning(f"[inject] {what} falhou: {e}")
+        return False
+
+
+# ============================================================
 # HTTP / EXPLORER
 # ============================================================
-def _init_http_server(chain, log):
+def _init_http_server(chain, log, p2p=None, sync=None, pool=None):
+    """
+    Importa server.py, chama set_chain() e (se v9.9.7+)
+    set_p2p_manager / set_sync_manager / set_pool_manager.
+
+    Retorna a instância Flask (app) ou None se falhar.
+    """
     try:
         from server import (
             app as http_app,
@@ -334,12 +397,27 @@ def _init_http_server(chain, log):
         log.error("Falha importando server.py: " + str(e))
         return None
 
+    # 1. Chain (obrigatório)
     try:
         set_chain(chain)
+        log.info("server.py: chain injetada")
     except Exception as e:
         log.error("Falha set_chain: " + str(e))
         return None
 
+    # 2. P2P (opcional — só se server.py for v9.9.7+)
+    if p2p is not None:
+        _inject_into_server("p2p", p2p)
+
+    # 3. Sync (opcional)
+    if sync is not None:
+        _inject_into_server("sync", sync)
+
+    # 4. Pool (opcional)
+    if pool is not None:
+        _inject_into_server("pool", pool)
+
+    # 5. Auto-registro de carteira
     try:
         reg = auto_registrar_carteira_atual()
         if reg.get("ok"):
@@ -415,6 +493,13 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None):
                    + " Peers=" + str(peer_count)
                    + " Mempool=" + str(mempool_n)
                    + " UTXOs=" + str(utxos_n))
+
+            if sync is not None:
+                try:
+                    s = sync.get_status()
+                    msg += (" Sync=" + str(s.get("progress", 0)) + "%")
+                except Exception:
+                    pass
 
             if pool_client is not None:
                 try:
@@ -544,7 +629,7 @@ def main():
     )
     chain._fork_signal = threading.Event()
 
-    if args.skip_verify == False:
+    if not args.skip_verify:
         status = _verify_chain(chain)
         if status == "invalid":
             log.error("Cadeia inválida. Abortando.")
@@ -554,17 +639,7 @@ def main():
         log.info("Apenas verificação. Encerrando.")
         return 0
 
-    # --- Inicializa o servidor HTTP (Flask) ---
-    http_app = _init_http_server(chain, log)
-    if http_app is None:
-        return 1
-    http_thread = threading.Thread(
-        target=run_http, args=(http_app,), daemon=True, name="HTTP"
-    )
-    http_thread.start()
-    _register_service("http", http_thread)
-
-    # --- Inicializa o P2P ---
+    # --- Inicializa o P2P (antes do HTTP, para já injetar) ---
     p2p = None
     if not args.no_p2p:
         try:
@@ -575,8 +650,9 @@ def main():
             log.info(f"P2P iniciado na porta {cfg['p2p_port']}")
         except Exception as e:
             log.error("Falha ao iniciar P2P: " + str(e))
+            p2p = None
 
-    # --- Inicializa o Sync ---
+    # --- Inicializa o Sync (antes do HTTP, para já injetar) ---
     sync = None
     if not args.no_sync and p2p is not None:
         try:
@@ -587,43 +663,97 @@ def main():
             log.info("Sync iniciado")
         except Exception as e:
             log.warning("Falha ao iniciar Sync: " + str(e))
+            sync = None
 
-    # --- Inicializa o Pool ---
+    # --- Inicializa o Pool (antes do HTTP, para já injetar) ---
     pool = None
-    pool_client = None
     if not args.no_pool and POOL_ENABLED:
         try:
             pool = PoolManager(chain)
             _register_service("pool", pool)
             log.info("PoolManager iniciado")
-            
-            if not args.no_pool_client and is_origin:
-                pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "http://127.0.0.1:5000")
-                pool_client = PoolClient(
-                    address=cfg["web_user"], # Fallback, idealmente a carteira ativa
-                    pubkey=node_pub,
-                    pool_url=pool_url
-                )
-                pool_client.start_mining()
-                _register_service("pool_client", pool_client)
-                log.info("PoolClient (auto-mineração) iniciado")
         except Exception as e:
-            log.warning("Falha ao iniciar Pool: " + str(e))
+            log.warning("Falha ao iniciar PoolManager: " + str(e))
+            pool = None
+
+    # --- Inicializa o servidor HTTP (AGORA com p2p/sync/pool) ---
+    http_app = _init_http_server(chain, log, p2p=p2p, sync=sync, pool=pool)
+    if http_app is None:
+        log.error("Falha ao inicializar servidor HTTP. Abortando.")
+        return 1
+
+    http_thread = threading.Thread(
+        target=run_http, args=(http_app,), daemon=True, name="HTTP"
+    )
+    http_thread.start()
+    _register_service("http", http_thread)
+
+    # --- Inicia o PoolClient (auto-mineração do nó ORIGEM) ---
+    pool_client = None
+    if (pool is not None
+            and not args.no_pool_client
+            and is_origin
+            and PoolClient is not None):
+        try:
+            pool_url = os.environ.get("BRN_POOL_URL_LOCAL",
+                                      "http://127.0.0.1:5000")
+
+            # pega endereço/pubkey da carteira ativa
+            w = {"address": "", "pubkey": ""}
+            try:
+                from secure_store import load_current_wallet
+                session_pass = os.environ.get("BRN_WALLET_SESSION_PASS", "")
+                wd = load_current_wallet(session_pass)
+                if wd.get("ok"):
+                    w = {
+                        "address": wd.get("address", ""),
+                        "pubkey": (wd.get("public_key")
+                                   or wd.get("pubkey")
+                                   or wd.get("pub_hex")
+                                   or ""),
+                    }
+            except Exception as e:
+                log.warning(f"PoolClient: carteira ativa indisponível: {e}")
+
+            if w.get("address") and w.get("pubkey"):
+                pool_client = PoolClient(
+                    address=w["address"],
+                    pubkey=w["pubkey"],
+                    pool_url=pool_url,
+                )
+                ok, msg = pool_client.start_mining()
+                if ok:
+                    _register_service("pool_client", pool_client)
+                    log.info(f"PoolClient iniciado ({msg})")
+                else:
+                    log.warning(f"PoolClient start falhou: {msg}")
+            else:
+                log.info("PoolClient: sem carteira ativa — pulado")
+        except Exception as e:
+            log.warning("Falha ao iniciar PoolClient: " + str(e))
+            pool_client = None
 
     # --- Inicia a Mineração Solo (se solicitado) ---
     if args.mine or AUTO_MINE:
         from miner_loop import get_miner
         miner = get_miner(chain)
-        w = {"address": "brn1qxyzk7y0v2j4g0a8d9n5t2k7h4s6w8c9p2e", "pubkey": "02"+"aa"*32} # Placeholder
+
+        w = {"address": "", "pubkey": ""}
         try:
             from secure_store import load_current_wallet
             session_pass = os.environ.get("BRN_WALLET_SESSION_PASS", "")
-            wallet_data = load_current_wallet(session_pass)
-            if wallet_data.get("ok"):
-                w = wallet_data
+            wd = load_current_wallet(session_pass)
+            if wd.get("ok"):
+                w = {
+                    "address": wd.get("address", ""),
+                    "pubkey": (wd.get("public_key")
+                               or wd.get("pubkey")
+                               or wd.get("pub_hex")
+                               or ""),
+                }
         except Exception:
             pass
-            
+
         if w.get("address"):
             ok, msg = miner.start(w["address"], w.get("pubkey", ""))
             log.info(f"Miner auto-start: {msg}")
