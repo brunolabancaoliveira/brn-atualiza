@@ -207,14 +207,21 @@ def analyze(log_file: str):
     print(" 📝 VEREDITO (Sugestão baseada nos 4 Gates)")
     print("="*70)
     
-    if not srm_ok:
+    z = locals().get('z_score', 0)
+    
+    if total_exp < 50:
+        print(f"  ⏳ HOLD: Amostra muito pequena ({total_exp} exposições).")
+        print("     Continue coletando dados até ter pelo menos 50 usuários por variante.")
+    elif not srm_ok:
         print("  ❌ RERUN: O split A/B está desbalanceado. Corrija o hash antes de continuar.")
-    elif abs(lift) > 0 and abs(locals().get('z_score', 0)) >= 1.96 and lift > 0:
+    elif abs(z) >= 1.96 and lift > 0:
         print("  ✅ SHIP: A Variante B (Banner) aumentou a ativação de forma significativa.")
         print("     Recomendação: Desligar o A/B test e deixar o Banner ligado para 100% dos usuários.")
+    elif abs(z) >= 1.96 and lift < 0:
+        print("  ❌ KILL: A Variante B DIMINUIU a ativação. Reverta para a tela original.")
     else:
         print("  ⏳ HOLD: Nenhuma diferença estatisticamente significativa observada até agora.")
-        print("     Recomendação: Manter o teste rodando ou avaliar qualitativamente (Fogg).")
+        print("     Recomendação: Manter o teste rodando.")
     
     print("="*70)
 
