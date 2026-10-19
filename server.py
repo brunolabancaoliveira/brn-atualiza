@@ -7,18 +7,7 @@ v9.9.9:
   [FIX] Adicionado campo 'forking' na resposta de /api/sync/status.
   [NEW] Integração completa da Trust Network (set_trust_network
         e rotas /api/trust/*).
-v9.9.8:
-  [FIX CRÍTICO] /api/l2/claim agora consulta BTC on-chain ANTES de
-        creditar BRN. Antes passava btc_amount_sats=esperado (o valor
-        do escrow) em vez do valor REALMENTE recebido. Um atacante
-        podia pagar 0.0001 BTC e receber o BRN de 1 BTC.
-  [FIX] HDWalletManager com import defensivo (try/except). Se o
-        wallet.py não tiver a classe, o server sobe mesmo assim.
-  [FIX] /api/miner/status alinhado com miner_loop v6.8:
-        hashes_done → hashes_total, hashes_done → hashes_done,
-        eta_seconds → eta_seconds (opcional).
-  [NEW] set_p2p_manager / set_sync_manager / set_pool_manager
-        expostos para o main.py v13.1 injetar.
+  [NEW] Rota /api/experiment/variant para o Teste A/B.
 ================================================================
 """
 from __future__ import annotations
@@ -485,6 +474,23 @@ def bootstrap_add():
         })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# TESTE A/B: VARIANTE [NOVO]
+# ============================================================
+@app.route("/api/experiment/variant", methods=["GET"])
+def get_experiment_variant():
+    try:
+        from ab_test import get_variant
+        import security
+        
+        node_hash = getattr(security, "_node_id_hash", "unknown")
+        variant = get_variant(node_hash)
+        
+        return jsonify({"ok": True, "variant": variant})
+    except Exception as e:
+        return jsonify({"ok": False, "variant": "A", "msg": str(e)}), 500
 
 
 # ============================================================
@@ -1053,7 +1059,6 @@ def miner_status():
             "uptime": st.get("uptime", 0),
             "consecutive_failures": st.get("consecutive_failures", 0),
             "hashrate": st.get("hashrate", 0.0),
-            # [FIX v9.9.8] miner_loop v6.8 expõe hashes_total, não hashes_done
             "hashes_done": st.get("hashes_total", st.get("hashes_done", 0)),
             "hashes_total": st.get("hashes_total", 0),
             "eta_seconds": st.get("eta_seconds"),
