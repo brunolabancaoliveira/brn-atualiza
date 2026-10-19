@@ -1,16 +1,17 @@
 @echo off
 REM ============================================================
-REM   iniciar.bat - BRN Node CLIENTE (Windows) - v5
+REM   iniciar.bat - BRN Node CLIENTE (Windows) - v6
 REM ============================================================
+REM   v6:
+REM     [NEW] Adiciona opcao --no-pool-client (padrao no Windows)
+REM           para evitar mineracao duplicada no Pool.
+REM     [NEW] Argumento --pool-client para forcar o cliente local.
 REM   v5:
 REM     [FIX] Remove sintaxe bash que quebrava o resumo
 REM     [FIX] Lista de arquivos obrigatorios completa
 REM     [NEW] Auto-detecta IP Tailscale do peer
 REM     [NEW] Cria pasta contracts/ se faltar
 REM     [NEW] Verifica escrow_btc_brn/factory/vm
-REM   v4:
-REM     [NEW] Verifica Tailscale antes de subir
-REM     [NEW] Faz tailscale ping no peer do brn_network.env
 REM ============================================================
 
 setlocal EnableDelayedExpansion
@@ -27,25 +28,37 @@ REM -------- Argumentos --------
 set "SKIP_TAILSCALE=0"
 set "FORCE_GUI=0"
 set "FORCE_NO_GUI=0"
+REM [NOVO v6] Por padrao, NAO inicia PoolClient local no Windows
+set "NO_POOL_CLIENT=1"
 
 :parse_args
 if "%~1"=="" goto args_done
-if /i "%~1"=="--skip-tailscale" set "SKIP_TAILSCALE=1"
-if /i "%~1"=="--gui"            set "FORCE_GUI=1"
-if /i "%~1"=="--no-gui"         set "FORCE_NO_GUI=1"
-if /i "%~1"=="-h"               goto show_help
-if /i "%~1"=="--help"           goto show_help
+if /i "%~1"=="--skip-tailscale"  set "SKIP_TAILSCALE=1"
+if /i "%~1"=="--gui"             set "FORCE_GUI=1"
+if /i "%~1"=="--no-gui"          set "FORCE_NO_GUI=1"
+if /i "%~1"=="--no-pool-client"  set "NO_POOL_CLIENT=1"
+if /i "%~1"=="--pool-client"     set "NO_POOL_CLIENT=0"
+if /i "%~1"=="-h"                goto show_help
+if /i "%~1"=="--help"            goto show_help
 shift
 goto parse_args
 
 :show_help
-echo Uso: iniciar.bat [--skip-tailscale] [--gui] [--no-gui]
+echo Uso: iniciar.bat [--skip-tailscale] [--gui] [--no-gui] [--no-pool-client] [--pool-client]
+echo.
+echo   --skip-tailscale    Nao verifica Tailscale
+echo   --gui               Forca abrir a GUI (carteira)
+echo   --no-gui            Forca modo headless (sem GUI)
+echo   --no-pool-client    [PADRAO] Nao inicia PoolClient no boot
+echo                       (o botao "Minerar Pool" da carteira cuida)
+echo   --pool-client       Forca iniciar PoolClient no boot
+echo                       (pode causar 2 mineradores se clicar no botao)
 exit /b 0
 
 :args_done
 
 echo ============================================================
-echo   BRN Node - CLIENTE (sincroniza da Maquina A) - v5
+echo   BRN Node - CLIENTE (sincroniza da Maquina A) - v6
 echo ============================================================
 echo.
 
@@ -218,10 +231,6 @@ if "%TS_PEER_IP%"=="" (
     if not "!TS_PEER_IP!"=="" (
         echo [ok] Peer detectado: !TS_PEER_IP!
         set "BRN_BOOTSTRAP_PEERS=!TS_PEER_IP!:6001"
-        REM salva de volta no env
-        (
-            echo !BRN_BOOTSTRAP_PEERS!
-        ) > nul
     )
 )
 
@@ -294,10 +303,20 @@ if "%HEADLESS_FLAG%"=="--headless" set "GUI_STATUS=HEADLESS"
 echo.
 
 REM ============================================================
-REM  8) RESOLVE ADMIN TOKEN STATUS (sintaxe batch correta)
+REM  8) RESOLVE ADMIN TOKEN STATUS
 REM ============================================================
 set "ADMIN_STATUS=NAO"
 if not "%BRN_ADMIN_TOKEN%"=="" set "ADMIN_STATUS=SIM"
+
+REM ============================================================
+REM  8.5) [NOVO v6] POOL CLIENT FLAG
+REM ============================================================
+set "POOL_CLIENT_FLAG="
+set "POOL_CLIENT_STATUS=ENABLED (padrao do main.py)"
+if "%NO_POOL_CLIENT%"=="1" (
+    set "POOL_CLIENT_FLAG=--no-pool-client"
+    set "POOL_CLIENT_STATUS=DISABLED (evita duplicidade)"
+)
 
 REM ============================================================
 REM  9) VERSAO main.py
@@ -324,6 +343,7 @@ echo   HTTP       : http://0.0.0.0:%BRN_WEB_PORT%
 echo   Explorer   : http://0.0.0.0:%BRN_EXPLORER_PORT%
 echo   Python     : %PYVER%
 echo   pywebview  : %GUI_STATUS%
+echo   PoolClient : %POOL_CLIENT_STATUS%
 echo   Tailscale  : %MY_TS_IP%  -^>  %TS_PEER_IP%
 echo ============================================================
 echo.
@@ -340,7 +360,7 @@ REM ============================================================
 echo [*] Iniciando CLIENTE BRN... ^(Ctrl+C para encerrar^)
 echo.
 
-%PY% main.py --client-mode %HEADLESS_FLAG%
+%PY% main.py --client-mode %HEADLESS_FLAG% %POOL_CLIENT_FLAG%
 set "EXITCODE=%ERRORLEVEL%"
 
 echo.
