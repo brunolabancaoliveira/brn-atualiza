@@ -5,6 +5,8 @@ v9.9.9:
   [FIX] /api/sync/status com fallback para altura real caso o
         sync_manager retorne -1 (painel mostrando -1).
   [FIX] Adicionado campo 'forking' na resposta de /api/sync/status.
+  [NEW] Integração completa da Trust Network (set_trust_network
+        e rotas /api/trust/*).
 v9.9.8:
   [FIX CRÍTICO] /api/l2/claim agora consulta BTC on-chain ANTES de
         creditar BRN. Antes passava btc_amount_sats=esperado (o valor
@@ -133,7 +135,7 @@ CHAIN = _LazyChain()
 
 
 # ============================================================
-# P2P / POOL / SYNC MANAGERS
+# P2P / POOL / SYNC / TRUST MANAGERS
 # ============================================================
 _P2P_MANAGER = None
 _P2P_LOCK = threading.Lock()
@@ -178,6 +180,21 @@ def set_sync_manager(sync) -> None:
 
 def _get_sync_manager():
     return _SYNC_MANAGER
+
+
+_TRUST_NETWORK = None
+_TRUST_LOCK = threading.Lock()
+
+
+def set_trust_network(trust) -> None:
+    global _TRUST_NETWORK
+    with _TRUST_LOCK:
+        _TRUST_NETWORK = trust
+    log.info(f"server: TrustNetwork {'injetada' if trust else 'removida'}")
+
+
+def _get_trust_network():
+    return _TRUST_NETWORK
 
 
 # ============================================================
@@ -1497,7 +1514,7 @@ def hd_derive():
 
 
 # ============================================================
-# PEERS SCORE
+# PEERS SCORE / TRUST NETWORK
 # ============================================================
 @app.route("/api/peers/score", methods=["GET"])
 def peers_score():
@@ -1523,6 +1540,34 @@ def peers():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/trust/stats", methods=["GET"])
+@require_rate_limit("status")
+def trust_stats():
+    trust = _get_trust_network()
+    if trust is None:
+        return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
+    try:
+        stats = trust.get_network_stats()
+        return jsonify({"ok": True, **stats})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/trust/nodes", methods=["GET"])
+@require_rate_limit("status")
+def trust_nodes():
+    trust = _get_trust_network()
+    if trust is None:
+        return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
+    try:
+        limit = int(request.args.get("limit", 100))
+        nodes = list(trust.nodes.values()) if hasattr(trust, "nodes") else []
+        nodes.sort(key=lambda x: x.get("trust_score", 0), reverse=True)
+        return jsonify({"ok": True, "count": len(nodes), "nodes": nodes[:limit]})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 # ============================================================
@@ -2099,6 +2144,7 @@ def health():
             "sync_injected": _SYNC_MANAGER is not None,
             "p2p_injected": _P2P_MANAGER is not None,
             "pool_injected": _POOL_MANAGER is not None,
+            "trust_injected": _TRUST_NETWORK is not None,
             "hd_wallet": _HAS_HD,
             "mode": "modo2_aberto",
             "version": "9.9.9",
@@ -2136,7 +2182,7 @@ def _shutdown():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.9 (Bootstrap P2P Sync + L2 Claim FIX)")
+    print(f"BRN Server v9.9.9 (Bootstrap P2P Sync + L2 Claim FIX + Trust Network)")
     print(f"  → http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
