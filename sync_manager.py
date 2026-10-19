@@ -1,11 +1,9 @@
 """
-sync_manager.py — Sincronização + Reorg automático (v8.5)
+sync_manager.py — Sincronização + Reorg automático (v8.7)
 ================================================================
-v8.5:
-  [FIX] CRÍTICO: _refresh_peers_from_p2p agora usa P2PClient.send_message
-        diretamente para buscar a altura, com timeout explícito.
-v8.4:
-  [FIX] _refresh_peers_from_p2p com fallback para lista crua de peers.
+v8.7:
+  [FIX] _refresh_peers_from_p2p agora IGNORA o cache do P2P e
+        sempre pergunta a altura real via P2PClient.send_message.
 ================================================================
 """
 from __future__ import annotations
@@ -21,9 +19,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 log = logging.getLogger("sync")
 
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
 NETWORK_MAGIC      = b"BRN5"
 MAX_MSG_SIZE       = 8 * 1024 * 1024
 DEFAULT_TIMEOUT    = 10.0
@@ -37,9 +32,6 @@ REORG_FETCH_BATCH    = int(os.environ.get("BRN_REORG_FETCH_BATCH", "200"))
 REORG_MAX_FAILS      = int(os.environ.get("BRN_REORG_MAX_FAILS", "3"))
 REORG_COOLDOWN_S     = float(os.environ.get("BRN_REORG_COOLDOWN_S", "60"))
 
-# ============================================================
-# TIPOS
-# ============================================================
 @dataclass
 class PeerStatus:
     node_id: str
@@ -70,9 +62,6 @@ class SyncStatus:
     reorgs_total: int = 0
     last_reorg_height: int = -1
 
-# ============================================================
-# ChainSyncManager
-# ============================================================
 class ChainSyncManager:
 
     def __init__(self, blockchain, db, p2p_manager,
@@ -143,17 +132,12 @@ class ChainSyncManager:
         return self._fork_signal.is_set()
 
     def _safe_height(self) -> int:
-        try:
-            h = int(self.chain.db.height())
-        except Exception:
-            return -1
-        return max(-1, h)
+        try: return max(-1, int(self.chain.db.height()))
+        except Exception: return -1
 
     def _local_work(self) -> int:
-        try:
-            return int(self.chain.cumulative_work())
-        except Exception:
-            return 0
+        try: return int(self.chain.cumulative_work())
+        except Exception: return 0
 
     def _peer_is_blocked(self, peer_id: str) -> bool:
         with self._reorg_fails_lock:
@@ -178,21 +162,18 @@ class ChainSyncManager:
     def _detect_fork(self) -> Optional[PeerStatus]:
         local_work = self._local_work()
         local_h = self._safe_height()
-        best = None
-        best_work = local_work
+        best, best_work = None, local_work
         with self.peer_lock: snapshot = list(self.peers.values())
         for p in snapshot:
             if p.height <= local_h: continue
             if self._peer_is_blocked(p.node_id): continue
             threshold_factor = 1.0 + (REORG_WORK_THRESHOLD / 100.0)
             if p.cumulative_work > best_work * threshold_factor:
-                best = p
-                best_work = p.cumulative_work
+                best, best_work = p, p.cumulative_work
         return best
 
     def _fetch_chain_from(self, peer: PeerStatus, start: int, end: int) -> List[Dict]:
-        all_blocks = []
-        cursor = start
+        all_blocks, cursor = [], start
         while cursor < end:
             batch_end = min(cursor + REORG_FETCH_BATCH, end)
             try:
@@ -200,9 +181,7 @@ class ChainSyncManager:
             except Exception as e:
                 log.warning(f"_fetch_chain_from({cursor}-{batch_end}): {e}")
                 return all_blocks
-            if not resp or "blocks" not in resp:
-                log.debug(f"_fetch_chain_from: resposta vazia em {cursor}")
-                return all_blocks
+            if not resp or "blocks" not in resp: return all_blocks
             batch = resp["blocks"]
             if not batch: break
             all_blocks.extend(batch)
@@ -222,10 +201,8 @@ class ChainSyncManager:
                 target_h = peer.height
                 start = max(0, local_h - REORG_LOOKBACK)
                 end = target_h + 1
-                log.info(f"[REORG] baixando #{start}...#{target_h} do peer")
                 all_blocks = self._fetch_chain_from(peer, start, end)
                 if not all_blocks:
-                    log.warning("[REORG] nenhum bloco recebido")
                     self._peer_record_fail(peer_id)
                     return False
                 common_h = -1
@@ -236,24 +213,20 @@ class ChainSyncManager:
                     if local_blk and local_blk["hash"] == blk["hash"]:
                         if h > common_h: common_h = h
                 if common_h < 0:
-                    log.warning(f"[REORG] sem ancestral comum")
                     self._peer_record_fail(peer_id)
                     return False
                 new_blocks = [b for b in all_blocks if common_h < int(b.get("height", -1)) <= target_h]
                 if not new_blocks:
-                    log.warning(f"[REORG] nenhum bloco novo (comum={common_h})")
                     self._peer_record_fail(peer_id)
                     return False
-                log.warning(f"[REORG] ancestral #{common_h}, nova cadeia com {len(new_blocks)} blocos")
                 if not hasattr(self.chain, "reorg_to"):
-                    log.error("[REORG] blockchain sem método reorg_to()")
                     self._peer_record_fail(peer_id)
                     return False
                 ok, msg = self.chain.reorg_to(new_blocks)
                 if ok:
                     self.status.reorgs_total += 1
                     self.status.last_reorg_height = common_h
-                    log.warning(f"[REORG] OK — fork resolvido em #{common_h} ({msg})")
+                    log.warning(f"[REORG] OK — fork resolvido em #{common_h}")
                     self._peer_record_success(peer_id)
                     return True
                 else:
@@ -268,11 +241,15 @@ class ChainSyncManager:
                 self.status.forking = False
                 self._fork_signal.clear()
 
+    # ══════════════════════════════════════════════════════════════
+    # [FIX v8.7] Sempre pergunta a altura real, ignora cache
+    # ══════════════════════════════════════════════════════════════
     def _refresh_peers_from_p2p(self) -> int:
         p2p = self.p2p
         if p2p is None: return 0
         count = 0
         disc = getattr(p2p, "discovery", None)
+        
         peers_info = []
         if disc is not None and hasattr(disc, "listar_peers_com_altura"):
             try: peers_info = disc.listar_peers_com_altura() or []
@@ -288,17 +265,21 @@ class ChainSyncManager:
             ip, _, port_s = addr.rpartition(":")
             try: port = int(port_s)
             except ValueError: continue
-            height = int(p.get("height", 0) or 0)
-            work = int(p.get("work", 0) or 0)
-            if height == 0:
-                try:
-                    from p2p_unified import P2PClient
-                    # [FIX] Usa send_message direto que aceita timeout
-                    resp, _ = P2PClient.send_message(ip, port, {"type": "get_chain_height"}, timeout=2.0)
-                    if resp:
-                        height = int(resp.get("height", 0))
-                        work = int(resp.get("work", 0))
-                except Exception: pass
+            
+            # [FIX] Ignora o cache e SEMPRE pergunta a altura real
+            try:
+                from p2p_unified import P2PClient
+                resp, _ = P2PClient.send_message(ip, port, {"type": "get_chain_height"}, timeout=10.0)
+                if resp:
+                    height = int(resp.get("height", 0))
+                    work = int(resp.get("work", 0))
+                else:
+                    height = int(p.get("height", 0) or 0)
+                    work = int(p.get("work", 0) or 0)
+            except Exception:
+                height = int(p.get("height", 0) or 0)
+                work = int(p.get("work", 0) or 0)
+            
             self.register_peer(addr, ip, port, height, work)
             count += 1
         return count
@@ -327,8 +308,7 @@ class ChainSyncManager:
         except Exception: return False
 
     def apply_block_batch(self, blocks: List[Dict]) -> Tuple[int, int]:
-        applied = 0
-        failed = 0
+        applied, failed = 0, 0
         for block_data in blocks:
             try:
                 h = block_data.get("height")
@@ -360,7 +340,6 @@ class ChainSyncManager:
             local_block = self.db.get_block(local_h)
             if peer_block and local_block:
                 if peer_block[0].get("hash") != local_block["hash"]:
-                    log.debug(f"sync_with_peer: fork detectado em #{local_h}")
                     return False
         while not self._stop_sync.is_set():
             local_h = self._safe_height()
@@ -414,7 +393,7 @@ class ChainSyncManager:
                 self.status.active_peer = None
         self.sync_thread = threading.Thread(target=_loop, daemon=True, name="ChainSync")
         self.sync_thread.start()
-        log.info("ChainSyncManager v8.5 iniciado")
+        log.info("ChainSyncManager v8.7 iniciado")
 
     def _best_peer_by_work(self) -> Optional[PeerStatus]:
         local_h = self._safe_height()
