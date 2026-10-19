@@ -1,22 +1,10 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.2)
+"""main.py — Entrypoint unificado do nó BRN (v12.11)
 ================================================================
-v13.2:
-  [FIX] COMPLETO: main() agora tem try/except no bloco da senha
-        (o v13.0 parava na linha 925 com SyntaxError).
-  [FIX] CRÍTICO: PoolClient usava BRN_NODE_PASSWORD para decifrar
-        current_wallet.enc, mas o arquivo é cifrado com
-        BRN_WALLET_SESSION_PASS. Resultado: nunca decifrava,
-        PoolClient nunca arrancava.
-        → _resolve_wallet_password() usa a senha certa.
-  [FIX] CRÍTICO: sync_manager não era injetado no server.py.
-        → /api/sync/status retornava 100% default sempre.
-        → Agora chama set_sync_manager() após start_sync_loop().
-  [FIX] P2P e Pool também são injetados no server.py.
-  [NEW] Logs de injeção: "[inject] X injetado em server.py"
-v13.1:
-  [FIX] Corrigido SyntaxError na linha 925
-v13.0:
-  [NEW] Pool client automático no nó ORIGEM
+v12.11:
+  [FIX] Validador (is_origin) pode rodar Pool e Minerador Solo juntos.
+v12.10:
+  [FIX] Aceita --gui e --no-gui (do iniciar.bat v6)
+  [FIX] Wallet() em vez de Wallet.create() (nao existia)
 ================================================================
 """
 from __future__ import annotations
@@ -32,64 +20,44 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-
-# ============================================================
-# BASE_DIR
-# ============================================================
 BASE_DIR = Path(__file__).resolve().parent
 
-
-def _bootstrap_env() -> None:
+def _bootstrap_env():
     env_file = BASE_DIR / "brn_network.env"
-    if not env_file.exists():
-        return
+    if not env_file.exists(): return
     try:
         for line in env_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
+            if not line or line.startswith("#") or "=" not in line: continue
             k, v = line.split("=", 1)
             k = k.strip()
             v = v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
-                os.environ[k] = v
+            if k and k not in os.environ: os.environ[k] = v
     except Exception as e:
         print("[boot] aviso: falha lendo " + str(env_file) + ": " + str(e))
 
-
-# ============================================================
-# DEFAULTS HARDCODED
-# ============================================================
 _HARDCODED_DEFAULTS = {
-    "BRN_NODE_PASSWORD":       "senha-no-temp-123",
-    "BRN_NETWORK_SECRET":      "9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9",
-    "BRN_BOOTSTRAP_PEERS":     "",
-    "BRN_WEB_PASS":            "senha-temp-123",
+    "BRN_NODE_PASSWORD": "senha-no-temp-123",
+    "BRN_NETWORK_SECRET": "9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9",
+    "BRN_BOOTSTRAP_PEERS": "",
+    "BRN_WEB_PASS": "senha-temp-123",
     "BRN_WALLET_SESSION_PASS": "senha-forte-da-carteira-2026",
-    "BRN_IS_ORIGIN":           "0",
-    "BRN_HTTPS":               "0",
-    "BRN_AUDIT_ENABLED":       "1",
-    "BRN_AUDIT_LOG":           "audit.log",
-    "BRN_P2P_AUTH":            "optional",
-    "BRN_P2P_AUTH_WINDOW":     "30",
-    "BRN_P2P_NONCE_CACHE":     "10000",
-    "BRN_SKIP_VERIFY":         "0",
-    "BRN_VERIFY_STRICT":       "0",
-    "BRN_TRACKER":             "",
-    "MONGO_USER":              "",
-    "MONGO_PASS":              "",
-    "MONGO_HOST":              "",
-    "MONGO_DB":                "brn_analytics",
-    "TS_AUTH_KEY":             "",
-    "TS_API_KEY":              "",
-    "TS_TAILNET":              "",
-    "TS_HOSTNAME_PREFIX":      "brn-node",
-    "BRN_POOL_ENABLED":        "1",
-    "BRN_POOL_URL_LOCAL":      "http://127.0.0.1:5000",
+    "BRN_IS_ORIGIN": "0",
+    "BRN_HTTPS": "0",
+    "BRN_AUDIT_ENABLED": "1",
+    "BRN_AUDIT_LOG": "audit.log",
+    "BRN_P2P_AUTH": "optional",
+    "BRN_P2P_AUTH_WINDOW": "30",
+    "BRN_P2P_NONCE_CACHE": "10000",
+    "BRN_SKIP_VERIFY": "0",
+    "BRN_VERIFY_STRICT": "0",
+    "BRN_TRACKER": "",
+    "MONGO_USER": "", "MONGO_PASS": "", "MONGO_HOST": "", "MONGO_DB": "brn_analytics",
+    "TS_AUTH_KEY": "", "TS_API_KEY": "", "TS_TAILNET": "", "TS_HOSTNAME_PREFIX": "brn-node",
+    "BRN_POOL_ENABLED": "1",
 }
 
-
-def _apply_hardcoded_defaults() -> int:
+def _apply_hardcoded_defaults():
     aplicados = 0
     for k, v in _HARDCODED_DEFAULTS.items():
         if k not in os.environ or os.environ[k] == "":
@@ -97,206 +65,100 @@ def _apply_hardcoded_defaults() -> int:
             aplicados += 1
     return aplicados
 
-
 _bootstrap_env()
 _applied = _apply_hardcoded_defaults()
-if _applied:
-    print(f"[boot] defaults aplicados: {_applied} variáveis")
+if _applied: print(f"[boot] defaults aplicados: {_applied} variaveis")
 
-
-# ============================================================
-# IMPORTS
-# ============================================================
 from brn_config import Config
 from brn_logger import setup_logger, get_logger
 from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
 
 _shutdown = threading.Event()
-
-NODE_ID_PATH        = BASE_DIR / "node_identity.enc"
+NODE_ID_PATH = BASE_DIR / "node_identity.enc"
 CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
-
-WEB_HOST      = os.environ.get("BRN_WEB_HOST",      "127.0.0.1")
+WEB_HOST = os.environ.get("BRN_WEB_HOST", "127.0.0.1")
 EXPLORER_HOST = os.environ.get("BRN_EXPLORER_HOST", "127.0.0.1")
-
 AUTO_MINE = os.environ.get("BRN_AUTO_MINE", "0") == "1"
 
-_running_services: list = []
+_running_services = []
 _services_lock = threading.Lock()
 
+def _register_service(name, svc):
+    with _services_lock: _running_services.append((name, svc))
 
-def _register_service(name: str, svc) -> None:
-    with _services_lock:
-        _running_services.append((name, svc))
-
-
-# ============================================================
-# THREAD EXCEPTHOOK
-# ============================================================
 def _thread_excepthook(args):
     try:
         log = get_logger("thread")
-        thread_name = args.thread.name if args.thread else "?"
-        log.error(
-            "Thread '" + str(thread_name) + "' morreu: " + str(args.exc_value),
-            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
-        )
-    except Exception:
-        pass
-
+        log.error("Thread caiu: " + str(args.exc_value), exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+    except Exception: pass
 
 threading.excepthook = _thread_excepthook
 
-
-def _thread_wrap(name: str, fn):
+def _thread_wrap(name, fn):
     def runner():
-        try:
-            fn()
-        except Exception as e:
-            try:
-                get_logger(name).exception(
-                    "thread " + name + " caiu: " + str(e))
-            except Exception:
-                pass
+        try: fn()
+        except Exception as e: get_logger(name).exception("thread " + name + " caiu: " + str(e))
     return runner
 
-
-# ============================================================
-# MÓDULOS OBRIGATÓRIOS
-# ============================================================
-def _check_required_modules() -> list:
-    required = [
-        "brn_config", "brn_logger", "version",
-        "blockchain", "db", "crypto", "wallet", "bech32",
-        "secure_store", "chain_validator", "checkpoints",
-        "p2p_auth", "p2p_cipher", "p2p_secure", "p2p_unified",
-        "discovery_v2", "miner_loop",
-    ]
+def _check_required_modules():
+    required = ["brn_config", "brn_logger", "version", "blockchain", "db", "crypto", "wallet", "bech32", "secure_store", "chain_validator", "checkpoints", "p2p_auth", "p2p_cipher", "p2p_secure", "p2p_unified", "discovery_v2", "miner_loop"]
     missing = []
     for m in required:
-        try:
-            __import__(m)
-        except Exception:
-            missing.append(m)
+        try: __import__(m)
+        except Exception: missing.append(m)
     return missing
 
-
-# ============================================================
-# L2
-# ============================================================
 L2_ENABLED = False
 btc_config = None
 BTCWatcher = None
 L2Manager = None
-
 try:
     import btc_config
     from btc_watcher import BTCWatcher
     from l2_manager import L2Manager
     L2_ENABLED = True
-    print("[L2] Módulos BTC carregados OK")
+    print("[L2] Modulos BTC carregados OK")
 except Exception as _e:
-    print("[AVISO] btc_watcher/l2_manager indisponível: " + str(_e))
-    print("[AVISO] Ponte BTC e L2 DESATIVADAS — o nó continua normal.")
+    print("[AVISO] btc_watcher/l2_manager indisponivel: " + str(_e))
 
+def _l2_disponivel(): return L2_ENABLED and btc_config and BTCWatcher and L2Manager
 
-def _l2_disponivel() -> bool:
-    return (L2_ENABLED
-            and btc_config is not None
-            and BTCWatcher is not None
-            and L2Manager is not None)
-
-
-# ============================================================
-# POOL
-# ============================================================
 POOL_ENABLED = os.environ.get("BRN_POOL_ENABLED", "1") == "1"
 PoolManager = None
-PoolClient = None
-
 if POOL_ENABLED:
     try:
         from mining_pool import PoolManager
-        print("[Pool] PoolManager carregado OK")
+        print("[Pool] Modulo de pool carregado OK")
     except Exception as _e:
-        print("[AVISO] mining_pool indisponível: " + str(_e))
-        print("[AVISO] Pool DESATIVADO — mineração local continua.")
-        POOL_ENABLED = False
+        print("[AVISO] mining_pool indisponivel: " + str(_e))
+        PoolManager = None
 
-    if POOL_ENABLED:
-        try:
-            from miner_pool_client import PoolClient
-            print("[Pool] PoolClient carregado OK")
-        except Exception as _e:
-            print("[AVISO] miner_pool_client indisponível: " + str(_e))
-            PoolClient = None
+def _pool_disponivel(): return POOL_ENABLED and PoolManager is not None
 
-
-def _pool_disponivel() -> bool:
-    return POOL_ENABLED and PoolManager is not None
-
-
-# ============================================================
-# AUDIT
-# ============================================================
-def _audit(event: str, data: dict = None) -> None:
+def _audit(event, data=None):
     try:
         from security import audit_log
         audit_log(event, data or {})
-    except Exception:
-        pass
+    except Exception: pass
 
-
-def _close_audit() -> None:
+def _close_audit():
     try:
         from security import close_audit
         close_audit()
-    except Exception:
-        pass
+    except Exception: pass
 
-
-# ============================================================
-# TAILSCALE
-# ============================================================
-def _setup_tailscale_auto(log) -> bool:
+def _setup_tailscale_auto(log):
     auth_key = os.environ.get("TS_AUTH_KEY", "").strip()
-    if not auth_key:
-        log.info("Tailscale: desabilitado (TS_AUTH_KEY vazia)")
-        return True
-
+    if not auth_key: return True
     setup_path = BASE_DIR / "brn_tailscale_setup.py"
-    if not setup_path.exists():
-        log.warning("Tailscale: brn_tailscale_setup.py não encontrado — pulando")
-        return True
-
-    log.info("Tailscale: configurando automaticamente...")
+    if not setup_path.exists(): return True
     try:
-        r = subprocess.run(
-            [sys.executable, str(setup_path), "--auto"],
-            capture_output=True, text=True, timeout=180,
-            cwd=str(BASE_DIR),
-        )
-        if r.returncode == 0:
-            log.info("Tailscale: OK")
-            for line in (r.stdout or "").splitlines()[-6:]:
-                if line.strip():
-                    log.info("  " + line)
-            return True
-        log.warning("Tailscale: falhou (código " + str(r.returncode) + ")")
-        return False
-    except subprocess.TimeoutExpired:
-        log.warning("Tailscale: timeout de 180s — continuando sem VPN")
-        return False
-    except Exception as e:
-        log.warning("Tailscale: erro — " + str(e))
-        return False
+        r = subprocess.run([sys.executable, str(setup_path), "--auto"], capture_output=True, text=True, timeout=180, cwd=str(BASE_DIR))
+        return r.returncode == 0
+    except Exception: return False
 
-
-# ============================================================
-# ARGS
-# ============================================================
 def parse_args():
-    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v13")
+    p = argparse.ArgumentParser(prog="main.py", description="BRN Node")
     p.add_argument("--status", action="store_true")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--read-only", action="store_true")
@@ -320,838 +182,298 @@ def parse_args():
     p.add_argument("--no-tailscale", action="store_true")
     p.add_argument("--no-sync", action="store_true")
     p.add_argument("--no-pool", action="store_true")
-    p.add_argument("--no-pool-client", action="store_true")
     p.add_argument("--pool-stats", action="store_true")
-    p.add_argument("--gui", action="store_true")
-    p.add_argument("--no-gui", action="store_true")
+    
+    gui_group = p.add_mutually_exclusive_group()
+    gui_group.add_argument("--gui", action="store_true")
+    gui_group.add_argument("--no-gui", action="store_true")
     return p.parse_args()
 
-
-# ============================================================
-# SENHA / IDENTIDADE
-# ============================================================
-def _resolve_password(args) -> str:
-    """Senha do nó (identidade Ed25519) — NÃO é a senha da carteira."""
+def _resolve_password(args):
     if args.password_file:
-        p = Path(args.password_file)
-        if not p.exists():
-            raise SystemExit("--password-file não encontrado: " + str(p))
-        return p.read_text(encoding="utf-8").rstrip("\r\n")
+        return Path(args.password_file).read_text(encoding="utf-8").rstrip("\r\n")
     env = os.environ.get("BRN_NODE_PASSWORD")
-    if env:
-        return env
+    if env: return env
     if sys.stdin.isatty():
         import getpass
-        return getpass.getpass("Senha do nó (identidade Ed25519): ")
-    raise SystemExit("Senha do nó não informada.")
+        return getpass.getpass("Senha do no: ")
+    raise SystemExit("Senha do no nao informada.")
 
-
-def _resolve_wallet_password() -> str:
-    """Senha da carteira — usada para decifrar current_wallet.enc.
-
-    [FIX v13.2] Usa BRN_WALLET_SESSION_PASS primeiro, depois
-    BRN_NODE_PASSWORD como fallback. Isto é o que a carteira
-    (app_wallet_v3.py) usa para cifrar o current_wallet.enc.
-    """
-    return (
-        os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
-        or os.environ.get("BRN_NODE_PASSWORD", "").strip()
-    )
-
-
-def load_or_create_node_identity(password: str, rotate: bool = False):
+def load_or_create_node_identity(password, rotate=False):
     from crypto import Ed25519PrivateKey
     from secure_store import save_wallet, load_wallet
-
     log = get_logger("identity")
-
     if rotate and NODE_ID_PATH.exists():
-        backup = NODE_ID_PATH.with_suffix(".enc.bak")
-        NODE_ID_PATH.replace(backup)
-        log.warning("Identidade rotacionada. Backup em " + str(backup))
-
+        NODE_ID_PATH.replace(NODE_ID_PATH.with_suffix(".enc.bak"))
     if NODE_ID_PATH.exists():
         data = load_wallet(password, str(NODE_ID_PATH))
-        if not data:
-            raise SystemExit("Falha ao decifrar " + str(NODE_ID_PATH))
-        sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
-        return sk, data["pub"]
-
+        if not data: raise SystemExit("Falha ao decifrar " + str(NODE_ID_PATH))
+        return Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"])), data["pub"]
     sk = Ed25519PrivateKey.generate()
     pub_hex = sk.public_key().public_bytes_raw().hex()
-    save_wallet(
-        {"sk": sk.private_bytes_raw().hex(), "pub": pub_hex},
-        password, str(NODE_ID_PATH),
-    )
-    log.info("Identidade nova criada: " + pub_hex[:16]
-             + "... (" + str(NODE_ID_PATH) + ")")
+    save_wallet({"sk": sk.private_bytes_raw().hex(), "pub": pub_hex}, password, str(NODE_ID_PATH))
     return sk, pub_hex
 
-
-# ============================================================
-# PAPEL
-# ============================================================
-def _read_role() -> str:
+def _read_role():
     try:
         p = BASE_DIR / "brn_role.txt"
-        if p.exists():
-            return p.read_text(encoding="utf-8").strip().lower()
-    except Exception:
-        pass
+        if p.exists(): return p.read_text(encoding="utf-8").strip().lower()
+    except Exception: pass
     return "auto"
 
-
-def _is_origin(client_mode: bool) -> bool:
-    if client_mode:
-        return False
-    if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
-        return True
+def _is_origin(client_mode):
+    if client_mode: return False
+    if os.environ.get("BRN_IS_ORIGIN", "0") == "1": return True
     return _read_role() in ("origin", "hub", "servidor")
 
+VERIFY_OK, VERIFY_INVALID, VERIFY_ERROR = "ok", "invalid", "error"
 
-# ============================================================
-# VERIFY
-# ============================================================
-VERIFY_OK      = "ok"
-VERIFY_INVALID = "invalid"
-VERIFY_ERROR   = "error"
-
-
-def _verify_chain(chain) -> str:
+def _verify_chain(chain):
     try:
         from chain_validator import verify_chain
-    except ImportError:
-        get_logger("verify").info("chain_validator.py não disponível")
-        return VERIFY_ERROR
-
+    except ImportError: return VERIFY_ERROR
     log = get_logger("verify")
-    log.info("Verificando integridade da cadeia...")
-    t0 = time.time()
     try:
         r = verify_chain(chain)
-    except Exception as e:
-        log.exception("validador falhou: " + str(e))
-        return VERIFY_ERROR
+        valid = getattr(r, "valid", bool(r))
+        if valid: return VERIFY_OK
+        return VERIFY_INVALID
+    except Exception: return VERIFY_ERROR
 
-    dt = time.time() - t0
+def do_status(cfg):
+    print("=" * 64)
+    print(" BRN Node - Diagnostico")
+    print("=" * 64)
+    print(" Config : " + cfg.source)
+    print(" Web    : " + WEB_HOST + ":" + str(cfg["web_port"]))
+    print(" P2P    : " + str(cfg["p2p_port"]))
+    missing = _check_required_modules()
+    if missing: print(" [!] Modulos faltando: " + ", ".join(missing))
+    else: print(" Modulos     : OK")
+    print("=" * 64)
 
-    valid = getattr(r, "valid", None)
-    if valid is None:
-        valid = bool(r)
-    summary_fn = getattr(r, "summary", None)
-    blocks = getattr(r, "blocks_checked", 0)
-    warns = getattr(r, "warnings", []) or []
-    errs = getattr(r, "errors", []) or []
-
-    if valid:
-        if callable(summary_fn):
-            log.info(f"OK {summary_fn()} ({dt:.2f}s)")
-        else:
-            log.info(f"OK cadeia íntegra ({dt:.2f}s, {blocks} blocos)")
-        for w in warns[:5]:
-            log.warning("  " + str(w))
-        return VERIFY_OK
-
-    log.error(f"CADEIA INVÁLIDA ({len(errs)} erros)")
-    for e in errs[:10]:
-        log.error("  - " + str(e))
-    return VERIFY_INVALID
-
-
-# ============================================================
-# [NEW v13.2] INJEÇÃO NO SERVER.PY
-# ============================================================
-def _inject_into_server(what: str, obj, log) -> bool:
-    """Injeta um manager no server.py (set_p2p_manager, etc).
-
-    Retorna True se conseguiu.
-    Não falha se o server.py for antigo (v9.5) — apenas loga WARN.
-    """
-    setter_name = {
-        "p2p":  "set_p2p_manager",
-        "sync": "set_sync_manager",
-        "pool": "set_pool_manager",
-    }.get(what)
-
-    if setter_name is None:
-        log.warning(f"[inject] tipo desconhecido: {what}")
-        return False
-
-    try:
-        import server as _srv
-        setter = getattr(_srv, setter_name, None)
-        if setter is None:
-            log.warning(
-                f"[inject] server.py NAO tem {setter_name}() — "
-                f"atualize para v9.9.8+"
-            )
-            return False
-        setter(obj)
-        log.info(f"[inject] {what} injetado em server.py")
-        return True
-    except ImportError:
-        log.warning("[inject] server.py indisponível (import falhou)")
-        return False
-    except Exception as e:
-        log.warning(f"[inject] {what} falhou: {e}")
-        return False
-
-
-# ============================================================
-# HTTP / EXPLORER
-# ============================================================
 def _init_http_server(chain, log):
     try:
-        from server import (
-            app as http_app,
-            set_chain,
-            auto_registrar_carteira_atual,
-        )
+        from server import app as http_app, set_chain, auto_registrar_carteira_atual
+        set_chain(chain)
+        auto_registrar_carteira_atual()
+        return http_app
     except Exception as e:
         log.error("Falha importando server.py: " + str(e))
         return None
 
-    try:
-        set_chain(chain)
-        log.info("server.py: chain injetada")
-    except Exception as e:
-        log.error("Falha set_chain: " + str(e))
-        return None
-
-    try:
-        reg = auto_registrar_carteira_atual()
-        if reg.get("ok"):
-            log.info("auto-registro pubkey: " + str(reg.get("msg")))
-        else:
-            log.info("auto-registro pubkey: pulado ("
-                     + str(reg.get("msg")) + ")")
-    except Exception as e:
-        log.warning("auto-registro pubkey falhou: " + str(e))
-
-    return http_app
-
-
 def run_http(app_instance):
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    ssl_ctx = None
-    if os.environ.get("BRN_HTTPS", "0") == "1":
-        try:
-            from security import ensure_self_signed_cert
-            cert, key = ensure_self_signed_cert()
-            ssl_ctx = (cert, key)
-            log.info("HTTPS https://" + WEB_HOST + ":" + str(port))
-        except Exception as e:
-            log.warning("Falha ao gerar cert HTTPS: " + str(e)
-                        + ". Caindo para HTTP.")
-            ssl_ctx = None
-    if ssl_ctx is None:
-        log.info("HTTP http://" + WEB_HOST + ":" + str(port))
-    app_instance.run(
-        host=WEB_HOST, port=port, threaded=True,
-        debug=False, use_reloader=False, ssl_context=ssl_ctx,
-    )
-
+    log.info("HTTP http://" + WEB_HOST + ":" + str(port))
+    app_instance.run(host=WEB_HOST, port=port, threaded=True, debug=False, use_reloader=False)
 
 def run_explorer():
     from explorer import app as explorer_app
-    log = get_logger("explorer")
     port = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
-    ssl_ctx = None
-    if os.environ.get("BRN_HTTPS", "0") == "1":
-        try:
-            from security import ensure_self_signed_cert
-            ssl_ctx = ensure_self_signed_cert()
-        except Exception:
-            ssl_ctx = None
-    proto = "https" if ssl_ctx else "http"
-    log.info("Explorer " + proto + "://" + EXPLORER_HOST + ":" + str(port))
-    explorer_app.run(
-        host=EXPLORER_HOST, port=port, threaded=True,
-        debug=False, use_reloader=False, ssl_context=ssl_ctx,
-    )
+    get_logger("explorer").info("Explorer http://" + EXPLORER_HOST + ":" + str(port))
+    explorer_app.run(host=EXPLORER_HOST, port=port, threaded=True, debug=False, use_reloader=False)
 
-
-# ============================================================
-# STATUS LOOP
-# ============================================================
-def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None):
+def run_status_loop(chain, p2p, l2_manager=None, sync=None, pool=None):
     log = get_logger("status")
-    if p2p is None:
-        log.warning("P2P desabilitado — status loop sem peers")
-
     while not _shutdown.is_set():
         time.sleep(30)
         try:
-            peer_count = 0
-            if p2p is not None:
-                try:
-                    st = p2p.get_status()
-                    peer_count = st.get("peer_count", 0)
-                except Exception as e:
-                    log.warning("p2p.get_status: " + str(e))
-
-            mempool_n = len(chain.db.all_mempool(limit=1000))
-            utxos_n = chain.db.count_utxos()
-
-            msg = ("Altura=" + str(chain.db.height())
-                   + " Peers=" + str(peer_count)
-                   + " Mempool=" + str(mempool_n)
-                   + " UTXOs=" + str(utxos_n))
-
-            if sync is not None:
-                try:
-                    s = sync.get_status()
-                    msg += (" Sync=" + str(s.get("mode", "?"))
-                            + "/" + str(s.get("local_height", 0))
-                            + "→" + str(s.get("target_height", 0))
-                            + " (" + str(s.get("progress", 0)) + "%)")
-                except Exception:
-                    pass
-
-            if pool_client is not None:
-                try:
-                    pcs = pool_client.status()
-                    if pcs.get("running"):
-                        msg += (" PoolClient["
-                                + str(round(pcs.get("hashrate_khs", 0), 1))
-                                + " kH/s shares="
-                                + str(pcs.get("shares_accepted", 0)) + "/"
-                                + str(pcs.get("shares_submitted", 0))
-                                + "]")
-                except Exception:
-                    pass
-
+            msg = "Altura=" + str(chain.db.height()) + " Peers=" + str(p2p.get_status().get("peer_count", 0) if p2p else 0)
+            if pool: msg += " Pool[" + str(pool.stats().get("miners_active", 0)) + "]"
             log.info(msg)
-        except Exception as e:
-            log.warning("status loop: " + str(e))
-
+        except Exception: pass
 
 def run_wallet_main_thread():
     try:
-        if not os.environ.get("BRN_WEB_PASS"):
-            get_logger("wallet").error("BRN_WEB_PASS não definida")
-            return
         from app_wallet_v3 import WalletApi
         import webview
-        log = get_logger("wallet")
-        index_path = BASE_DIR / "index_wallet.html"
-        if not index_path.exists():
-            log.error("index_wallet.html não encontrado: " + str(index_path))
-            return
         api = WalletApi()
-        webview.create_window(
-            "BRN RWA — Carteira Digital",
-            url=index_path.resolve().as_uri(),
-            js_api=api,
-            width=1020, height=880,
-            min_size=(820, 640),
-            background_color="#0d1117",
-        )
+        webview.create_window("BRN RWA — Carteira Digital", url=(BASE_DIR / "index_wallet.html").resolve().as_uri(), js_api=api, width=1020, height=880)
         webview.start(debug=False)
-    except Exception as e:
-        get_logger("wallet").error("Falha: " + str(e))
+    except Exception as e: get_logger("wallet").error("Falha GUI: " + str(e))
 
-
-# ============================================================
-# POOL CLIENT LOCAL [FIX v13.2]
-# ============================================================
-def _setup_pool_client_local(chain, pool, log, disabled: bool):
-    """Inicia PoolClient no nó ORIGEM (minera para o pool local).
-
-    [FIX v13.2] Usa _resolve_wallet_password() (não node_password).
-    """
-    if disabled:
-        log.info("PoolClient local: desativado por --no-pool-client")
-        return None
-    if pool is None:
-        log.info("PoolClient local: PoolManager não está ativo")
-        return None
-    if PoolClient is None:
-        log.info("PoolClient local: miner_pool_client indisponível")
-        return None
-
-    # [FIX v13.2] Senha correta: BRN_WALLET_SESSION_PASS
-    wallet_pass = _resolve_wallet_password()
-    if not wallet_pass:
-        log.warning("PoolClient: BRN_WALLET_SESSION_PASS/BRN_NODE_PASSWORD vazias")
-        return None
-
-    addr = ""
-    pub = ""
+def _setup_relay(p2p, node_id_priv, enabled):
+    if not enabled or p2p is None: return None
     try:
-        from secure_store import load_current_wallet
-        w = load_current_wallet(wallet_pass)
-        if w and w.get("ok"):
-            addr = (w.get("address") or "").strip()
-            pub = (w.get("public_key") or w.get("pub_hex")
-                   or w.get("pubkey") or "").strip()
-        else:
-            log.info("PoolClient: current_wallet.enc não decifrou ("
-                     + str(w.get("msg", "?")) + ")")
-    except Exception as e:
-        log.warning("PoolClient: falha lendo current_wallet: " + str(e))
+        from p2p_relay import RelayManager
+        relay = RelayManager(p2p, node_id_priv)
+        srv = getattr(p2p, "server", None)
+        if srv and hasattr(srv, "on_relay_request"):
+            srv.on_relay_request = relay.handle_relay_request
+            srv.on_relay_incoming = relay.handle_incoming_relay
+            srv.on_relay_accepted = lambda ip, pid, msg: relay.handle_route_accepted(msg)
+            srv.on_relay_data = relay.handle_relay_data
+        return relay
+    except Exception: return None
 
-    if not addr.startswith("brn1") or not pub:
-        log.warning("PoolClient: current_wallet.enc sem address/public_key")
-        return None
-
-    pool_url = os.environ.get(
-        "BRN_POOL_URL_LOCAL", "http://127.0.0.1:5000")
-
+def _setup_sync(chain, p2p, log):
+    if p2p is None: return None
     try:
-        pc = PoolClient(addr, pub, pool_url=pool_url)
-        ok, msg = pc.start_mining()
-        if not ok:
-            log.warning("PoolClient: start_mining falhou: " + str(msg))
-            return None
-        log.info("PoolClient LOCAL iniciado (addr=" + addr[:16]
-                 + "... pool=" + pool_url + ")")
-        return pc
-    except Exception as e:
-        log.warning("PoolClient: exceção: " + str(e))
-        return None
+        from sync_manager import ChainSyncManager
+        sync = ChainSyncManager(chain, chain.db, p2p)
+        sync.set_sync_mode("full")
+        sync.start_sync_loop()
+        return sync
+    except Exception: return None
 
+def _setup_pool(chain, p2p, log, disabled):
+    if disabled or not _pool_disponivel(): return None
+    try:
+        pool = PoolManager(chain)
+        if p2p: pool.on_block_mined = lambda blk: p2p.broadcast_block(blk)
+        return pool
+    except Exception: return None
 
-# ============================================================
-# BROADCAST (chain.on_block_mined → P2P)
-# ============================================================
 def _setup_local_miner_broadcast(chain, p2p, log):
-    if p2p is None:
-        log.info("chain.on_block_mined: P2P desligado — broadcast inativo")
-        return False
+    if p2p is None: return False
     try:
-        def _on_local_block(block):
-            try:
-                p2p.broadcast_block(block)
-                log.info("miner local: bloco #" + str(block.get("height"))
-                         + " propagado via P2P")
-            except Exception as e:
-                log.debug("broadcast_block falhou: " + str(e))
-
-        chain.on_block_mined = _on_local_block
-        log.info("chain.on_block_mined ligado ao P2P")
+        chain.on_block_mined = lambda blk: p2p.broadcast_block(blk)
         return True
-    except Exception as e:
-        log.warning("Falha ligando on_block_mined: " + str(e))
-        return False
+    except Exception: return False
 
-
-# ============================================================
-# SHUTDOWN
-# ============================================================
-def _stop_with_timeout(name: str, svc, timeout: float = 5.0, log=None) -> None:
+def _stop_with_timeout(name, svc, timeout=5.0, log=None):
     try:
-        if hasattr(svc, "stop"):
-            fn = svc.stop
-        elif hasattr(svc, "stop_mining"):
-            fn = svc.stop_mining
-        elif callable(svc):
-            fn = svc
-        else:
-            return
-    except Exception:
-        return
+        fn = svc.stop if hasattr(svc, "stop") else svc
+        t = threading.Thread(target=fn, daemon=True)
+        t.start()
+        t.join(timeout)
+    except Exception: pass
 
-    t = threading.Thread(target=fn, daemon=True, name="stop-" + name)
-    t.start()
-    t.join(timeout)
-    if t.is_alive() and log is not None:
-        log.warning("Serviço " + name + " não parou em "
-                    + str(timeout) + "s")
-
-
-def _graceful_shutdown(log) -> None:
-    log.info("Encerrando serviços...")
-    with _services_lock:
-        services = list(_running_services)
-
-    for name, svc in reversed(services):
-        _stop_with_timeout(name, svc, timeout=5.0, log=log)
-
-    try:
-        from wallet import WalletManager
-        WalletManager.lock_session()
-    except Exception:
-        pass
-
-    try:
-        from mongo_client import mongo
-        mongo.close()
-    except Exception:
-        pass
-
+def _graceful_shutdown(log):
+    log.info("Encerrando servicos...")
+    with _services_lock: services = list(_running_services)
+    for name, svc in reversed(services): _stop_with_timeout(name, svc)
     _audit("node_stop", {})
     _close_audit()
 
-
-# ============================================================
-# MAIN [FIX v13.2 — COMPLETO]
-# ============================================================
 def main():
     args = parse_args()
     cfg = Config(args.config)
 
-    if args.read_only:
-        cfg.data["read_only"] = True
-    if args.headless or args.no_gui:
-        cfg.data["headless"] = True
-    if args.gui:
-        cfg.data["headless"] = False
-    if args.log_level:
-        cfg.data["log_level"] = args.log_level
-    if args.log_file:
-        cfg.data["log_file"] = args.log_file
+    if args.read_only: cfg.data["read_only"] = True
+    if args.headless: cfg.data["headless"] = True
+    if args.log_level: cfg.data["log_level"] = args.log_level
+    if args.log_file: cfg.data["log_file"] = args.log_file
+
+    if getattr(args, "no_gui", False): cfg.data["headless"] = True
+    elif getattr(args, "gui", False): cfg.data["headless"] = False
 
     cfg.apply_to_env()
-
-    log = setup_logger(level=cfg["log_level"],
-                       log_file=cfg["log_file"] or None)
-
+    log = setup_logger(level=cfg["log_level"], log_file=cfg["log_file"] or None)
     is_origin = _is_origin(args.client_mode)
 
     log.info("=" * 60)
     log.info(" BRN Node v" + VERSION + " (" + BUILD_DATE + ")")
-
-    if args.l2 and _l2_disponivel():
-        l2_mode = "ON"
-    elif not args.l2:
-        l2_mode = "off"
-    else:
-        l2_mode = "INDISPONÍVEL"
-
-    pool_mode = (
-        "off" if args.no_pool
-        else ("ON" if _pool_disponivel() else "off")
-    )
-
-    log.info(" Config: " + cfg.source
-             + " | Modo: " + ("ORIGEM" if is_origin else "CLIENTE")
-             + " | L2: " + l2_mode
-             + " | Pool: " + pool_mode)
-    log.info(" HTTPS: " + ("ON" if os.environ.get("BRN_HTTPS") == "1" else "off")
-             + " | Auto-mine: " + ("ON" if AUTO_MINE else "off"))
-    log.info(" GUI: " + ("headless" if cfg["headless"] else "pywebview"))
+    log.info(" Modo: " + ("ORIGEM" if is_origin else "CLIENTE"))
     log.info("=" * 60)
 
-    # ---- comandos que saem sozinhos ----
-    if args.version:
-        print(VERSION)
-        return 0
-    if args.status:
-        print("=" * 64)
-        print(" BRN Node — Diagnóstico (v" + VERSION + ")")
-        print("=" * 64)
-        print(" Config    : " + cfg.source)
-        print(" Web       : " + WEB_HOST + ":" + str(cfg["web_port"]))
-        print(" Explorer  : " + EXPLORER_HOST + ":" + str(cfg["explorer_port"]))
-        print(" P2P       : " + str(cfg["p2p_port"]))
-        print(" Pool      : " + ("SIM" if _pool_disponivel() else "não"))
-        print(" L2        : " + ("SIM" if _l2_disponivel() else "não"))
-        print(" Role      : " + ("ORIGEM" if is_origin else "CLIENTE"))
-        print("=" * 64)
-        return 0
-    if args.check_update:
-        print('{"ok": false, "msg": "check_update simplificado"}')
-        return 0
+    if args.version: print(VERSION); return 0
+    if args.status: do_status(cfg); return 0
 
-    # ---- módulos obrigatórios ----
     missing = _check_required_modules()
     if missing:
-        log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
+        log.error("Modulos faltando: " + ", ".join(missing))
         return 1
 
-    # ---- Tailscale ----
-    if not args.no_tailscale:
-        _setup_tailscale_auto(log)
-    else:
-        log.info("Tailscale: pulado por --no-tailscale")
+    if not args.no_tailscale: _setup_tailscale_auto(log)
 
-    # ---- identidade ----
-    try:
-        node_password = _resolve_password(args)
-    except SystemExit as e:
-        log.error(str(e))
-        return 1
+    node_password = _resolve_password(args)
+    node_id_priv, node_id_pub = load_or_create_node_identity(node_password, rotate=args.rotate_node_id)
 
-    try:
-        node_sk, node_pub = load_or_create_node_identity(
-            node_password, rotate=args.rotate_node_id
-        )
-    except SystemExit as e:
-        log.error(str(e))
-        return 1
-    except Exception as e:
-        log.exception("Falha ao carregar identidade: " + str(e))
-        return 1
-
-    log.info("Nó ID: " + node_pub[:16] + "...")
-
-    # ---- blockchain ----
     from blockchain import Blockchain
-    chain = Blockchain(
-        cfg["db_path"],
-        auto_genesis=is_origin,
-        network_secret=cfg["network_secret"],
-    )
-    chain._fork_signal = threading.Event()
-    log.info("Blockchain pronta (altura=" + str(chain.db.height()) + ")")
+    chain = Blockchain(cfg["db_path"], auto_genesis=is_origin)
+    
+    if not args.skip_verify: _verify_chain(chain)
 
-    # ---- verify ----
-    if args.verify_only:
-        st = _verify_chain(chain)
-        try:
-            chain.db.close()
-        except Exception:
-            pass
-        return 0 if st == VERIFY_OK else 2
-
-    if not args.skip_verify and os.environ.get("BRN_SKIP_VERIFY", "0") != "1":
-        strict = os.environ.get("BRN_VERIFY_STRICT", "0") == "1"
-        st = _verify_chain(chain)
-        if st == VERIFY_INVALID and strict:
-            log.error("Abortando: cadeia inválida (BRN_VERIFY_STRICT=1)")
-            try:
-                chain.db.close()
-            except Exception:
-                pass
-            return 2
-        if st == VERIFY_ERROR:
-            log.warning("Verificação não conclusiva — seguindo com cautela")
-
-    # ---- P2P ----
     p2p = None
     if not args.no_p2p:
         try:
             from p2p_unified import P2PManager
-            p2p = P2PManager(chain, node_sk,
-                             tcp_port=cfg["p2p_port"],
-                             enable_upnp=cfg["upnp"])
+            p2p = P2PManager(chain, node_id_priv, tcp_port=cfg["p2p_port"], enable_upnp=cfg["upnp"])
             p2p.start()
             _register_service("p2p", p2p)
-            log.info("P2P iniciado na porta " + str(cfg["p2p_port"]))
-        except Exception as e:
-            log.error("Falha ao iniciar P2P: " + str(e))
-            p2p = None
+        except Exception as e: log.error("P2P falhou: " + str(e))
 
-    # ---- Sync ----
-    sync = None
-    if not args.no_sync and p2p is not None:
-        try:
-            from sync_manager import ChainSyncManager
-            sync = ChainSyncManager(chain, chain.db, p2p)
-            try:
-                sync.set_sync_mode("full")
-            except Exception:
-                pass
-            sync.start_sync_loop()
-            _register_service("sync", sync)
-            log.info("Sync iniciado (full mode)")
-        except ImportError as e:
-            log.warning("sync_manager indisponível: " + str(e))
-            sync = None
-        except Exception as e:
-            log.warning("Falha ao iniciar Sync: " + str(e))
-            sync = None
-    elif args.no_sync:
-        log.info("Sync: pulado por --no-sync")
+    relay = _setup_relay(p2p, node_id_priv, args.relay)
+    if relay: _register_service("relay", relay)
 
-    # ---- Pool server ----
-    pool = None
-    if not args.no_pool and _pool_disponivel():
-        try:
-            pool = PoolManager(chain)
-            _register_service("pool", pool)
-            log.info("PoolManager iniciado")
-        except Exception as e:
-            log.warning("Falha ao iniciar PoolManager: " + str(e))
-            pool = None
-    elif args.no_pool:
-        log.info("Pool: desativado por --no-pool")
+    sync = _setup_sync(chain, p2p, log)
+    if sync: _register_service("sync", sync)
 
-    # ---- HTTP ----
-    http_app = _init_http_server(chain, log)
-    if http_app is not None:
-        threading.Thread(
-            target=_thread_wrap("HTTP", lambda: run_http(http_app)),
-            daemon=True, name="HTTP",
-        ).start()
-    else:
-        log.error("HTTP não pôde ser inicializado — seguindo sem API")
+    pool = _setup_pool(chain, p2p, log, disabled=args.no_pool)
+    if pool: _register_service("pool", pool)
 
-    # ══════════════════════════════════════════════════════════════
-    # [FIX v13.2] INJEÇÕES NO SERVER.PY
-    # ══════════════════════════════════════════════════════════════
-    if p2p is not None:
-        _inject_into_server("p2p", p2p, log)
-    else:
-        log.warning("Sem P2PManager — tx nao serao propagadas")
-
-    if sync is not None:
-        _inject_into_server("sync", sync, log)
-    else:
-        log.info("Sem SyncManager — /api/sync/status retornara default")
-
-    if pool is not None:
-        _inject_into_server("pool", pool, log)
-    else:
-        log.info("Sem PoolManager — /api/pool/* retornara 503")
-
-    # ---- PoolClient (auto-mineração do nó ORIGEM) ----
-    pool_client = None
-    if is_origin and pool is not None:
-        pool_client = _setup_pool_client_local(
-            chain, pool, log,
-            disabled=args.no_pool_client,
-        )
-        if pool_client is not None:
-            _register_service("pool_client", pool_client)
-    elif is_origin:
-        log.info("PoolClient local: PoolManager inativo — pulando")
-    else:
-        log.info("PoolClient local: modo cliente — pulando")
-
-    # ---- Broadcast local → P2P ----
     _setup_local_miner_broadcast(chain, p2p, log)
 
-    # ---- Miner local ----
-    quer_miner_local = bool(args.mine or AUTO_MINE)
+    if p2p:
+        try:
+            import server as _srv
+            _srv.set_p2p_manager(p2p)
+            if pool: _srv.set_pool_manager(pool)
+        except Exception: pass
 
-    # [SAFETY] Não roda miner local se pool/pool_client estiver ativo
-    if quer_miner_local and (pool is not None or pool_client is not None):
-        log.warning("Miner local IGNORADO: pool/pool_client está ativo "
-                    "(evita forks).")
+    http_app = _init_http_server(chain, log)
+    if http_app: threading.Thread(target=_thread_wrap("HTTP", lambda: run_http(http_app)), daemon=True).start()
+    threading.Thread(target=_thread_wrap("Explorer", run_explorer), daemon=True).start()
+
+    # v12.11: Validador pode rodar Pool e Solo juntos
+    quer_miner_local = bool(args.mine or AUTO_MINE)
+    if quer_miner_local and pool is not None and not is_origin:
+        log.warning("Cliente: Minerador Solo IGNORADO (Pool ativo).")
         quer_miner_local = False
 
     if quer_miner_local:
         try:
             from miner_loop import get_miner
-
+            from wallet import Wallet
+            from secure_store import save_wallet, load_wallet
             miner = get_miner(chain)
-            wallet_pass = _resolve_wallet_password()
-            w = {"address": "", "pubkey": ""}
+            mw_path = BASE_DIR / "miner_wallet.enc"
+            mw = None
             try:
-                from secure_store import load_current_wallet
-                wd = load_current_wallet(wallet_pass)
-                if wd.get("ok"):
-                    w = {
-                        "address": wd.get("address", ""),
-                        "pubkey": (wd.get("public_key")
-                                   or wd.get("pubkey")
-                                   or wd.get("pub_hex")
-                                   or ""),
-                    }
-            except Exception as e:
-                log.warning("Miner local: falha lendo carteira: " + str(e))
-
-            if w.get("address") and w.get("pubkey"):
-                ok, msg = miner.start(w["address"], w["pubkey"])
-                log.info(f"Miner auto-start: {msg}")
-                _register_service("miner", miner)
-            else:
-                log.warning("Miner: sem carteira ativa para minerar.")
+                data = load_wallet(node_password, str(mw_path))
+                if data: mw = Wallet.from_dict(data)
+            except Exception: pass
+            
+            if mw is None:
+                mw = Wallet()
+                save_wallet(mw.to_dict(), node_password, str(mw_path))
+                
+            miner.start(mw.address, mw.pub_hex)
+            _register_service("miner", miner)
         except Exception as e:
             log.warning("Miner local falhou: " + str(e))
 
-    # ---- Status loop ----
-    threading.Thread(
-        target=_thread_wrap(
-            "StatusLoop",
-            lambda: run_status_loop(
-                chain, p2p, sync, pool, pool_client),
-        ),
-        daemon=True, name="StatusLoop",
-    ).start()
+    threading.Thread(target=_thread_wrap("StatusLoop", lambda: run_status_loop(chain, p2p, None, sync, pool)), daemon=True).start()
 
-    # ---- Cliente aguarda genesis ----
-    if not is_origin and chain.db.height() < 0:
-        log.info("Aguardando genesis (timeout "
-                 + str(CLIENT_BOOT_TIMEOUT) + "s)...")
-        t0 = time.time()
-        while (chain.db.height() < 0
-               and (time.time() - t0) < CLIENT_BOOT_TIMEOUT
-               and not _shutdown.is_set()):
-            time.sleep(1)
+    _audit("node_start", {"mode": "origin" if is_origin else "client", "height": chain.db.height()})
+    log.info("No pronto. Ctrl+C para encerrar.")
 
-    # ---- AUDIT ----
-    _audit("node_start", {
-        "mode":        "origin" if is_origin else "client",
-        "l2":          bool(args.l2 and _l2_disponivel()),
-        "mine":        bool(quer_miner_local),
-        "pool":        bool(pool),
-        "pool_client": bool(pool_client),
-        "https":       os.environ.get("BRN_HTTPS") == "1",
-        "height":      chain.db.height(),
-        "node_id":     node_pub[:16],
-        "sync":        bool(sync),
-        "p2p":         bool(p2p),
-    })
-
-    log.info("Nó pronto. Ctrl+C para encerrar.")
-
-    # ---- GUI ou headless ----
     try:
-        if not cfg["headless"]:
-            log.info("Abrindo carteira desktop (pywebview)...")
-            run_wallet_main_thread()
+        if not cfg["headless"]: run_wallet_main_thread()
         else:
-            log.info("Modo headless. Ctrl+C para encerrar.")
-            while not _shutdown.is_set():
-                time.sleep(1)
-    except KeyboardInterrupt:
-        log.info("Encerrando por Ctrl+C...")
+            while not _shutdown.is_set(): time.sleep(1)
+    except KeyboardInterrupt: pass
 
-    # ---- shutdown ----
-    log.info("Encerrando...")
     _shutdown.set()
     _graceful_shutdown(log)
-
-    try:
-        chain.db.close()
-    except Exception:
-        pass
-
-    try:
-        del node_password
-    except Exception:
-        pass
-
+    try: chain.db.close()
+    except Exception: pass
     return 0
 
-
-# ============================================================
-# SIGNAL HANDLERS
-# ============================================================
 _signal_count = 0
-
-
 def _on_signal(signum, frame):
     global _signal_count
     _signal_count += 1
-    if _signal_count >= 2:
-        print("\n[!] Forçando saída.", file=sys.stderr)
-        os._exit(1)
+    if _signal_count >= 2: os._exit(1)
     _shutdown.set()
 
-
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT,  _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
-    if hasattr(signal, "SIGHUP"):
-        signal.signal(signal.SIGHUP, _on_signal)
-
-    try:
-        sys.exit(main())
-    except SystemExit:
-        raise
+    try: sys.exit(main())
+    except SystemExit: raise
     except Exception as e:
-        try:
-            log = get_logger("main")
-            log.exception("Erro fatal: " + str(e))
-            try:
-                _graceful_shutdown(log)
-            except Exception:
-                pass
-        except Exception:
-            print("Erro fatal: " + str(e), file=sys.stderr)
+        get_logger("main").exception("Erro fatal: " + str(e))
         sys.exit(1)
